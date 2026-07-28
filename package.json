@@ -1,0 +1,10 @@
+{
+  "name": "panel-wizard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Static Cloudflare Workers deploy wizard (_worker.js + static assets) — no build step.",
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev"
+  }
+}

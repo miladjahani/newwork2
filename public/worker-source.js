@@ -1,7279 +1,8680 @@
-import { connect } from "cloudflare:sockets";
-const GLOBAL_TRAFFIC_CACHE = new Map();
-const ACTIVE_CONNECTIONS_COUNT = new Map();
-const GLOBAL_LAST_ACTIVE_WRITE = new Map();
-const GLOBAL_LAST_DB_WRITE = new Map();
-const GLOBAL_WRITE_LOCK = new Map();
-const DNS_CACHE = new Map();
-const USER_REQ_CACHE = new Map();
-const LOGIN_ATTEMPTS = new Map(); 
-let GLOBAL_REQ_COUNT = 0;
-let GLOBAL_LAST_REQ_WRITE = 0;
-const DNS_CACHE_TTL = 5 * 60 * 1000;
-const DOH_RESOLVER = "https://cloudflare-dns.com/dns-query";
-const UPSTREAM_BUNDLE_TARGET_BYTES = 128 * 1024;
-const UPSTREAM_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
-const UPSTREAM_QUEUE_MAX_ITEMS = 4096;
-const DOWNSTREAM_GRAIN_BYTES = 32 * 1024;
-const DOWNSTREAM_GRAIN_TAIL_THRESHOLD = 512;
-const DOWNSTREAM_GRAIN_SILENT_MS = 1;
-const DNS_CACHE_MAX_ENTRIES = 2048;
-const TEXT_ENCODER = new TextEncoder();
-const TEXT_DECODER = new TextDecoder();
-const TLS_PORTS = new Set(["443", "2053", "2083", "2087", "2096", "8443"]);
-
-/* ============================================================================
-   ADDED MODULE — Telegram bot integration + regional fallback-relay matching
-   Ported from worker-source.js (readable names) and adapted to run against
-   the D1 schema already used by this panel (env.DB), instead of the
-   KV-based "键值配置" store worker-source.js used.
-   ============================================================================ */
-
-/* ---------------- settings helpers (uses the existing settings table) ---- */
-async function getSetting(db, key, fallback = "") {
-	try {
-		const row = await db.prepare("SELECT value FROM settings WHERE key = ?").bind(key).first();
-		return row ? row.value : fallback;
-	} catch (e) {
-		return fallback;
-	}
+// CFnew - 终端 
+// 版本: v2.9.8c 
+import { connect as 连接 } from 'cloudflare:sockets';
+const 基础64文本解码器 = new TextDecoder();
+function 解码64(文本) {
+  const 二进制 = atob(文本);
+  const 字节 = new Uint8Array(二进制.length);
+  for (let 索引 = 0; 索引 < 二进制.length; 索引++) 字节[索引] = 二进制.charCodeAt(索引);
+  return 基础64文本解码器.decode(字节);
 }
-async function setSetting(db, key, value) {
-	await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(key, String(value)).run();
-}
+let 认证令牌 = '351c9981-04b6-4103-aa4b-864aa9c91469';
+let 回退地址 = '';
+let 代理5配置 = '';
+let 自定义优选地址列表 = [];
+let 自定义优选域名列表 = [];
+let 启用代理降级 = false;
+let 禁用非传输层安全 = false;
+let 禁用优选 = false;
+let 启用地区匹配 = true;
+let 当前工作器地区 = '';
+let 手动工作器地区 = '';
+let 优选地址源 = '';
+let 自定义路径 = '';
+let 启用明文 = true;
+let 启用木马 = false;
+let 启用扩展传输 = false;
+let 传输路径 = '';
+// 启用ECH功能（true启用，false禁用）
+let 启用加密客户端问候 = false;
+// 自定义DNS服务器（默认：https://223.5.5.5/dns-query）
+let 自定义域名系统 = 'https://223.5.5.5/dns-query';
+// 自定义ECH域名（默认：cloudflare-ech.com）
+let 自定义加密客户端问候域名 = 'cloudflare-ech.com';
+let 自定义应用层协议协商 = '';
+let 订阅转换接口 = 解码64('aHR0cHM6Ly91cmwudjEubWsvc3Vi');
+// 远程配置URL（硬编码）
+const 远程配置网址 = 'https://raw.githubusercontent.com/byJoey/test/refs/heads/main/tist.ini';
+let 启用优选域名 = true; // 优选域名默认关闭
+let 启用优选地址 = true;
+let 启用仓库优选 = true;
+let 启用原生地址 = false; // 原生地址默认关闭          
 
-/* ---------------- Telegram bot ------------------------------------------- */
-async function getTelegramConfig(env) {
-	const [token, secret, botUsername, enabled] = await Promise.all([
-		getSetting(env.DB, "tg_bot_token", ""),
-		getSetting(env.DB, "tg_bot_secret", ""),
-		getSetting(env.DB, "tg_bot_username", ""),
-		getSetting(env.DB, "tg_bot_enabled", "0"),
-	]);
-	return { token, secret, botUsername, enabled: enabled === "1" };
-}
-async function sendTelegramMessage(token, chatId, text) {
-	try {
-		await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
-		});
-	} catch (e) {}
-}
-function randomSecretString(length = 32) {
-	const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-	let out = "";
-	const bytes = crypto.getRandomValues(new Uint8Array(length));
-	for (let i = 0; i < length; i++) out += chars[bytes[i] % chars.length];
-	return out;
-}
-
-/* Admin-only: called once (from the panel settings UI) after saving a bot
-   token, to register the Telegram webhook pointed at this worker. */
-async function handleTelegramSetup(request, url, env) {
-	const json = (data, status = 200) => new Response(JSON.stringify(data), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });
-	const body = await readJsonBody(request);
-	const token = (body && body.token) || (await getSetting(env.DB, "tg_bot_token", ""));
-	if (!token) return json({ success: false, message: "ابتدا توکن بات تلگرام را وارد کنید." }, 400);
-	await setSetting(env.DB, "tg_bot_token", token);
-	let secret = await getSetting(env.DB, "tg_bot_secret", "");
-	if (!secret) {
-		secret = randomSecretString(32);
-		await setSetting(env.DB, "tg_bot_secret", secret);
-	}
-	const webhookUrl = `${url.origin}/api/tg/webhook`;
-	try {
-		const setResp = await fetch(`https://api.telegram.org/bot${token}/setWebhook`, {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ url: webhookUrl, secret_token: secret }),
-		});
-		const setData = await setResp.json();
-		let botUsername = "";
-		try {
-			const meResp = await fetch(`https://api.telegram.org/bot${token}/getMe`);
-			const meData = await meResp.json();
-			if (meData && meData.ok) botUsername = meData.result.username || "";
-		} catch (e) {}
-		if (botUsername) await setSetting(env.DB, "tg_bot_username", botUsername);
-		await setSetting(env.DB, "tg_bot_enabled", setData && setData.ok ? "1" : "0");
-		return json({ success: !!(setData && setData.ok), telegram: setData, webhookUrl, botUsername });
-	} catch (err) {
-		return json({ success: false, message: String((err && err.message) || err) }, 502);
-	}
-}
-
-/* Handles incoming Telegram updates. The secret header IS the auth for
-   this route — it is intentionally reachable without a panel session,
-   since Telegram itself is the caller. */
-async function handleTelegramWebhook(request, env) {
-	const tg = await getTelegramConfig(env);
-	if (!tg.token || !tg.secret) return new Response("not configured", { status: 404 });
-	const receivedSecret = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
-	if (receivedSecret !== tg.secret) return new Response("forbidden", { status: 403 });
-
-	let update = null;
-	try {
-		update = await request.json();
-	} catch (e) {
-		return new Response("ok");
-	}
-	const message = update && update.message;
-	const text = ((message && message.text) || "").trim();
-	const chatId = message && message.chat && message.chat.id;
-	if (!message || !chatId) return new Response("ok");
-
-	const token = tg.token;
-	const origin = new URL(request.url).origin;
-
-	async function sendUserStatus(user) {
-		const now = Date.now();
-		const isExpired = user.expiry_days && user.created_at ? now > new Date(user.created_at).getTime() + user.expiry_days * 86400000 : false;
-		const status = user.is_active === 0 ? "⛔ غیرفعال" : isExpired ? "⏳ منقضی شده" : "✅ فعال";
-		const used = ((Number(user.used_gb) || 0)).toFixed(2);
-		const limit = user.limit_gb ? user.limit_gb + " GB" : "نامحدود";
-		const text =
-			`<b>${user.username}</b>\n` +
-			`وضعیت: ${status}\n` +
-			`مصرف: ${used} GB از ${limit}\n\n` +
-			`لینک اشتراک شما (در اپلیکیشن VPN paste کنید):\n<code>${origin}/sub/${user.username}</code>`;
-		await sendTelegramMessage(token, chatId, text);
-	}
-	async function tryLink(rawArg) {
-		const arg = (rawArg || "").trim();
-		if (!arg) return false;
-		const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(arg, arg).first();
-		if (!user) {
-			await sendTelegramMessage(token, chatId, "❌ این کد پیدا نشد. لینک را دوباره از ادمین بگیرید.");
-			return false;
-		}
-		await env.DB.prepare("UPDATE users SET telegram_chat_id = ? WHERE id = ?").bind(String(chatId), user.id).run();
-		await sendTelegramMessage(token, chatId, "✅ حساب شما متصل شد.");
-		await sendUserStatus(user);
-		return true;
-	}
-	try {
-		if (text.startsWith("/start")) {
-			const payload = text.replace("/start", "").trim();
-			if (payload) {
-				await tryLink(payload);
-			} else {
-				await sendTelegramMessage(
-					token,
-					chatId,
-					"خوش آمدید! 👋\nروی لینکی که ادمین برایتان فرستاده بزنید تا حساب شما وصل شود.\n\nیا این را بفرستید:\n<code>/link کد-شما</code>",
-				);
-			}
-		} else if (text.startsWith("/link")) {
-			await tryLink(text.replace("/link", ""));
-		} else if (text.startsWith("/status")) {
-			const { results } = await env.DB.prepare("SELECT * FROM users WHERE telegram_chat_id = ?").bind(String(chatId)).all();
-			if (!results || !results.length) {
-				await sendTelegramMessage(token, chatId, "هنوز حسابی متصل نشده. روی لینک ادمین بزنید یا /link کد-شما را بفرستید.");
-			} else {
-				for (const user of results) await sendUserStatus(user);
-			}
-		} else {
-			await sendTelegramMessage(token, chatId, "دستورات: /link کد — /status");
-		}
-	} catch (e) {}
-	return new Response("ok");
-}
-
-/* Best-effort notification hook — safe to call from anywhere; never
-   throws, and is a no-op when the bot isn't configured or the user has
-   no linked chat. Call this from checkAutoResets/handlevIees etc. when
-   a user's status changes (expired, quota exhausted, disabled). */
-async function notifyUserByTelegram(env, username, text) {
-	try {
-		const tg = await getTelegramConfig(env);
-		if (!tg.token || !tg.enabled) return;
-		const user = await env.DB.prepare("SELECT telegram_chat_id FROM users WHERE username = ?").bind(username).first();
-		if (!user || !user.telegram_chat_id) return;
-		await sendTelegramMessage(tg.token, user.telegram_chat_id, text);
-	} catch (e) {}
-}
-
-/* ---------------- regional fallback-relay matching ------------------------
-   Fixes/relays are configured by the admin as a JSON array under the
-   settings key "fallback_relays":
-     [{ "address": "1.2.3.4", "port": 443, "region": "DE" }, ...]
-   When the direct connection to a destination fails, we pick the relay
-   whose region is closest to the *worker's own edge* (request.cf.country),
-   and retry the raw TCP connect through it. This is the same idea as the
-   "proxyIP" workaround these tools rely on, just geo-aware and with a
-   configurable pool instead of one static address. */
-const REGION_NEIGHBORS = {
-	US: ["SG", "JP", "KR"],
-	SG: ["JP", "KR", "US"],
-	JP: ["SG", "KR", "US"],
-	KR: ["JP", "SG", "US"],
-	DE: ["NL", "GB", "SE", "FI"],
-	SE: ["DE", "NL", "FI", "GB"],
-	NL: ["DE", "GB", "SE", "FI"],
-	FI: ["SE", "DE", "NL", "GB"],
-	GB: ["DE", "NL", "SE", "FI"],
+let 键值存储 = null;
+let 键值配置 = {};
+let 键值配置上次加载 = 0;
+const 键值缓存期限 = 30 * 1000; // 30秒缓存（短窗口内跳过版本检查）
+let 键值配置版本 = '';
+// 面板自身版本号 + 自动更新相关默认设置
+const 面板版本 = 'v1.0.0';
+const 配置默认值 = {
+  wk: '',
+  ev: 'yes',
+  et: 'no',
+  ex: 'no',
+  ech: 'no',
+  tp: '',
+  customDNS: 'https://223.5.5.5/dns-query',
+  customECHDomain: 'cloudflare-ech.com',
+  alpn: '',
+  d: '',
+  p: '',
+  yx: '',
+  yxURL: '',
+  s: '',
+  homepage: '',
+  scu: 解码64('aHR0cHM6Ly91cmwudjEubWsvc3Vi'),
+  ena: 'no',
+  epd: 'yes',
+  epi: 'yes',
+  egi: 'yes',
+  ae: '',
+  rm: '',
+  qj: '',
+  dkby: 'no',
+  yxby: '',
+  ipv4: 'yes',
+  ipv6: 'yes',
+  ispMobile: 'yes',
+  ispUnicom: 'yes',
+  ispTelecom: 'yes',
+  // --- self-update settings (all stored in KV, never hardcoded) ---
+  updVerUrl: '',   // raw URL to a plain-text VERSION file, e.g. .../main/VERSION
+  updSrcUrl: '',   // raw URL to the latest worker-source.js
+  cfToken: '',     // Cloudflare API token, needs only "Workers Scripts:Edit"
+  cfAccountId: '', // Cloudflare account id the worker lives in
+  cfScriptName: '' // the Worker's script name on Cloudflare
 };
-const REGION_COUNTRY_MAP = {
-	US: "US", SG: "SG", JP: "JP", KR: "KR", DE: "DE", SE: "SE", NL: "NL", FI: "FI", GB: "GB",
-	CN: "SG", TW: "JP", AU: "SG", CA: "US", FR: "DE", IT: "DE", ES: "DE", CH: "DE", AT: "DE",
-	BE: "NL", DK: "SE", NO: "SE", IE: "GB",
+
+function 是否开启值(值, 默认启用 = false) {
+  if (值 === undefined || 值 === null || 值 === '') return 默认启用;
+  if (值 === true || 值 === false) return 值;
+  const 文本 = String(值).trim().toLowerCase();
+  if (文本 === 'yes' || 文本 === 'true' || 文本 === '1' || 文本 === 'on') return true;
+  if (文本 === 'no' || 文本 === 'false' || 文本 === '0' || 文本 === 'off') return false;
+  return 默认启用;
+}
+
+function 归一配置开关(值, 默认启用 = false) {
+  return 是否开启值(值, 默认启用) ? 'yes' : 'no';
+}
+
+function 获取配置开关值(键, 默认启用 = false, 备用值 = undefined) {
+  const 默认值 = 备用值 !== undefined ? 备用值 : (默认启用 ? 'yes' : 'no');
+  return 是否开启值(获取配置值(键, 默认值), 默认启用);
+}
+
+function 获取配置文本值(键, 默认值 = '', 备用值 = undefined) {
+  const 值 = 获取配置值(键, 备用值 !== undefined ? 备用值 : 默认值);
+  return 值 === undefined || 值 === null ? 默认值 : String(值);
+}
+
+function 整理有效配置(配置) {
+  const 快照 = {
+    ...配置默认值,
+    ...配置
+  };
+  ['ev', 'et', 'ex', 'ech', 'ena', 'epd', 'epi', 'egi', 'ipv4', 'ipv6', 'ispMobile', 'ispUnicom', 'ispTelecom'].forEach(键 => {
+    快照[键] = 归一配置开关(快照[键], 是否开启值(配置默认值[键]));
+  });
+  if (快照.ev === 'no' && 快照.et === 'no' && 快照.ex === 'no') {
+    快照.ev = 'yes';
+  }
+  if (快照.ech === 'yes') {
+    快照.dkby = 'yes';
+  }
+  return 快照;
+}
+
+function 读取环境配置值(环境值, ...名称列表) {
+  if (!环境值) return undefined;
+  for (const 名称 of 名称列表) {
+    if (环境值[名称] !== undefined && 环境值[名称] !== null && 环境值[名称] !== '') {
+      return 环境值[名称];
+    }
+  }
+  return undefined;
+}
+
+function 获取环境配置快照(环境值 = {}) {
+  const 映射 = {
+    wk: ['wk', 'WK'],
+    ev: ['ev', 'EV'],
+    et: ['et', 'ET'],
+    ex: ['ex', 'EX'],
+    ech: ['ech', 'ECH'],
+    tp: ['tp', 'TP'],
+    customDNS: ['customDNS', 'CUSTOMDNS', 'CUSTOM_DNS'],
+    customECHDomain: ['customECHDomain', 'CUSTOMECHDOMAIN', 'CUSTOM_ECH_DOMAIN'],
+    alpn: ['alpn', 'ALPN'],
+    d: ['d', 'D'],
+    p: ['p', 'P'],
+    yx: ['yx', 'YX'],
+    yxURL: ['yxURL', 'YXURL', 'YX_URL'],
+    s: ['s', 'S'],
+    homepage: ['homepage', 'HOMEPAGE'],
+    scu: ['scu', 'SCU'],
+    ena: ['ena', 'ENA'],
+    epd: ['epd', 'EPD'],
+    epi: ['epi', 'EPI'],
+    egi: ['egi', 'EGI'],
+    ae: ['ae', 'AE'],
+    rm: ['rm', 'RM'],
+    qj: ['qj', 'QJ'],
+    dkby: ['dkby', 'DKBY'],
+    yxby: ['yxby', 'YXBY'],
+    ipv4: ['ipv4', 'IPV4'],
+    ipv6: ['ipv6', 'IPV6'],
+    ispMobile: ['ispMobile', 'ISPMOBILE', 'ISP_MOBILE'],
+    ispUnicom: ['ispUnicom', 'ISPUNICOM', 'ISP_UNICOM'],
+    ispTelecom: ['ispTelecom', 'ISPTELECOM', 'ISP_TELECOM']
+  };
+  const 快照 = {};
+  for (const [键, 名称列表] of Object.entries(映射)) {
+    const 值 = 读取环境配置值(环境值, ...名称列表);
+    if (值 !== undefined) 快照[键] = 值;
+  }
+  return 快照;
+}
+
+function 获取有效配置快照(环境值 = {}) {
+  return 整理有效配置({
+    ...获取环境配置快照(环境值),
+    ...键值配置
+  });
+}
+const 地区映射 = {
+  'HK': ['🇭🇰 香港', 'HK', 'Hong Kong'],
+  'US': ['🇺🇸 美国', 'US', 'United States'],
+  'SG': ['🇸🇬 新加坡', 'SG', 'Singapore'],
+  'JP': ['🇯🇵 日本', 'JP', 'Japan'],
+  'KR': ['🇰🇷 韩国', 'KR', 'South Korea'],
+  'DE': ['🇩🇪 德国', 'DE', 'Germany'],
+  'SE': ['🇸🇪 瑞典', 'SE', 'Sweden'],
+  'NL': ['🇳🇱 荷兰', 'NL', 'Netherlands'],
+  'FI': ['🇫🇮 芬兰', 'FI', 'Finland'],
+  'GB': ['🇬🇧 英国', 'GB', 'United Kingdom'],
+  'Oracle': ['甲骨文', 'Oracle'],
+  'DigitalOcean': ['数码海', 'DigitalOcean'],
+  'Vultr': ['Vultr', 'Vultr'],
+  'Multacom': ['Multacom', 'Multacom']
 };
-function nearestRegionOrder(region) {
-	const neighbors = REGION_NEIGHBORS[region] || [];
-	const all = ["US", "SG", "JP", "KR", "DE", "SE", "NL", "FI", "GB"];
-	return [region, ...neighbors, ...all.filter((r) => r !== region && !neighbors.includes(r))];
+let 备用地址列表 = [{
+  domain: 解码64('UHJveHlJUC5ISy5DTUxpdXNzc3MubmV0'),
+  region: 'HK',
+  regionCode: 'HK',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5VUy5DTUxpdXNzc3MubmV0'),
+  region: 'US',
+  regionCode: 'US',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5TRy5DTUxpdXNzc3MubmV0'),
+  region: 'SG',
+  regionCode: 'SG',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5KUC5DTUxpdXNzc3MubmV0'),
+  region: 'JP',
+  regionCode: 'JP',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5LUi5DTUxpdXNzc3MubmV0'),
+  region: 'KR',
+  regionCode: 'KR',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5ERS5DTUxpdXNzc3MubmV0'),
+  region: 'DE',
+  regionCode: 'DE',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5TRS5DTUxpdXNzc3MubmV0'),
+  region: 'SE',
+  regionCode: 'SE',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5OTC5DTUxpdXNzc3MubmV0'),
+  region: 'NL',
+  regionCode: 'NL',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5GSS5DTUxpdXNzc3MubmV0'),
+  region: 'FI',
+  regionCode: 'FI',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5HQi5DTUxpdXNzc3MubmV0'),
+  region: 'GB',
+  regionCode: 'GB',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5PcmFjbGUuY21saXVzc3NzLm5ldA=='),
+  region: 'Oracle',
+  regionCode: 'Oracle',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5EaWdpdGFsT2NlYW4uQ01MaXVzc3NzLm5ldA=='),
+  region: 'DigitalOcean',
+  regionCode: 'DigitalOcean',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5WdWx0ci5DTUxpdXNzc3MubmV0'),
+  region: 'Vultr',
+  regionCode: 'Vultr',
+  port: 443
+}, {
+  domain: 解码64('UHJveHlJUC5NdWx0YWNvbS5DTUxpdXNzc3MubmV0'),
+  region: 'Multacom',
+  regionCode: 'Multacom',
+  port: 443
+}];
+const 直连域名列表 = [{
+  name: "cloudflare.182682.xyz",
+  domain: "cloudflare.182682.xyz"
+}, {
+  name: "speed.marisalnc.com",
+  domain: "speed.marisalnc.com"
+}, {
+  domain: "freeyx.cloudflare88.eu.org"
+}, {
+  domain: "bestcf.top"
+}, {
+  domain: "cdn.2020111.xyz"
+}, {
+  domain: "cfip.cfcdn.vip"
+}, {
+  domain: "cf.0sm.com"
+}, {
+  domain: "cf.090227.xyz"
+}, {
+  domain: "cf.zhetengsha.eu.org"
+}, {
+  domain: "cloudflare.9jy.cc"
+}, {
+  domain: "cf.zerone-cdn.pp.ua"
+}, {
+  domain: "cfip.1323123.xyz"
+}, {
+  domain: "cnamefuckxxs.yuchen.icu"
+}, {
+  domain: "cloudflare-ip.mofashi.ltd"
+}, {
+  domain: "115155.xyz"
+}, {
+  domain: "cname.xirancdn.us"
+}, {
+  domain: "f3058171cad.002404.xyz"
+}, {
+  domain: "8.889288.xyz"
+}, {
+  domain: "cdn.tzpro.xyz"
+}, {
+  domain: "cf.877771.xyz"
+}, {
+  domain: "xn--b6gac.eu.org"
+}];
+const 错误_无效数据 = atob('aW52YWxpZCBkYXRh');
+const 错误_无效用户 = atob('aW52YWxpZCB1c2Vy');
+const 错误_不支持命令 = atob('Y29tbWFuZCBpcyBub3Qgc3VwcG9ydGVk');
+const 错误_仅支持域名系统用户数据报 = atob('VURQIHByb3h5IG9ubHkgZW5hYmxlIGZvciBETlMgd2hpY2ggaXMgcG9ydCA1Mw==');
+const 错误_无效地址类型 = atob('aW52YWxpZCBhZGRyZXNzVHlwZQ==');
+const 错误_空地址 = atob('YWRkcmVzc1ZhbHVlIGlzIGVtcHR5');
+const 错误_网页套接字未打开 = atob('d2ViU29ja2V0LmVhZHlTdGF0ZSBpcyBub3Qgb3Blbg==');
+const 错误_无效标识字符串 = atob('U3RyaW5naWZpZWQgaWRlbnRpZmllciBpcyBpbnZhbGlk');
+const 错误_无效代理地址 = atob('SW52YWxpZCBTT0NLUyBhZGRyZXNzIGZvcm1hdA==');
+const 错误_代理无可用方法 = atob('bm8gYWNjZXB0YWJsZSBtZXRob2Rz');
+const 错误_代理需要认证 = atob('c29ja3Mgc2VydmVyIG5lZWRzIGF1dGg=');
+const 错误_代理认证失败 = atob('ZmFpbCB0byBhdXRoIHNvY2tzIHNlcnZlcg==');
+const 错误_代理连接失败 = atob('ZmFpbCB0byBvcGVuIHNvY2tzIGNvbm5lY3Rpb24=');
+let 已解析代理5配置 = {};
+let 是否代理已启用 = false;
+const 地址类型_四版 = 1;
+const 地址类型_网址 = 2;
+const 地址类型_六版 = 3;
+const 传输块大小 = 64 * 1024;
+const 传输下载包大小 = 32 * 1024;
+const 传输下载尾部 = 512;
+const 传输下载延迟 = 0;
+const 传输上传包大小 = 16 * 1024;
+const 传输上传队列上限 = 256 * 1024;
+const 传输连接竞速数 = 2;
+const 首字节超时 = 3500;
+const 共享解码器 = new TextDecoder();
+const 唯一标识字节缓存 = new Map();
+function 是否有效格式(字符串) {
+  const 用户正则 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return 用户正则.test(字符串);
 }
-async function getFallbackRelays(env) {
-	try {
-		const raw = await getSetting(env.DB, "fallback_relays", "[]");
-		const list = JSON.parse(raw);
-		return Array.isArray(list) ? list : [];
-	} catch (e) {
-		return [];
-	}
+function 是否有效地址(地址792) {
+  const 值4正则 = /^(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)$/;
+  if (值4正则.test(地址792)) return true;
+  const 值6正则 = /^(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}$/;
+  if (值6正则.test(地址792)) return true;
+  const 值6值正则 = /^::1$|^::$|^(?:[0-9a-fA-F]{1,4}:)*::(?:[0-9a-fA-F]{1,4}:)*[0-9a-fA-F]{1,4}$/;
+  if (值6值正则.test(地址792)) return true;
+  return false;
 }
-function pickRegionalFallbackRelay(relays, workerCountry) {
-	if (!relays.length) return null;
-	if (!workerCountry) return relays[0];
-	const region = REGION_COUNTRY_MAP[workerCountry] || null;
-	if (!region) return relays[0];
-	for (const candidateRegion of nearestRegionOrder(region)) {
-		const match = relays.find((r) => (r.region || "").toUpperCase() === candidateRegion);
-		if (match) return match;
-	}
-	return relays[0];
+function 创建节点命名器(跳过 = false) {
+  // 如果配置了 yxURL，则跳过编号
+  const 值跳过 = typeof 优选地址源 !== 'undefined' && 优选地址源 && 优选地址源.trim();
+  let 跳过编号791 = 值跳过 || 跳过;
+  const 计数器组790 = {};
+  function 设置跳过编号(本地值789) {
+    if (!值跳过) {
+      跳过编号791 = 本地值789;
+    }
+  }
+  function 处理命名器(基础名称, 节点名称788 = null) {
+    if (跳过编号791 || 基础名称 && 基础名称.includes('.')) {
+      return 节点名称788 || 基础名称;
+    }
+    if (!计数器组790[基础名称]) 计数器组790[基础名称] = 0;
+    计数器组790[基础名称]++;
+    const 索引787 = String(计数器组790[基础名称]).padStart(2, '0');
+    return `${节点名称788 || 基础名称}-${索引787}`;
+  }
+  return {
+    namer: 处理命名器,
+    setSkipNumbering: 设置跳过编号
+  };
 }
-/* Routing modes for the fallback-relay pool, stored in settings key
-   "relay_mode":
-     - "fallback_only" (default): try the real destination directly first;
-       only fall back to a region-matched relay if that direct connect fails.
-       Zero behavior change for deployments with no relays configured.
-     - "prefer_region": if a relay matches the visitor's region, connect
-       THROUGH that relay first (this is a real part of the connection
-       path, not a failure handler) — and only fall back to a plain direct
-       connect if the relay attempt itself fails. This is the mode to use
-       when the relays are meant to actively carry traffic (e.g. cleaner
-       IPs, lower latency to a given region) rather than just being a
-       last-resort. */
-async function connectDirectWithRegionalFallback(env, request, address, port, initialData, targetDoh) {
-	const relays = await getFallbackRelays(env);
-	const workerCountry = request && request.cf && request.cf.country;
-	const relay = relays.length ? pickRegionalFallbackRelay(relays, workerCountry) : null;
-	const mode = relays.length ? await getSetting(env.DB, "relay_mode", "fallback_only") : "fallback_only";
+function 规范化节点主机(主机786) {
+  return String(主机786 || '').trim().replace(/^\[([^\]]+)\]$/, '$1');
+}
+function 处理值节点别名部分(值785, 回退 = 'Node') {
+  let 文本784 = String(值785 || '').trim();
+  if (!文本784 || /^自定义优选-/i.test(文本784)) 文本784 = 回退;
+  文本784 = 文本784.replace(/^\[([^\]]+)\]$/, '$1').replace(/^https?:\/\//i, '').replace(/[/?#].*$/, '').replace(/\s+/g, '_');
+  return 文本784 || 回退;
+}
+function 获取值节点别名基础(项目783) {
+  const 主机782 = 规范化节点主机(项目783?.ip || 项目783?.domain || '');
+  if (主机782 && 主机782.includes(':') && /^[0-9a-fA-F:.]+$/.test(主机782)) return 'IPv6优选';
+  if (主机782 && !是否有效地址(主机782)) return '优选域名';
+  const 本地值781 = 处理值节点别名部分(项目783?.isp || 项目783?.name || '', 'IPv4优选');
+  const 机房780 = 处理值节点别名部分(项目783?.colo || '', '');
+  return 机房780 ? `${本地值781}-${机房780}` : 本地值781;
+}
+function 创建值节点命名器(跳过编号779 = false) {
+  const 计数器组 = {};
+  return 项目778 => {
+    const 基础 = 获取值节点别名基础(项目778);
+    if (跳过编号779) return 基础;
+    计数器组[基础] = (计数器组[基础] || 0) + 1;
+    return `${基础}-${String(计数器组[基础]).padStart(2, '0')}`;
+  };
+}
+function 规范化应用层协议协商(值777) {
+  const 本地值776 = ['', 'h3', 'h2', 'http/1.1', 'h3,h2', 'h2,http/1.1', 'h3,h2,http/1.1'];
+  const 应用层协议协商775 = String(值777 || '').trim();
+  return 本地值776.includes(应用层协议协商775) ? 应用层协议协商775 : '';
+}
+function 处理值应用层协议协商值(参数774) {
+  const 应用层协议协商 = 规范化应用层协议协商(自定义应用层协议协商);
+  if (应用层协议协商) 参数774.set('alpn', 应用层协议协商);
+}
+async function 处理值键值值(本地值773) {
+  if (本地值773.C) {
+    try {
+      键值存储 = 本地值773.C;
+      await 加载键值配置();
+    } catch (错误772) {
+      键值存储 = null;
+    }
+  } else {}
+}
+async function 加载键值配置(本地值771 = false) {
+  if (!键值存储) {
+    return;
+  }
 
-	if (mode === "prefer_region" && relay && relay.address) {
-		try {
-			return await connectDirect(relay.address, relay.port || port, initialData, targetDoh);
-		} catch (relayErr) {
-			return await connectDirect(address, port, initialData, targetDoh);
-		}
-	}
+  // 短窗口内完全信任缓存，避免高频请求时打爆 KV
+  if (!本地值771 && 键值配置上次加载 > 0 && Date.now() - 键值配置上次加载 < 键值缓存期限) {
+    return;
+  }
+  try {
+    // 读取小体积的版本键 c_ver（约 13B），用于跨 isolate 缓存失效
+    let 本地值770 = '';
+    try {
+      本地值770 = (await 键值存储.get('c_ver')) || '';
+    } catch (忽略值769) {}
 
-	try {
-		return await connectDirect(address, port, initialData, targetDoh);
-	} catch (primaryErr) {
-		if (!relay || !relay.address) throw primaryErr;
-		return await connectDirect(relay.address, relay.port || port, initialData, targetDoh);
-	}
+    // 版本未变化且已有缓存，仅刷新时间戳，跳过完整读取
+    if (!本地值771 && 本地值770 && 本地值770 === 键值配置版本 && 键值配置 && Object.keys(键值配置).length > 0) {
+      键值配置上次加载 = Date.now();
+      return;
+    }
+    const 配置数据 = await 键值存储.get('c');
+    if (配置数据) {
+      键值配置 = JSON.parse(配置数据);
+    }
+    键值配置版本 = 本地值770;
+    键值配置上次加载 = Date.now();
+  } catch (错误768) {
+    // 读取失败时保留现有缓存，避免临时故障导致配置丢失
+    if (!键值配置) 键值配置 = {};
+  }
 }
+async function 保存键值配置() {
+  if (!键值存储) {
+    return;
+  }
+  try {
+    const 配置字符串 = JSON.stringify(键值配置);
+    await 键值存储.put('c', 配置字符串);
+    // 写入版本号，让其它 isolate 在下次请求时能立即看到变更
+    const 新值 = String(Date.now());
+    键值配置版本 = 新值;
+    try {
+      await 键值存储.put('c_ver', 新值);
+    } catch (忽略值767) {}
+    键值配置上次加载 = Date.now();
+  } catch (错误766) {
+    throw 错误766;
+  }
+}
+function 获取配置值(键765, 默认值 = '') {
+  if (键值配置[键765] !== undefined) {
+    return 键值配置[键765];
+  }
+  return 默认值;
+}
+async function 设置配置值(键764, 值763) {
+  键值配置[键764] = 值763;
+  await 保存键值配置();
+}
+async function 检测工作器地区(请求762) {
+  try {
+    const 云墙国家 = 请求762.cf?.country;
+    if (云墙国家) {
+      const 国家值地区 = {
+        'US': 'US',
+        'SG': 'SG',
+        'JP': 'JP',
+        'KR': 'KR',
+        'DE': 'DE',
+        'SE': 'SE',
+        'NL': 'NL',
+        'FI': 'FI',
+        'GB': 'GB',
+        'CN': 'SG',
+        'TW': 'JP',
+        'AU': 'SG',
+        'CA': 'US',
+        'FR': 'DE',
+        'IT': 'DE',
+        'ES': 'DE',
+        'CH': 'DE',
+        'AT': 'DE',
+        'BE': 'NL',
+        'DK': 'SE',
+        'NO': 'SE',
+        'IE': 'GB'
+      };
+      if (国家值地区[云墙国家]) {
+        return 国家值地区[云墙国家];
+      }
+    }
+    return 'SG';
+  } catch (错误761) {
+    return 'SG';
+  }
+}
+async function 检查地址可用性(域名760, 端口759 = 443, 超时758 = 2000) {
+  try {
+    const 控制器757 = new AbortController();
+    const 超时标识756 = setTimeout(() => 控制器757.abort(), 超时758);
+    const 响应755 = await fetch(`https://${域名760}`, {
+      method: 'HEAD',
+      signal: 控制器757.signal,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (compatible; CF-IP-Checker/1.0)'
+      }
+    });
+    clearTimeout(超时标识756);
+    return 响应755.status < 500;
+  } catch (错误754) {
+    return true;
+  }
+}
+async function 获取值备用地址(工作器地区753 = '', 值地区匹配752 = 启用地区匹配) {
+  if (备用地址列表.length === 0) {
+    return null;
+  }
+  const 可用地址列表751 = 备用地址列表.map(地址750 => ({
+    ...地址750,
+    available: true
+  }));
+  if (值地区匹配752 && 工作器地区753) {
+    const 值地址列表749 = 获取值地区值(工作器地区753, 可用地址列表751, 值地区匹配752);
+    if (值地址列表749.length > 0) {
+      const 已选地址748 = 值地址列表749[0];
+      return 已选地址748;
+    }
+  }
+  const 已选地址 = 可用地址列表751[0];
+  return 已选地址;
+}
+function 获取值值(地区747) {
+  const 值映射 = {
+    'US': ['SG', 'JP', 'KR'],
+    'SG': ['JP', 'KR', 'US'],
+    'JP': ['SG', 'KR', 'US'],
+    'KR': ['JP', 'SG', 'US'],
+    'DE': ['NL', 'GB', 'SE', 'FI'],
+    'SE': ['DE', 'NL', 'FI', 'GB'],
+    'NL': ['DE', 'GB', 'SE', 'FI'],
+    'FI': ['SE', 'DE', 'NL', 'GB'],
+    'GB': ['DE', 'NL', 'SE', 'FI']
+  };
+  return 值映射[地区747] || [];
+}
+function 获取值值值值(地区746) {
+  const 值值745 = 获取值值(地区746);
+  const 值值744 = ['US', 'SG', 'JP', 'KR', 'DE', 'SE', 'NL', 'FI', 'GB'];
+  return [地区746, ...值值745, ...值值744.filter(结果值743 => 结果值743 !== 地区746 && !值值745.includes(结果值743))];
+}
+function 获取值地区值(工作器地区, 可用地址列表, 值地区匹配 = 启用地区匹配) {
+  if (!值地区匹配 || !工作器地区) {
+    return 可用地址列表;
+  }
+  const 值值742 = 获取值值值值(工作器地区);
+  const 值地址列表741 = [];
+  for (const 地区 of 值值742) {
+    const 地区地址列表 = 可用地址列表.filter(地址740 => 地址740.regionCode === 地区);
+    值地址列表741.push(...地区地址列表);
+  }
+  return 值地址列表741;
+}
+function 解析地址值端口(输入) {
+  if (输入.includes('[') && 输入.includes(']')) {
+    const 本地值739 = 输入.match(/^\[([^\]]+)\](?::(\d+))?$/);
+    if (本地值739) {
+      return {
+        address: 本地值739[1],
+        port: 本地值739[2] ? parseInt(本地值739[2], 10) : null
+      };
+    }
+  }
+  const 值值索引738 = 输入.lastIndexOf(':');
+  if (值值索引738 > 0) {
+    const 地址737 = 输入.substring(0, 值值索引738);
+    const 端口字符串 = 输入.substring(值值索引738 + 1);
+    const 端口736 = parseInt(端口字符串, 10);
 
-function safeDecodeURI(value) {
-	try {
-		return decodeURIComponent(value);
-	} catch (e) {
-		return value;
-	}
-}
-async function readJsonBody(request) {
-	try {
-		const body = await request.json();
-		return body && typeof body === "object" ? body : {};
-	} catch (e) {
-		return {};
-	}
-}
-async function fetchWithFallback(path, options = {}) {
-	const githubUrl = `https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/${path}`;
-	const staticUrl = `https://zeus-files.surge.sh/${path}`;
-	try {
-		const res = await fetch(githubUrl, options);
-		if (res.ok) return res;
-	} catch (e) {}
-	return await fetch(staticUrl, options);
-}
-let localLastAutoResetCheck = 0;
-async function checkAutoResets(env, ctx) {
-	const now = Date.now();
-	if (now - localLastAutoResetCheck < 3600000) return;
-	try {
-		const cache = caches.default;
-		const cacheReq = new Request("https://internal.zeus/auto_reset");
-		if (await cache.match(cacheReq)) return;
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_auto_reset_check'").first();
-		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
-		if (now - dbLastCheck < 3600000) {
-			localLastAutoResetCheck = dbLastCheck;
-			const ttl = Math.floor((3600000 - (now - dbLastCheck)) / 1000);
-			if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
-			return;
-		}
-		await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_auto_reset_check', ?)").bind(String(now)).run();
-		localLastAutoResetCheck = now;
-		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=3600" } })));
-		const todayUtc = Math.floor(now / 86400000) * 86400000;
-		await env.DB.prepare(`UPDATE users SET used_gb = 0, is_active = 1, last_reset_vol_time = ? WHERE auto_reset_vol_days > 0 AND ? >= (last_reset_vol_time + (auto_reset_vol_days * 86400000))`).bind(todayUtc, todayUtc).run();
-		await env.DB.prepare(`UPDATE users SET used_req = 0, is_active = 1, last_reset_req_time = ? WHERE auto_reset_req_days > 0 AND ? >= (last_reset_req_time + (auto_reset_req_days * 86400000))`).bind(todayUtc, todayUtc).run();
-	} catch (e) {}
-}
-let localLastIpRotateCheck = 0;
-async function checkAutoRotates(env, ctx) {
-	const now = Date.now();
-	if (now - localLastIpRotateCheck < 60000) return;
-	try {
-		const cache = caches.default;
-		const cacheReq = new Request("https://internal.zeus/auto_rotate");
-		if (await cache.match(cacheReq)) return;
-		const row = await env.DB.prepare("SELECT value FROM settings WHERE key = 'last_ip_rotate_check'").first();
-		const dbLastCheck = row ? parseInt(row.value) || 0 : 0;
-		if (now - dbLastCheck < 60000) {
-			localLastIpRotateCheck = dbLastCheck;
-			const ttl = Math.floor((60000 - (now - dbLastCheck)) / 1000);
-			if (ttl > 0 && ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": `max-age=${ttl}` } })));
-			return;
-		}
-		await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('last_ip_rotate_check', ?)").bind(String(now)).run();
-		localLastIpRotateCheck = now;
-		if (ctx) ctx.waitUntil(cache.put(cacheReq, new Response("1", { headers: { "Cache-Control": "max-age=60" } })));
-		const { results: usersToRotate } = await env.DB.prepare("SELECT * FROM users WHERE auto_rotate_ip = 1 AND ? >= (last_rotate_time + (rotate_time * 60000))").bind(now).all();
-		if (!usersToRotate || usersToRotate.length === 0) return;
-		const res = await fetchWithFallback("ips.txt");
-		if (!res.ok) return;
-		const text = await res.text();
-		const blocks = text.split("----------");
-		let cachedIpsData = {};
-		blocks.forEach((block) => {
-			const lines = block
-				.trim()
-				.split("\n")
-				.map((l) => l.trim())
-				.filter((l) => l.length > 0);
-			if (lines.length === 0) return;
-			let opName = "Unknown";
-			const ips = [];
-			lines.forEach((line) => {
-				if (line.includes("#")) opName = line.split("#")[1].trim();
-				else if (!line.startsWith("[source")) ips.push(line);
-			});
-			if (ips.length > 0) cachedIpsData[opName] = ips;
-		});
-		const stmts = [];
-		for (const u of usersToRotate) {
-			let availableIps = [];
-			if (u.ip_operator === "all") {
-				Object.values(cachedIpsData).forEach((ips) => (availableIps = availableIps.concat(ips)));
-			} else {
-				availableIps = cachedIpsData[u.ip_operator] || [];
-			}
-			availableIps = [...new Set(availableIps)];
-			let count = u.ip_count || 20;
-			let selectedIps = [];
-			if (count >= availableIps.length) {
-				selectedIps = availableIps;
-			} else {
-				const shuffled = availableIps.slice();
-				for (let i = shuffled.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-				}
-				selectedIps = shuffled.slice(0, count);
-			}
-			if (selectedIps.length > 0) {
-				stmts.push(env.DB.prepare("UPDATE users SET ips = ?, last_rotate_time = ? WHERE id = ?").bind(selectedIps.join("\n"), now, u.id));
-			}
-		}
-		if (stmts.length > 0) {
-			const batchSize = 50;
-			for (let i = 0; i < stmts.length; i += batchSize) {
-				await env.DB.batch(stmts.slice(i, i + batchSize));
-			}
-		}
-	} catch (e) {}
-}
-let cachedVipCountries = [];
-let lastVipCountriesFetch = 0;
-async function replaceBrokenProxy(username, env, oldProxy) {
-	try {
-		if (GLOBAL_WRITE_LOCK.get(username + "_proxy_rotate")) return;
-		GLOBAL_WRITE_LOCK.set(username + "_proxy_rotate", true);
-		const user = await env.DB.prepare("SELECT id, user_socks5, auto_rotate_user_proxy FROM users WHERE username = ?").bind(username).first();
-		if (!user || user.auto_rotate_user_proxy !== 1 || !user.user_socks5) {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		let proxyList = [];
-		let isArrayMode = false;
-		try {
-			if (user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-				isArrayMode = true;
-			} else {
-				proxyList = [user.user_socks5];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5];
-		}
-		let matchIndex = -1;
-		for (let i = 0; i < proxyList.length; i++) {
-			let itemStr = typeof proxyList[i] === "object" && proxyList[i] !== null ? proxyList[i].proxy : proxyList[i];
-			if (itemStr === oldProxy) {
-				matchIndex = i;
-				break;
-			}
-		}
-		if (matchIndex === -1) {
-			GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-			return;
-		}
-		let countryCode = (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null && proxyList[matchIndex].country) ? proxyList[matchIndex].country : "all";
-		try {
-			const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-			const s = await connectProxy(oldProxy, "ip-api.com", 80, payload);
-			const reader = s.readable.getReader();
-			let resStr = "";
-			const dec = new TextDecoder();
-			const timeoutId = setTimeout(() => { try { s.close(); } catch(e){} }, 2000);
-			try {
-				while (true) {
-					const res = await reader.read();
-					if (res.done || !res.value) break;
-					resStr += dec.decode(res.value, { stream: true });
-					if (resStr.includes("countryCode")) break;
-				}
-			} finally {
-				clearTimeout(timeoutId);
-				try { s.close(); } catch (e) {}
-			}
-			const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-			if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
-		} catch (e) {}
-		if (countryCode === "all") {
-			try {
-				let remain = oldProxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-				if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-				if (remain.startsWith("[")) remain = remain.substring(1, remain.indexOf("]"));
-				else if (remain.includes(":")) remain = remain.substring(0, remain.lastIndexOf(":"));
-				const geoRes = await fetch(`http://ip-api.com/json/${remain}?fields=countryCode`);
-				const geoData = await geoRes.json();
-				if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-			} catch (e) {}
-		}
-		let newProxy = null;
-		const upperCountry = countryCode.toUpperCase();
-		const sources = [];
-		const isOldProxyVIP = oldProxy.includes("@");
-		if (cachedVipCountries.length === 0 || Date.now() - lastVipCountriesFetch > 3600000) {
-			try {
-				const ghRes = await fetchWithFallback("vip-list", {
-					headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" }
-				});
-				if (ghRes.ok) {
-					const files = await ghRes.json();
-					cachedVipCountries = files.filter(f => f.name.endsWith('.txt')).map(f => f.name.replace('.txt', '').toUpperCase());
-					lastVipCountriesFetch = Date.now();
-				}
-			} catch (e) {}
-		}
-		let fallbackVIPs = cachedVipCountries.length > 0 ? [...cachedVipCountries] : ["DE", "US", "GB", "NL", "FR", "TR"];
-		for (let i = fallbackVIPs.length - 1; i > 0; i--) {
-			const j = Math.floor(Math.random() * (i + 1));
-			[fallbackVIPs[i], fallbackVIPs[j]] = [fallbackVIPs[j], fallbackVIPs[i]];
-		}
-		if (upperCountry !== "ALL" && upperCountry !== "UN") {
-			sources.push({ url: `proxy_vip/${upperCountry}.txt`, type: 'repo' });
-		}
-		for (const fc of fallbackVIPs) {
-			if (fc !== upperCountry) {
-				sources.push({ url: `proxy_vip/${fc}.txt`, type: 'repo' });
-			}
-		}
-		if (!isOldProxyVIP) {
-			if (upperCountry !== "ALL" && upperCountry !== "UN") {
-				sources.push({ url: `proxy/${upperCountry}.txt`, type: 'repo' });
-			}
-			sources.push({ url: `proxy/ALL.txt`, type: 'repo' });
-		}
-		for (const src of sources) {
-			try {
-				const res = await fetchWithFallback(src.url);
-				if (!res.ok) continue;
-				const text = await res.text();
-				const lines = text.split("\n").map(l => l.trim()).filter(l => l.length > 5);
-				if (lines.length > 0) {
-					for (let i = lines.length - 1; i > 0; i--) {
-						const j = Math.floor(Math.random() * (i + 1));
-						[lines[i], lines[j]] = [lines[j], lines[i]];
-					}
-					const testBatch = lines.slice(0, 3).flatMap(line => {
-						if (line.match(/^(socks4|socks5|socks|http|https|tg):\/\//i) || line.includes("t.me/socks")) {
-							return [line];
-						}
-						if (src.type === 'socks5') return [`socks5://${line}`];
-						if (src.type === 'http') return [`http://${line}`];
-						return [`socks5://${line}`, `http://${line}`];
-					});
-					try {
-						newProxy = await Promise.any(testBatch.map(p => {
-							return new Promise(async (resolve, reject) => {
-								let sock = null;
-								const timeoutId = setTimeout(() => { try { sock && sock.close(); } catch (e) {} reject(new Error('timeout')); }, 3000); 
-								try {
-									const payload = TEXT_ENCODER.encode("GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n");
-									sock = await connectProxy(p, "1.1.1.1", 80, payload);
-									const reader = sock.readable.getReader();
-									const res = await reader.read();
-									clearTimeout(timeoutId);
-									try { sock.close(); } catch (e) {}
-									if (res.done || !res.value) reject(new Error("empty"));
-									else resolve(p);
-								} catch (e) {
-									clearTimeout(timeoutId);
-									try { sock && sock.close(); } catch (err) {}
-									reject(e);
-								}
-							});
-						}));
-					} catch (e) {
-						continue;
-					}
-					if (newProxy) {
-						break; 
-					}
-				}
-			} catch (e) {}
-		}
-		if (newProxy) {
-			let finalProxyVal = newProxy;
-			if (isArrayMode) {
-				if (typeof proxyList[matchIndex] === "object" && proxyList[matchIndex] !== null) {
-					proxyList[matchIndex].proxy = newProxy;
-				} else {
-					proxyList[matchIndex] = newProxy;
-				}
-				finalProxyVal = JSON.stringify(proxyList);
-			}
-			await env.DB.prepare("UPDATE users SET user_socks5 = ? WHERE id = ?").bind(finalProxyVal, user.id).run();
-		}
-	} catch(e) {
-	} finally {
-		GLOBAL_WRITE_LOCK.delete(username + "_proxy_rotate");
-	}
+    // address 含 ':' 说明是裸 IPv6（如 2001:db8::1），整体当地址，无端口
+    if (!地址737.includes(':') && !isNaN(端口736) && 端口736 > 0 && 端口736 <= 65535) {
+      return {
+        address: 地址737,
+        port: 端口736
+      };
+    }
+  }
+  return {
+    address: 输入,
+    port: null
+  };
 }
 export default {
-	async fetch(request, env, ctx) {
-		if (!env.DB) {
-			return new Response("Database binding 'DB' is missing in Cloudflare Workers settings.", { status: 500 });
-		}
-		try {
-			try {
-				await DbService.ensureSchema(env.DB);
-			} catch (e) {}
-			trackRequest(env, ctx);
-			if (schemaEnsured) {
-				ctx.waitUntil(checkAutoResets(env, ctx));
-				ctx.waitUntil(checkAutoRotates(env, ctx));
-			}
-			const url = new URL(request.url);
-			if (Router.isWebSocketUpgrade(request)) {
-				return await Router.handleWebSocket(request, env, ctx);
-			}
-			if (Router.isSubscriptionPath(url.pathname)) {
-				return await Router.handleSubscription(url, env);
-			}
-			if (url.pathname.startsWith("/api/")) {
-				return await Router.handleApi(request, url, env, ctx);
-			}
-			if (url.pathname === "/panel" || url.pathname === "/login") {
-				return await Router.handlePanel(request, env);
-			}
-			if (url.pathname.startsWith("/status/")) {
-				return await Router.handleUserStatus(url, env);
-			}
-			return new Response(HTML_TEMPLATES.nginx, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		} catch (err) {
-			return new Response("Internal Server Error", { status: 500 });
-		}
-	},
-};
-const Router = {
-	isWebSocketUpgrade(request) {
-		const upgradeHeader = (request.headers.get("Upgrade") || "").toLowerCase();
-		return upgradeHeader === "websocket";
-	},
-	isSubscriptionPath(pathname) {
-		return pathname.startsWith("/sub/") || pathname.startsWith("/feed/");
-	},
-	async handleWebSocket(request, env, ctx) {
-		try {
-			return handlevIees(env, null, ctx, request);
-		} catch (e) {
-			return new Response("Internal Server Error", { status: 500 });
-		}
-	},
-	async handleSubscription(url, env) {
-		const isSubPath = url.pathname.startsWith("/sub/");
-		const offset = isSubPath ? 5 : 6;
-		let subUser = safeDecodeURI(url.pathname.slice(offset));
-		const host = url.hostname;
-		try {
-			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(subUser, subUser).first();
-			if (!user || user.connection_type !== "vl" + "e" + "ss") {
-				return new Response("Not Found", { status: 404 });
-			}
-			try {
-				await env.DB.prepare("UPDATE users SET used_req = used_req + 1 WHERE username = ?").bind(user.username).run();
-			} catch (e) {}
-			return await SubscriptionService.generateText(user, host);
-		} catch (err) {
-			return new Response("Error building config: " + err.message, { status: 500 });
-		}
-	},
-	async handlePanel(request, env) {
-		const hasPassword = await DbService.getPanelPassword(env.DB);
-		if (!hasPassword) {
-			return new Response(HTML_TEMPLATES.setup, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		}
-		const authorized = await DbService.verifyApiAuth(request, env);
-		if (!authorized) {
-			return new Response(HTML_TEMPLATES.login, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		}
-		return new Response(HTML_TEMPLATES.panel, {
-			headers: {
-				"Content-Type": "text/html; charset=utf-8",
-				"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-				Pragma: "no-cache",
-				Expires: "0",
-			},
-		});
-	},
-	async handleUserStatus(url, env) {
-		const username = safeDecodeURI(url.pathname.slice(8));
-		if (!username) {
-			return new Response("Username is required", { status: 400 });
-		}
-		try {
-			const user = await env.DB.prepare("SELECT * FROM users WHERE username = ? COLLATE NOCASE OR uuid = ?").bind(username, username).first();
-			if (!user) {
-				return new Response("User not found", { status: 404 });
-			}
-			const userJson = JSON.stringify({
-				username: user.username,
-				uuid: user.uuid,
-				limit_gb: user.limit_gb,
-				expiry_days: user.expiry_days,
-				used_gb: user.used_gb,
-				limit_req: user.limit_req,
-				used_req: user.used_req,
-				is_active: user.is_active,
-				online_count: getActiveIpCount(user.active_ips),
-				ip_limit: user.ip_limit,
-				created_at: user.created_at,
-				tls: user.tls,
-				port: user.port,
-				ips: user.ips,
-				fingerprint: user.fingerprint || "chrome",
-				user_proxy_iata: user.user_proxy_iata,
-				user_socks5: user.user_socks5,
-				user_proxy_ip: user.user_proxy_ip,
-			});
-			const html = HTML_TEMPLATES.status.replace("/* {{USER_DATA_PLACEHOLDER}} */", `window.statusUser = ${userJson};`);
-			return new Response(html, {
-				headers: { "Content-Type": "text/html; charset=utf-8" },
-			});
-		} catch (err) {
-			return new Response("Error: " + err.message, { status: 500 });
-		}
-	},
-	async handleApi(request, url, env, ctx) {
-		const hasPassword = await DbService.getPanelPassword(env.DB);
-		if (url.pathname === "/api/setup-password" && request.method === "POST") {
-			if (hasPassword) {
-				return new Response(JSON.stringify({ error: "رمز عبور از قبل تعریف شده است" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const { password } = await readJsonBody(request);
-			if (!password || password.length < 4) {
-				return new Response(JSON.stringify({ error: "رمز عبور باید حداقل ۴ کاراکتر باشد" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const hashed = await DbService.sha256(password);
-			await DbService.setPanelPassword(env.DB, hashed);
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + hashed + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-				},
-			});
-		}
-		if (url.pathname === "/api/login" && request.method === "POST") {
-			const clientIP = request.headers.get("CF-Connecting-IP") || "unknown";
-			const now = Date.now();
-			if (LOGIN_ATTEMPTS.size > 256) {
-				for (const [ip, rec] of LOGIN_ATTEMPTS) {
-					if (now - rec.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
-				}
-			}
-			const attemptRecord = LOGIN_ATTEMPTS.get(clientIP) || { count: 0, lastAttempt: 0 };
-			if (attemptRecord.count >= 5 && (now - attemptRecord.lastAttempt) < 900000) {
-				const remaining = Math.ceil((900000 - (now - attemptRecord.lastAttempt)) / 60000);
-				return new Response(JSON.stringify({ error: `دسترسی شما مسدود شد. لطفاً ${remaining} دقیقه دیگر تلاش کنید.` }), {
-					status: 429,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const { password } = await readJsonBody(request);
-			const hashedInput = await DbService.sha256(password);
-			const storedHash = await DbService.getPanelPassword(env.DB);
-			let isValid = false;
-			if (storedHash === hashedInput) {
-				isValid = true;
-			} else {
-				const oldHashedInput = await DbService.oldSha256(password);
-				if (storedHash === oldHashedInput) {
-					isValid = true;
-					await DbService.setPanelPassword(env.DB, hashedInput);
-				}
-			}
-			if (isValid) {
-				LOGIN_ATTEMPTS.delete(clientIP); 
-				return new Response(JSON.stringify({ success: true }), {
-					headers: {
-						"Content-Type": "application/json; charset=utf-8",
-						"Set-Cookie": "panel_session=" + hashedInput + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-					},
-				});
-			} else {
-				attemptRecord.count = (now - attemptRecord.lastAttempt > 900000) ? 1 : attemptRecord.count + 1;
-				attemptRecord.lastAttempt = now;
-				LOGIN_ATTEMPTS.set(clientIP, attemptRecord);
-				return new Response(JSON.stringify({ error: `رمز عبور اشتباه است (تلاش‌های باقی‌مانده: ${5 - attemptRecord.count})` }), {
-					status: 401,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
-		if (url.pathname === "/api/logout" && request.method === "POST") {
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=; Path=/; Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax",
-				},
-			});
-		}
-		if (url.pathname === "/api/recover" && request.method === "POST") {
-			const { api_token } = await readJsonBody(request);
-			if (!api_token) {
-				return new Response(JSON.stringify({ error: "Token is required" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			try {
-				const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-					headers: { Authorization: "Bearer " + api_token },
-				});
-				const cfData = await cfRes.json();
-				if (!cfRes.ok || !cfData.success) {
-					return new Response(JSON.stringify({ error: "Invalid or expired Cloudflare token" }), {
-						status: 401,
-						headers: { "Content-Type": "application/json; charset=utf-8" },
-					});
-				}
-				const host = url.hostname;
-				let isAuthorized = false;
-				if (host.endsWith(".workers.dev")) {
-					const parts = host.split(".");
-					const targetSubdomain = parts[parts.length - 3];
-					const accountsRes = await fetch("https://api.cloudflare.com/client/v4/accounts", {
-						headers: { Authorization: "Bearer " + api_token },
-					});
-					const accountsData = await accountsRes.json();
-					if (accountsData.success && accountsData.result) {
-						for (const acc of accountsData.result) {
-							const subRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${acc.id}/workers/subdomain`, {
-								headers: { Authorization: "Bearer " + api_token },
-							});
-							const subData = await subRes.json();
-							if (subData.success && subData.result && subData.result.subdomain === targetSubdomain) {
-								isAuthorized = true;
-								break;
-							}
-						}
-					}
-				} else {
-					const zonesRes = await fetch("https://api.cloudflare.com/client/v4/zones", {
-						headers: { Authorization: "Bearer " + api_token },
-					});
-					const zonesData = await zonesRes.json();
-					if (zonesData.success && zonesData.result) {
-						for (const zone of zonesData.result) {
-							if (host === zone.name || host.endsWith("." + zone.name)) {
-								isAuthorized = true;
-								break;
-							}
-						}
-					}
-				}
-				if (!isAuthorized) {
-					return new Response(JSON.stringify({ error: "این توکن متعلق به صاحب پـنـل نیست (ای کــثـــکـــش)" }), {
-						status: 403,
-						headers: { "Content-Type": "application/json; charset=utf-8" },
-					});
-				}
-				await env.DB.prepare("DELETE FROM settings WHERE key = 'panel_password'").run();
-				cachedPanelPassword = null;
-				return new Response(JSON.stringify({ success: true }), {
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			} catch (err) {
-				return new Response(JSON.stringify({ error: "Cloudflare API connection error" }), {
-					status: 500,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-		}
-		if (url.pathname === "/api/tg/webhook" && request.method === "POST") {
-			return await handleTelegramWebhook(request, env);
-		}
-		const authorized = await DbService.verifyApiAuth(request, env);
-		if (!authorized && url.pathname !== "/api/test-proxy") {
-			return new Response(JSON.stringify({ error: "Unauthorized" }), {
-				status: 401,
-				headers: { "Content-Type": "application/json; charset=utf-8" },
-			});
-		}
-		if (url.pathname === "/api/tg/setup" && request.method === "POST") {
-			return await handleTelegramSetup(request, url, env);
-		}
-		if (url.pathname === "/api/tg/status" && request.method === "GET") {
-			const tg = await getTelegramConfig(env);
-			return new Response(JSON.stringify({ enabled: tg.enabled, botUsername: tg.botUsername, hasToken: !!tg.token }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-		}
-		if (url.pathname === "/api/fallback-relays") {
-			if (request.method === "GET") {
-				const list = await getFallbackRelays(env);
-				const mode = await getSetting(env.DB, "relay_mode", "fallback_only");
-				return new Response(JSON.stringify({ relays: list, mode: mode }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-			if (request.method === "POST") {
-				const body = await readJsonBody(request);
-				const list = Array.isArray(body.relays) ? body.relays.filter((r) => r && r.address) : [];
-				await setSetting(env.DB, "fallback_relays", JSON.stringify(list));
-				if (body.mode === "prefer_region" || body.mode === "fallback_only") await setSetting(env.DB, "relay_mode", body.mode);
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json; charset=utf-8" } });
-			}
-		}
-		if (url.pathname === "/api/auto-update-setup" && request.method === "POST") {
-			const body = await readJsonBody(request);
-			if (body.action === "check") {
-				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-				const hasToken = !!env.CF_API_TOKEN || !!(dbTokenRow && dbTokenRow.value);
-				const autoUpdateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'auto_update'").first();
-				const isAutoUpdateEnabled = autoUpdateRow ? autoUpdateRow.value === '1' : false;
-				return new Response(JSON.stringify({ has_token: hasToken, auto_update: isAutoUpdateEnabled }), { headers: { "Content-Type": "application/json" } });
-			}
-			if (body.action === "enable") {
-				const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-				let token = body.token || env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null);
-				if (!token) return new Response(JSON.stringify({ error: "TOKEN_MISSING" }), { status: 400, headers: { "Content-Type": "application/json" } });
-				try {
-					const cfRes = await fetch("https://api.cloudflare.com/client/v4/user/tokens/verify", {
-						headers: { Authorization: "Bearer " + token },
-					});
-					const cfData = await cfRes.json();
-					if (!cfRes.ok || !cfData.success) {
-						return new Response(JSON.stringify({ error: "INVALID_TOKEN" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('cf_token', ?)").bind(token).run();
-					await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '1')").run();
-					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-				} catch(e) {
-					return new Response(JSON.stringify({ error: "خطا در بررسی توکن با کلودفلر" }), { status: 500, headers: { "Content-Type": "application/json" } });
-				}
-			}
-			if (body.action === "disable") {
-				await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('auto_update', '0')").run();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/restart-core" && request.method === "POST") {
-			try {
-				GLOBAL_TRAFFIC_CACHE.clear();
-				ACTIVE_CONNECTIONS_COUNT.clear();
-				GLOBAL_LAST_ACTIVE_WRITE.clear();
-				GLOBAL_LAST_DB_WRITE.clear();
-				GLOBAL_WRITE_LOCK.clear();
-				DNS_CACHE.clear();
-				USER_REQ_CACHE.clear();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/update-panel" && request.method === "POST") {
-			const body = await request.json().catch(() => ({}));
-			const dbTokenRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'cf_token'").first();
-			let currentToken = env.CF_API_TOKEN || (dbTokenRow ? dbTokenRow.value : null) || body.cf_token || null;
-			let currentAccountId = env.CF_ACCOUNT_ID;
-			if (!currentToken) {
-				return new Response(JSON.stringify({ error: "TOKEN_REQUIRED" }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-			try {
-				const cfHeaders = {
-					"Authorization": "Bearer " + currentToken,
-					"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ZeusPanel/1.0"
-				};
-				if (!currentAccountId) {
-					const accRes = await fetch("https://api.cloudflare.com/client/v4/accounts", { headers: cfHeaders });
-					if (!accRes.ok) throw new Error("کلودفلر درخواست اکانت را رد کرد (وضعیت: " + accRes.status + ")");
-					const accData = await accRes.json().catch(() => ({}));
-					if (!accData.success || !accData.result || accData.result.length === 0) throw new Error("توکن نامعتبر است یا اکانتی یافت نشد.");
-					currentAccountId = accData.result[0].id;
-				}
-				const githubRes = await fetchWithFallback("zeus.obfuscated.js?t=" + Date.now(), {
-					headers: {
-						"User-Agent": "Mozilla/5.0",
-						"Cache-Control": "no-cache"
-					}
-				});
-				if (!githubRes.ok) throw new Error("خطا در دریافت سورس جدید از گیت‌هاب (وضعیت: " + githubRes.status + ")");
-				const newCode = await githubRes.text();
-				const scriptName = env.WORKER_NAME || url.hostname.split(".")[0];
-				const bindingsRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}/bindings`, {
-					headers: cfHeaders
-				});
-				if (!bindingsRes.ok) throw new Error("عدم دسترسی به تنظیمات ورکر. کلودفلر خطا داد (وضعیت: " + bindingsRes.status + ")");
-				const bindingsData = await bindingsRes.json().catch(() => ({}));
-				if (!bindingsData.success) throw new Error("توکن فاقد دسترسی ویرایش ورکر است.");
-				const newBindings = [];
-				for (const b of bindingsData.result || []) {
-					if (b.name === "CF_API_TOKEN" || b.name === "CF_ACCOUNT_ID") continue;
-					if (b.type === "d1") {
-						newBindings.push({ type: "d1", name: b.name, id: b.database_id || b.id });
-					} else if (b.type === "kv_namespace") {
-						newBindings.push({ type: "kv_namespace", name: b.name, namespace_id: b.namespace_id || b.id });
-					} else if (b.type === "plain_text") {
-						newBindings.push({ type: "plain_text", name: b.name, text: b.text || "" });
-					} else if (b.type !== "secret_text") {
-						newBindings.push(b);
-					}
-				}
-				newBindings.push({ type: "secret_text", name: "CF_API_TOKEN", text: currentToken });
-				newBindings.push({ type: "secret_text", name: "CF_ACCOUNT_ID", text: currentAccountId });
-				const metadata = {
-					main_module: "zeus.js",
-					compatibility_date: "2026-07-10",
-					compatibility_flags: ["nodejs_compat"],
-					bindings: newBindings
-				};
-				const formData = new FormData();
-				formData.append("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }), "metadata.json");
-				formData.append("zeus.js", new Blob([newCode], { type: "application/javascript+module" }), "zeus.js");
-				const deployRes = await fetch(`https://api.cloudflare.com/client/v4/accounts/${currentAccountId}/workers/scripts/${scriptName}`, {
-					method: "PUT",
-					headers: cfHeaders,
-					body: formData
-				});
-				if (!deployRes.ok) {
-					const errText = await deployRes.text().catch(() => "");
-					throw new Error("خطای کلودفلر هنگام دیپلوی (" + deployRes.status + "): " + errText.substring(0, 150));
-				}
-				const deployData = await deployRes.json().catch(() => ({}));
-				if (!deployData.success) {
-					const cfError = deployData.errors && deployData.errors.length > 0 ? deployData.errors[0].message : "خطا در اعمال آپدیت.";
-					throw new Error(cfError);
-				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			} catch (err) {
-				return new Response(JSON.stringify({ error: err.message }), { status: 400, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/change-password" && request.method === "POST") {
-			const { current_password, new_password } = await readJsonBody(request);
-			if (!current_password || !new_password) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی و جدید الزامی هستند" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const currentHash = await DbService.sha256(current_password);
-			const oldCurrentHash = await DbService.oldSha256(current_password);
-			const storedHash = await DbService.getPanelPassword(env.DB);
-			if (storedHash && storedHash !== currentHash && storedHash !== oldCurrentHash) {
-				return new Response(JSON.stringify({ error: "رمز عبور فعلی اشتباه است" }), {
-					status: 401,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			if (new_password.length < 4) {
-				return new Response(JSON.stringify({ error: "رمز عبور جدید باید حداقل ۴ کاراکتر باشد" }), {
-					status: 400,
-					headers: { "Content-Type": "application/json; charset=utf-8" },
-				});
-			}
-			const newHash = await DbService.sha256(new_password);
-			await DbService.setPanelPassword(env.DB, newHash);
-			return new Response(JSON.stringify({ success: true }), {
-				headers: {
-					"Content-Type": "application/json; charset=utf-8",
-					"Set-Cookie": "panel_session=" + newHash + "; Path=/; HttpOnly; Secure; SameSite=Lax; Max-Age=31536000",
-				},
-			});
-		}
-		if (url.pathname === "/api/settings/bulk") {
-			if (request.method === "GET") {
-				try {
-					const { results } = await env.DB.prepare("SELECT * FROM settings").all();
-					const settingsObj = {};
-					if (results) {
-						results.forEach((r) => {
-							if (r.key !== 'cf_token' && r.key !== 'panel_password') settingsObj[r.key] = r.value;
-						});
-					}
-					return new Response(JSON.stringify(settingsObj), { headers: { "Content-Type": "application/json" } });
-				} catch (e) {
-					return new Response(JSON.stringify({}), { headers: { "Content-Type": "application/json" } });
-				}
-			}
-			if (request.method === "POST") {
-				const body = await readJsonBody(request);
-				if (body.settings && typeof body.settings === "object") {
-					for (const [k, v] of Object.entries(body.settings)) {
-						await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)").bind(k, String(v)).run();
-					}
-				}
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname === "/api/proxy-ip") {
-			if (request.method === "POST") {
-				const { proxy_ip, iata, socks5 } = await readJsonBody(request);
-				if (proxy_ip) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_ip', ?)").bind(proxy_ip).run();
-				if (iata !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('proxy_location_iata', ?)").bind(iata).run();
-				if (socks5 !== undefined) await env.DB.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('socks5', ?)").bind(socks5).run();
-				return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-			}
-			if (request.method === "GET") {
-				const rowIp = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_ip'").first();
-				const rowIata = await env.DB.prepare("SELECT value FROM settings WHERE key = 'proxy_location_iata'").first();
-				const rowSocks = await env.DB.prepare("SELECT value FROM settings WHERE key = 'socks5'").first();
-				return new Response(
-					JSON.stringify({
-						proxy_ip: rowIp ? rowIp.value : "",
-						iata: rowIata ? rowIata.value : "",
-						socks5: rowSocks ? rowSocks.value : "",
-					}),
-					{ headers: { "Content-Type": "application/json" } },
-				);
-			}
-		}
-		if (url.pathname === "/api/test-proxy" && request.method === "POST") {
-			const { proxy } = await readJsonBody(request);
-			if (!proxy) return new Response(JSON.stringify({ error: "پـروکـسـی وارد نشده است" }), { status: 400, headers: { "Content-Type": "application/json" } });
-			try {
-				let ip = "";
-				let workingProxy = proxy;
-				if (proxy.includes("t.me/socks") || proxy.includes("tg://socks")) {
-					ip = proxy.match(/server=([^&]+)/)?.[1] || "";
-				} else {
-					let cleanProxy = proxy.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					let remain = cleanProxy;
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						ip = remain.substring(1, remain.indexOf("]"));
-					} else {
-						const lastColon = remain.lastIndexOf(":");
-						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
-						else ip = remain;
-					}
-				}
-				let country = "UN";
-				const startTime = Date.now();
-				const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-				const s = await connectProxy(proxy, "ip-api.com", 80, payload);
-				const reader = s.readable.getReader();
-				let resStr = "";
-				const dec = new TextDecoder();
-				try {
-					while (true) {
-						const res = await reader.read();
-						if (res.done || !res.value) break;
-						resStr += dec.decode(res.value, { stream: true });
-						if (resStr.includes("countryCode")) break;
-					}
-				} finally {
-					try { s.close(); } catch (e) {}
-				}
-				if (!resStr) {
-					throw new Error("تایم‌اوت در دریافت دیتا");
-				}
-				const ping = Date.now() - startTime;
-				try {
-					const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-					if (jsonMatch && jsonMatch[1]) country = jsonMatch[1];
-				} catch (e) {}
-				if (country === "UN" && ip) {
-					try {
-						const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-						const geoData = await geoRes.json();
-						if (geoData && geoData.countryCode) country = geoData.countryCode;
-					} catch (e) {}
-				}
-				return new Response(JSON.stringify({ success: true, ping, country }), { headers: { "Content-Type": "application/json" } });
-			} catch (e) {
-				let msg = e.message;
-				if (msg.includes("Stream was cancelled") || msg.includes("network")) msg = "ارتباط با سرور قطع شد (احتمالاً پـروکـسـی مسدود یا خاموش است)";
-				else if (msg.includes("timeout") || msg.includes("timed out") || msg.includes("تایم‌اوت")) msg = "تایم‌اوت در اتصال (پـروکـسـی در دسترس نیست)";
-				else if (msg.includes("Invalid URL") || msg.includes("Invalid format")) msg = "فرمت وارد شده برای پـروکـسـی اشتباه است";
-				else if (msg === "err") msg = "خطای نامشخص (ارتباط برقرار نشد)";
-				return new Response(JSON.stringify({ error: msg }), { status: 500, headers: { "Content-Type": "application/json" } });
-			}
-		}
-		if (url.pathname.startsWith("/api/users")) {
-			const pathParts = url.pathname.split("/");
-			const isUserAction = pathParts.length > 3;
-			if (isUserAction) {
-				const username = safeDecodeURI(pathParts.pop());
-				if (request.method === "PUT") {
-					const body = await readJsonBody(request);
-					if (Object.keys(body).length === 0) {
-						return new Response(JSON.stringify({ error: "Invalid request body" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (body.toggle_only !== undefined) {
-						await env.DB.prepare("UPDATE users SET is_active = CASE WHEN is_active = 1 THEN 0 ELSE 1 END WHERE username = ?").bind(username).run();
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} else if (body.reset_action !== undefined) {
-						if (body.reset_action === "volume") {
-							await env.DB.prepare("UPDATE users SET used_gb = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							GLOBAL_TRAFFIC_CACHE.set(username, 0);
-						} else if (body.reset_action === "req") {
-							await env.DB.prepare("UPDATE users SET used_req = 0, is_active = 1 WHERE username = ?").bind(username).run();
-							USER_REQ_CACHE.set(username, 0);
-						} else if (body.reset_action === "time") {
-							await env.DB.prepare("UPDATE users SET created_at = CURRENT_TIMESTAMP, is_active = 1 WHERE username = ?").bind(username).run();
-						}
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} else {
-						const { username: new_username, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = body;
-						if (new_username && new_username !== username) {
-							if (!/^[a-zA-Z0-9_-]+$/.test(new_username)) {
-								return new Response(JSON.stringify({ error: "نام کاربری جدید غیرمجاز است" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-							}
-							const existing = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(new_username).first();
-							if (existing) {
-								return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json" } });
-							}
-							if (GLOBAL_TRAFFIC_CACHE.has(username)) {
-								GLOBAL_TRAFFIC_CACHE.set(new_username, GLOBAL_TRAFFIC_CACHE.get(username));
-								GLOBAL_TRAFFIC_CACHE.delete(username);
-							}
-							if (USER_REQ_CACHE.has(username)) {
-								USER_REQ_CACHE.set(new_username, USER_REQ_CACHE.get(username));
-								USER_REQ_CACHE.delete(username);
-							}
-							if (ACTIVE_CONNECTIONS_COUNT.has(username)) {
-								ACTIVE_CONNECTIONS_COUNT.set(new_username, ACTIVE_CONNECTIONS_COUNT.get(username));
-								ACTIVE_CONNECTIONS_COUNT.delete(username);
-							}
-							if (GLOBAL_LAST_ACTIVE_WRITE.has(username)) {
-								GLOBAL_LAST_ACTIVE_WRITE.set(new_username, GLOBAL_LAST_ACTIVE_WRITE.get(username));
-								GLOBAL_LAST_ACTIVE_WRITE.delete(username);
-							}
-						}
-						await env.DB.prepare("UPDATE users SET username = ?, limit_gb = ?, expiry_days = ?, limit_req = ?, ips = ?, tls = ?, port = ?, fingerprint = ?, max_connections = ?, ip_limit = ?, block_porn = ?, block_ads = ?, frag_len = ?, frag_int = ?, user_proxy_iata = ?, user_socks5 = ?, user_proxy_ip = ?, auto_reset_vol_days = ?, auto_reset_req_days = ?, auto_rotate_ip = ?, rotate_time = ?, ip_operator = ?, ip_count = ?, auto_rotate_user_proxy = ? WHERE username = ?")
-							.bind(new_username || username, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, auto_rotate_user_proxy ? 1 : 0, username)
-							.run();
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					}
-				}
-				if (request.method === "DELETE") {
-					await env.DB.prepare("DELETE FROM users WHERE username = ?").bind(username).run();
-					return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-				}
-			} else {
-				if (request.method === "GET") {
-					try {
-						await flushExpiredTraffic(env);
-					} catch (e) {}
-					try {
-						const { results } = await env.DB.prepare("SELECT * FROM users ORDER BY id DESC").all();
-						const now = Date.now();
-						const enrichedUsers = (results || []).map((user) => ({
-							...user,
-							is_online: user.last_active && now - user.last_active < 20000 ? 1 : 0,
-							online_count: getActiveIpCount(user.active_ips),
-						}));
-						let cfReqs = { today: 0, total: 0 };
-						try {
-							const liveCf = await getCfUsage(env);
-							const todayStr = new Date().toISOString().split("T")[0];
-							const dateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-							const totalRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_total'").first();
-							let dbTotal = totalRow ? parseInt(totalRow.value) || 0 : 0;
-							let dbToday = 0;
-							if (dateRow && dateRow.value === todayStr) {
-								const todayRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_today'").first();
-								dbToday = todayRow ? parseInt(todayRow.value) || 0 : 0;
-							}
-							if (liveCf.today > dbToday) {
-								dbToday = liveCf.today;
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbToday), String(dbToday)).run();
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(todayStr, todayStr).run();
-							}
-							if (liveCf.total > dbTotal) {
-								dbTotal = liveCf.total;
-								await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(dbTotal), String(dbTotal)).run();
-							}
-							cfReqs.today = dbToday + GLOBAL_REQ_COUNT;
-							cfReqs.total = dbTotal + GLOBAL_REQ_COUNT;
-						} catch (e) {}
-						return new Response(
-							JSON.stringify({
-								users: enrichedUsers,
-								serverTime: now,
-								cfRequestsToday: cfReqs.today,
-								cfRequestsTotal: cfReqs.total,
-							}),
-							{
-								headers: {
-									"Content-Type": "application/json",
-									"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-								},
-							},
-						);
-					} catch (dbErr) {
-						return new Response(
-							JSON.stringify({
-								users: [],
-								serverTime: Date.now(),
-								cfRequestsToday: 0,
-								cfRequestsTotal: 0,
-								error: dbErr.message
-							}),
-							{
-								status: 200, 
-								headers: {
-									"Content-Type": "application/json",
-									"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-								},
-							}
-						);
-					}
-				}
-				if (request.method === "POST") {
-					const { username, uuid, limit_gb, expiry_days, limit_req, ips, tls, port, fingerprint, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, auto_rotate_ip, rotate_time, ip_operator, ip_count, auto_rotate_user_proxy } = await readJsonBody(request);
-					if (!username) {
-						return new Response(JSON.stringify({ error: "نام کاربری اجباری است" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (username.length > 32) {
-						return new Response(JSON.stringify({ error: "نام کاربری نمی‌تواند بیشتر از ۳۲ کاراکتر باشد" }), { status: 400, headers: { "Content-Type": "application/json" } });
-					}
-					if (!/^[a-zA-Z0-9_-]+$/.test(username)) {
-						return new Response(JSON.stringify({ error: "نام کاربری غیرمجاز است (فقط حروف، اعداد، خط تیره و آندرلاین)" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-					}
-					let finalUuid = uuid;
-					if (!finalUuid) {
-						const randomHex = Array.from(crypto.getRandomValues(new Uint8Array(6)))
-							.map(b => b.toString(16).padStart(2, "0"))
-							.join("");
-						finalUuid = `50414e45-4c5f-5a45-5553-${randomHex}`;
-					}
-					const parsedUsedGb = parseFloat(used_gb);
-					const finalUsedGb = !isNaN(parsedUsedGb) ? parsedUsedGb : 0;
-					const parsedUsedReq = parseInt(used_req);
-					const finalUsedReq = !isNaN(parsedUsedReq) ? parsedUsedReq : 0;
-					const finalCreatedAt = created_at || new Date().toISOString();
-					const parsedIsActive = parseInt(is_active);
-					const finalIsActive = !isNaN(parsedIsActive) ? parsedIsActive : 1;
-					const existingUser = await env.DB.prepare("SELECT id FROM users WHERE username = ? COLLATE NOCASE").bind(username).first();
-					if (existingUser) {
-						return new Response(JSON.stringify({ error: "این نام کاربری از قبل وجود دارد" }), { status: 400, headers: { "Content-Type": "application/json; charset=utf-8" } });
-					}
-					try {
-						const todayUtc = Math.floor(Date.now() / 86400000) * 86400000;
-						const nowTime = Date.now();
-						await env.DB.prepare("INSERT INTO users (username, uuid, limit_gb, expiry_days, limit_req, ips, connection_type, tls, port, fingerprint, max_connections, ip_limit, used_gb, used_req, created_at, is_active, block_porn, block_ads, frag_len, frag_int, user_proxy_iata, user_socks5, user_proxy_ip, auto_reset_vol_days, auto_reset_req_days, last_reset_vol_time, last_reset_req_time, auto_rotate_ip, rotate_time, ip_operator, ip_count, last_rotate_time, auto_rotate_user_proxy) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-							.bind(username, finalUuid, limit_gb ? parseFloat(limit_gb) : null, expiry_days ? parseInt(expiry_days) : null, limit_req ? parseInt(limit_req) : null, ips || null, "vl" + "e" + "ss", tls, port, fingerprint || "chrome", ip_limit ? parseInt(ip_limit) : null, ip_limit ? parseInt(ip_limit) : null, finalUsedGb, finalUsedReq, finalCreatedAt, finalIsActive, block_porn ? 1 : 0, block_ads ? 1 : 0, frag_len !== undefined ? frag_len : "200-3000", frag_int !== undefined ? frag_int : "1-2", user_proxy_iata || null, user_socks5 || null, user_proxy_ip || null, auto_reset_vol_days ? parseInt(auto_reset_vol_days) : 0, auto_reset_req_days ? parseInt(auto_reset_req_days) : 0, todayUtc, todayUtc, auto_rotate_ip || 0, rotate_time || 0, ip_operator || "all", ip_count || 20, nowTime, auto_rotate_user_proxy ? 1 : 0)
-							.run();
-						return new Response(JSON.stringify({ success: true }), { headers: { "Content-Type": "application/json" } });
-					} catch (err) {
-						return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: { "Content-Type": "application/json" } });
-					}
-				}
-			}
-		}
-		return new Response(JSON.stringify({ error: "Not Found" }), { status: 404, headers: { "Content-Type": "application/json" } });
-	},
-};
-let schemaEnsured = false;
-let schemaPromise = null;
-let cachedPanelPassword = null;
-const DbService = {
-	async ensureSchema(db) {
-		if (schemaEnsured) return;
-		if (schemaPromise) {
-			await schemaPromise;
-			return;
-		}
-		schemaPromise = (async () => {
-			try {
-				await db.prepare(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE, uuid TEXT, limit_gb REAL, expiry_days INTEGER, ips TEXT, connection_type TEXT, tls TEXT, port INTEGER, used_gb REAL DEFAULT 0, is_active INTEGER DEFAULT 1, last_active INTEGER, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`).run();
-			} catch (e) {}
-			try {
-				await db.prepare("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)").run();
-			} catch (e) {}
-			try {
-				const { results } = await db.prepare("PRAGMA table_info(users)").all();
-				const existingCols = new Set((results || []).map((r) => r.name));
-				const colsToAdd = [
-					{ name: "is_active", def: "INTEGER DEFAULT 1" },
-					{ name: "last_active", def: "INTEGER" },
-					{ name: "fingerprint", def: "TEXT DEFAULT 'chrome'" },
-					{ name: "max_connections", def: "INTEGER" },
-					{ name: "limit_req", def: "INTEGER" },
-					{ name: "used_req", def: "INTEGER DEFAULT 0" },
-					{ name: "ip_limit", def: "INTEGER DEFAULT NULL" },
-					{ name: "active_ips", def: "TEXT DEFAULT NULL" },
-					{ name: "block_porn", def: "INTEGER DEFAULT 0" },
-					{ name: "block_ads", def: "INTEGER DEFAULT 0" },
-					{ name: "frag_len", def: "TEXT DEFAULT '200-3000'" },
-					{ name: "frag_int", def: "TEXT DEFAULT '1-2'" },
-					{ name: "lifetime_used_gb", def: "REAL DEFAULT 0" },
-					{ name: "user_proxy_ip", def: "TEXT DEFAULT NULL" },
-					{ name: "user_proxy_iata", def: "TEXT DEFAULT NULL" },
-					{ name: "user_socks5", def: "TEXT DEFAULT NULL" },
-					{ name: "auto_reset_vol_days", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_reset_req_days", def: "INTEGER DEFAULT 0" },
-					{ name: "last_reset_vol_time", def: "INTEGER DEFAULT 0" },
-					{ name: "last_reset_req_time", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_rotate_ip", def: "INTEGER DEFAULT 0" },
-					{ name: "rotate_time", def: "INTEGER DEFAULT 0" },
-					{ name: "ip_operator", def: "TEXT DEFAULT 'all'" },
-					{ name: "ip_count", def: "INTEGER DEFAULT 20" },
-					{ name: "last_rotate_time", def: "INTEGER DEFAULT 0" },
-					{ name: "auto_rotate_user_proxy", def: "INTEGER DEFAULT 0" },
-					{ name: "telegram_chat_id", def: "TEXT DEFAULT NULL" }
-				];
-				const stmts = [];
-				for (const col of colsToAdd) {
-					if (!existingCols.has(col.name)) {
-						stmts.push(db.prepare(`ALTER TABLE users ADD COLUMN ${col.name} ${col.def}`));
-					}
-				}
-				if (stmts.length > 0) {
-					await db.batch(stmts);
-				}
-			} catch (e) {}
-			try {
-				await db.prepare("UPDATE users SET ip_limit = max_connections WHERE ip_limit IS NULL AND max_connections IS NOT NULL").run();
-			} catch (e) {}
-			try {
-				await db.prepare("UPDATE users SET lifetime_used_gb = used_gb WHERE lifetime_used_gb = 0 OR lifetime_used_gb IS NULL").run();
-			} catch (e) {}
-		})();
-		await schemaPromise;
-		schemaEnsured = true;
-	},
-	async getPanelPassword(db) {
-		if (cachedPanelPassword !== null) return cachedPanelPassword;
-		try {
-			const row = await db.prepare("SELECT value FROM settings WHERE key = 'panel_password'").first();
-			cachedPanelPassword = row ? row.value : "";
-			return cachedPanelPassword || null;
-		} catch (e) {
-			return null;
-		}
-	},
-	async setPanelPassword(db, password) {
-		await db.prepare("INSERT OR REPLACE INTO settings (key, value) VALUES ('panel_password', ?)").bind(password).run();
-		cachedPanelPassword = password;
-	},
-	async verifyApiAuth(request, env) {
-		const storedPasswordHash = await this.getPanelPassword(env.DB);
-		if (!storedPasswordHash) return true;
-		const cookies = request.headers.get("Cookie") || "";
-		const sessionCookie = cookies.split(";").find((c) => c.trim().startsWith("panel_session="));
-		if (!sessionCookie) return false;
-		const sessionToken = sessionCookie.split("=")[1].trim();
-		return sessionToken === storedPasswordHash;
-	},
-	async sha256(message) {
-		const salt = "ZEUS_PANEL_SECURE_SALT_2026";
-		const msgBuffer = new TextEncoder().encode(message + salt);
-		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-	},
-	async oldSha256(message) {
-		const msgBuffer = new TextEncoder().encode(message);
-		const hashBuffer = await crypto.subtle.digest("SHA-256", msgBuffer);
-		const hashArray = Array.from(new Uint8Array(hashBuffer));
-		return hashArray.map((b) => b.toString(16).padStart(2, "0")).join("");
-	},
-};
-function getActiveIpCount(activeIpsJson) {
-	if (!activeIpsJson) return 0;
-	try {
-		const activeIps = JSON.parse(activeIpsJson);
-		const now = Date.now();
-		let count = 0;
-		for (const [ip, data] of Object.entries(activeIps)) {
-			const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-			if (now - lastSeen <= 20000) {
-				count++;
-			}
-		}
-		return count;
-	} catch (e) {
-		return 0;
-	}
-}
-const SubscriptionService = {
-	async generateText(user, host) {
-		let ips = [host];
-		if (user.ips) {
-			const parsedIps = user.ips
-				.split("\n")
-				.map((ip) => ip.trim())
-				.filter((ip) => ip.length > 0);
-			if (parsedIps.length > 0) ips = parsedIps;
-		}
-		const ports = String(user.port || "443")
-			.split(",")
-			.map((p) => p.trim())
-			.filter((p) => p.length > 0);
-		const fp = user.fingerprint || "chrome";
-		const dynPath = encodeURIComponent("/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default"));
-		const links = [];
-		const m1 = decodeURIComponent("%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F");
-		const m2 = decodeURIComponent("%F0%9F%9A%80%40PANEL_ZEUS%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80");
-		links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m1));
-		links.push("vl" + "e" + "ss://" + user.uuid + "@0.0.0.0:1?encryption=none&security=none&type=ws&host=" + host + "&path=" + dynPath + "#" + encodeURIComponent(m2));
-		let remVol = "Unlimited";
-		if (user.limit_gb) {
-			let rem = user.limit_gb - (user.used_gb || 0);
-			remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
-		}
-		let remTime = "Unlimited";
-		if (user.expiry_days && user.created_at) {
-			const created = new Date(user.created_at);
-			const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-			const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-			remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-		}
-		let remReq = "Unlimited";
-		if (user.limit_req) {
-			let rem = user.limit_req - (user.used_req || 0);
-			remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
-		}
-		const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
-		links.push("vl" + "e" + "ss://" + user.uuid + "@" + host + ":80?path=" + dynPath + "&security=none&encryption=none&host=" + host + "&fp=" + fp + "&type=ws#" + encodeURIComponent(infoRemark));
-		const rawPath = "/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default");
-		let proxyList = [];
-		try {
-			if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-				proxyList = JSON.parse(user.user_socks5);
-			} else if (user.user_socks5 || user.user_proxy_ip) {
-				proxyList = [user.user_socks5 || user.user_proxy_ip];
-			} else {
-				proxyList = [null];
-			}
-		} catch (e) {
-			proxyList = [user.user_socks5 || user.user_proxy_ip];
-		}
-		if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [null];
-		for (let locIdx = 0; locIdx < proxyList.length; locIdx++) {
-			let proxyItem = proxyList[locIdx];
-			let proxyStr = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.proxy : proxyItem;
-			let countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : (user.user_proxy_iata || "");
-			if (!countryCode && proxyStr) {
-				try {
-					const payload = new TextEncoder().encode("GET /json/?fields=countryCode HTTP/1.1\r\nHost: ip-api.com\r\nConnection: close\r\n\r\n");
-					const s = await connectProxy(proxyStr, "ip-api.com", 80, payload);
-					const reader = s.readable.getReader();
-					let resStr = "";
-					const dec = new TextDecoder();
-					const timeoutId = setTimeout(() => { try { s.close(); } catch(e){} }, 2000);
-					try {
-						while (true) {
-							const res = await reader.read();
-							if (res.done || !res.value) break;
-							resStr += dec.decode(res.value, { stream: true });
-							if (resStr.includes("countryCode")) break;
-						}
-					} finally {
-						clearTimeout(timeoutId);
-						try { s.close(); } catch (e) {}
-					}
-					const jsonMatch = resStr.match(/\{[^}]*"countryCode"\s*:\s*"([^"]+)"[^}]*\}/);
-					if (jsonMatch && jsonMatch[1]) countryCode = jsonMatch[1];
-				} catch (e) {}
-				if (!countryCode) {
-					let ip = "";
-					let cleanProxy = proxyStr.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-					let remain = cleanProxy;
-					if (remain.includes("@")) remain = remain.substring(remain.lastIndexOf("@") + 1);
-					if (remain.startsWith("[")) {
-						ip = remain.substring(1, remain.indexOf("]"));
-					} else {
-						const lastColon = remain.lastIndexOf(":");
-						if (lastColon !== -1 && remain.indexOf(":") === lastColon) ip = remain.substring(0, lastColon);
-						else ip = remain;
-					}
-					if (ip) {
-						try {
-							const geoRes = await fetch(`http://ip-api.com/json/${ip}?fields=countryCode`);
-							const geoData = await geoRes.json();
-							if (geoData && geoData.countryCode) countryCode = geoData.countryCode;
-						} catch (e) {}
-					}
-				}
-			}
-			let flagEmoji = "🌐";
-			if (countryCode) {
-				const codePoints = countryCode
-					.toUpperCase()
-					.split("")
-					.map((char) => 127397 + char.charCodeAt(0));
-				try {
-					flagEmoji = String.fromCodePoint(...codePoints);
-				} catch (e) {}
-			}
-			const currentDynPath = encodeURIComponent(rawPath + ((proxyList[0] !== null && proxyList[0] !== "") ? `?loc=${locIdx}` : ""));
-			ips.forEach((ip) => {
-				ports.forEach((portStr) => {
-					const isTlsPort = TLS_PORTS.has(portStr);
-					const tlsVal = isTlsPort ? "tls" : "none";
-					const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
-					const remark = "ZEUS | " + flagEmoji + " | " + user.username;
-					links.push("vl" + "e" + "ss://" + user.uuid + "@" + ip + ":" + portStr + "?path=" + currentDynPath + "&security=" + tlsVal + "&encryption=none&insecure=0&host=" + host + "&fp=" + fp + "&type=ws&allowInsecure=0&sni=" + host + userFrag + "#" + encodeURIComponent(remark));
-				});
-			});
-		}
-		const noise = ["# System Update Feed: OK", "# Sync Code: " + Math.random().toString(36).slice(2, 10), "# Version: 2.10.1", "# Description: Secure Node Configurations", ""].join("\n");
-		const plainContent = noise + links.join("\n");
-		const subContent = btoa(unescape(encodeURIComponent(plainContent)));
-		const downloadBytes = Math.floor((user.used_gb || 0) * 1073741824);
-		const totalBytes = user.limit_gb ? Math.floor(user.limit_gb * 1073741824) : 0;
-		let expireTimestamp = 0;
-		if (user.expiry_days && user.created_at) {
-			expireTimestamp = Math.floor((new Date(user.created_at).getTime() + user.expiry_days * 86400000) / 1000);
-		}
-		const subUserInfo = `upload=0; download=${downloadBytes}; total=${totalBytes}; expire=${expireTimestamp}`;
-		return new Response(subContent, {
-			headers: {
-				"Content-Type": "text/plain; charset=utf-8",
-				"Access-Control-Allow-Origin": "*",
-				"Cache-Control": "no-store",
-				"Subscription-Userinfo": subUserInfo,
-			},
-		});
-	},
-};
-async function flushExpiredTraffic(env) {
-	const now = Date.now();
-	for (const [key, val] of DNS_CACHE.entries()) {
-		if (now > val.expires) DNS_CACHE.delete(key);
-	}
-	for (const [ip, record] of LOGIN_ATTEMPTS.entries()) {
-		if (now - record.lastAttempt > 900000) LOGIN_ATTEMPTS.delete(ip);
-	}
-	const allUsers = new Set([...GLOBAL_TRAFFIC_CACHE.keys(), ...USER_REQ_CACHE.keys()]);
-	for (const uname of allUsers) {
-		const cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
-		const cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-		const activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-		if (cachedBytes <= 0 && cachedReqs <= 0) {
-			GLOBAL_TRAFFIC_CACHE.delete(uname);
-			USER_REQ_CACHE.delete(uname);
-			if (activeCount <= 0) {
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
-			}
-			continue;
-		}
-		if (GLOBAL_WRITE_LOCK.get(uname)) continue;
-		const lastActive = GLOBAL_LAST_ACTIVE_WRITE.get(uname) || 0;
-		if (activeCount <= 0 || now - lastActive > 20000) {
-			GLOBAL_WRITE_LOCK.set(uname, true);
-			GLOBAL_TRAFFIC_CACHE.set(uname, 0);
-			USER_REQ_CACHE.set(uname, 0);
-			const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-			try {
-				await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
-			} catch (e) {
-				console.error(e.message);
-			} finally {
-				GLOBAL_WRITE_LOCK.delete(uname);
-				if (activeCount <= 0) {
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-					GLOBAL_LAST_ACTIVE_WRITE.delete(uname + "_hb");
-				}
-			}
-		}
-	}
-}
-function getSelectedUserProxy(userSocks5, request) {
-	if (!userSocks5) return "";
-	let proxyList = [];
-	try {
-		if (userSocks5.trim().startsWith("[")) {
-			proxyList = JSON.parse(userSocks5);
-		} else {
-			proxyList = [userSocks5];
-		}
-	} catch (e) {
-		proxyList = [userSocks5];
-	}
-	if (!Array.isArray(proxyList) || proxyList.length === 0) return "";
-	let idx = 0;
-	if (request) {
-		try {
-			const url = new URL(request.url);
-			const locParam = url.searchParams.get("loc");
-			if (locParam !== null && !isNaN(locParam)) {
-				idx = parseInt(locParam, 10);
-			}
-		} catch (e) {}
-	}
-	const selected = proxyList[idx] || proxyList[0];
-	return typeof selected === "object" ? (selected.proxy || "") : String(selected || "");
-}
-async function handlevIees(env, storedData = null, ctx = null, request = null) {
-	let rawClientIP = request ? request.headers.get("CF-Connecting-IP") || "unknown" : "unknown";
-	let clientIP = rawClientIP;
-	if (rawClientIP !== "unknown") {
-		if (rawClientIP.includes(':')) {
-			const parts = rawClientIP.split(':');
-			if (parts.length >= 4) {
-				clientIP = parts.slice(0, 4).join(':') + '::/64';
-			}
-		} else if (rawClientIP.includes('.')) {
-			const parts = rawClientIP.split('.');
-			if (parts.length === 4) {
-				clientIP = parts.slice(0, 3).join('.') + '.0/24';
-			}
-		}
-	}
-	const socketPair = new WebSocketPair();
-	const [clientSock, serverSock] = Object.values(socketPair);
-	serverSock.accept();
-	serverSock.binaryType = "arraybuffer";
-	let username = null;
-	let validUUID = null;
-	let targetDns = "8.8.4.4";
-	let targetDoh = "https://cloudflare-dns.com/dns-query";
-	function addBytes(bytes) {
-		if (bytes <= 0) return;
-		if (!username) {
-			uncountedBytes += bytes;
-			return;
-		}
-		if (uncountedBytes > 0) {
-			bytes += uncountedBytes;
-			uncountedBytes = 0;
-		}
-		let current = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-		GLOBAL_TRAFFIC_CACHE.set(username, current + bytes);
-		GLOBAL_LAST_ACTIVE_WRITE.set(username, Date.now());
-		if (GLOBAL_WRITE_LOCK.get(username)) return;
-		let lastDbWrite = GLOBAL_LAST_DB_WRITE.get(username) || 0;
-		let now = Date.now();
-		let thresholdBytes = 50 * 1024 * 1024;
-		if ((current >= thresholdBytes && now - lastDbWrite > 10000) || (current > 0 && now - lastDbWrite > 60000)) {
-			GLOBAL_WRITE_LOCK.set(username, true);
-			let toCommit = GLOBAL_TRAFFIC_CACHE.get(username) || 0;
-			let toCommitReq = USER_REQ_CACHE.get(username) || 0;
-			if (toCommit <= 0 && toCommitReq <= 0) {
-				GLOBAL_WRITE_LOCK.set(username, false);
-				return;
-			}
-			GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) - toCommit);
-			USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) - toCommitReq);
-			GLOBAL_LAST_DB_WRITE.set(username, now);
-			let deltaGb = toCommit / (1024 * 1024 * 1024);
-			let writeTask = async () => {
-				try {
-					await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, toCommitReq, username).run();
-				} catch (e) {
-					console.error(e.message);
-					GLOBAL_TRAFFIC_CACHE.set(username, (GLOBAL_TRAFFIC_CACHE.get(username) || 0) + toCommit);
-					USER_REQ_CACHE.set(username, (USER_REQ_CACHE.get(username) || 0) + toCommitReq);
-				} finally {
-					GLOBAL_WRITE_LOCK.set(username, false);
-				}
-			};
-			if (ctx) ctx.waitUntil(writeTask());
-			else writeTask();
-		}
-	}
-	let isOfflineSet = false;
-	let hasCountedAsActive = false;
-	const setOffline = () => {
-		if (isOfflineSet) return;
-		isOfflineSet = true;
-		const uname = username;
-		if (!uname) return;
-		if (clientIP && clientIP !== "unknown" && validUUID) {
-			const removeIpTask = async () => {
-				try {
-					const user = await env.DB.prepare("SELECT active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
-					if (user) {
-						let activeIps = JSON.parse(user.active_ips || "{}");
-						if (activeIps[clientIP]) {
-							if (typeof activeIps[clientIP] === "object") {
-								activeIps[clientIP].count = (activeIps[clientIP].count || 1) - 1;
-								if (activeIps[clientIP].count <= 0) {
-									delete activeIps[clientIP];
-								}
-							} else {
-								delete activeIps[clientIP];
-							}
-							await env.DB.prepare("UPDATE users SET active_ips = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), validUUID).run();
-						}
-					}
-				} catch (e) {
-					console.error(`[setOffline Task] Error: ${e.message}`);
-				}
-			};
-			if (ctx) ctx.waitUntil(removeIpTask());
-			else removeIpTask();
-		}
-		let activeCount = ACTIVE_CONNECTIONS_COUNT.get(uname) || 0;
-		if (hasCountedAsActive) {
-			activeCount = Math.max(0, activeCount - 1);
-		}
-		if (activeCount <= 0) {
-			ACTIVE_CONNECTIONS_COUNT.delete(uname);
-			let cachedBytes = GLOBAL_TRAFFIC_CACHE.get(uname) || 0;
-			let cachedReqs = USER_REQ_CACHE.get(uname) || 0;
-			if ((cachedBytes > 0 || cachedReqs > 0) && !GLOBAL_WRITE_LOCK.get(uname)) {
-				GLOBAL_WRITE_LOCK.set(uname, true);
-				GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) - cachedBytes);
-				USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) - cachedReqs);
-				const deltaGb = cachedBytes / (1024 * 1024 * 1024);
-				const writeTask = async () => {
-					try {
-						await env.DB.prepare("UPDATE users SET used_gb = used_gb + ?, lifetime_used_gb = lifetime_used_gb + ?, used_req = used_req + ? WHERE username = ?").bind(deltaGb, deltaGb, cachedReqs, uname).run();
-					} catch (e) {
-						console.error(e.message);
-						GLOBAL_TRAFFIC_CACHE.set(uname, (GLOBAL_TRAFFIC_CACHE.get(uname) || 0) + cachedBytes);
-						USER_REQ_CACHE.set(uname, (USER_REQ_CACHE.get(uname) || 0) + cachedReqs);
-					} finally {
-						GLOBAL_WRITE_LOCK.delete(uname);
-						GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-					}
-				};
-				if (ctx) {
-					ctx.waitUntil(writeTask());
-				} else {
-					writeTask();
-				}
-			} else {
-				GLOBAL_LAST_ACTIVE_WRITE.delete(uname);
-			}
-		} else {
-			ACTIVE_CONNECTIONS_COUNT.set(uname, activeCount);
-		}
-	};
-	let heartbeat;
-	const runHeartbeat = async () => {
-		if (serverSock.readyState === WebSocket.OPEN) {
-			try {
-				serverSock.send(new Uint8Array(0));
-				if (!validUUID || !username) {
-					heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-					return;
-				}
-				const nowTime = Date.now();
-				const lastCheck = GLOBAL_LAST_ACTIVE_WRITE.get(username + "_hb") || 0;
-				if (nowTime - lastCheck >= 20000) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username + "_hb", nowTime);
-					const user = await env.DB.prepare("SELECT is_active, limit_gb, used_gb, limit_req, used_req, expiry_days, created_at, ip_limit, active_ips FROM users WHERE uuid = ?").bind(validUUID).first();
-					let isExpired = false;
-					let isIpLimitExpired = false;
-					let updatedActiveIps = null;
-					if (!user || user.is_active === 0) {
-						isExpired = true;
-					} else {
-						if (user.limit_gb && user.used_gb >= user.limit_gb) isExpired = true;
-						if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) >= user.limit_req) isExpired = true;
-						if (user.expiry_days && user.created_at) {
-							const expiryDate = new Date(new Date(user.created_at).getTime() + user.expiry_days * 86400000);
-							if (nowTime > expiryDate.getTime()) isExpired = true;
-						}
-						if (!isExpired && clientIP && clientIP !== "unknown") {
-							let activeIps = {};
-							try { activeIps = JSON.parse(user.active_ips || "{}"); } catch (e) {}
-							let hasChanges = false;
-							for (const [ip, data] of Object.entries(activeIps)) {
-								const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-								if (nowTime - lastSeen > 20000) { delete activeIps[ip]; hasChanges = true; }
-							}
-							if (!activeIps[clientIP]) {
-								isIpLimitExpired = true;
-							} else {
-								const sortedIps = Object.keys(activeIps).sort((a, b) => {
-									const tA = typeof activeIps[a] === "object" ? activeIps[a].timestamp : activeIps[a];
-									const tB = typeof activeIps[b] === "object" ? activeIps[b].timestamp : activeIps[b];
-									return tB - tA;
-								});
-								if (user.ip_limit && user.ip_limit > 0 && sortedIps.indexOf(clientIP) >= user.ip_limit) isIpLimitExpired = true;
-							}
-							if (hasChanges || isIpLimitExpired) updatedActiveIps = JSON.stringify(activeIps);
-						}
-					}
-					if (isExpired) {
-						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(validUUID).run();
-						clearTimeout(heartbeat);
-						closeSocketQuietly(serverSock);
-						return;
-					}
-					if (isIpLimitExpired) {
-						clearTimeout(heartbeat);
-						closeSocketQuietly(serverSock);
-						return;
-					}
-					if (updatedActiveIps !== null) {
-						await env.DB.prepare("UPDATE users SET last_active = ?, active_ips = ? WHERE username = ?").bind(nowTime, updatedActiveIps, username).run();
-					} else {
-						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(nowTime, username).run();
-					}
-				}
-			} catch (e) {}
-			heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-		} else {
-			clearTimeout(heartbeat);
-		}
-	};
-	heartbeat = setTimeout(runHeartbeat, Math.floor(Math.random() * 5000) + 20000);
-	let remoteConnWrapper = { socket: null, connectingPromise: null, retryConnect: null };
-	let reqUUID = null;
-	let isHeaderParsed = false;
-	let isHeaderParsing = false;
-	let isDnsQuery = false;
-	let chunkBuffer = new Uint8Array(0);
-	let uncountedBytes = 0;
-	let wsChain = Promise.resolve();
-	let wsStopped = false,
-		wsFailed = false,
-		wsFinished = false;
-	let wsQueueBytes = 0,
-		wsQueueItems = 0;
-	let currentSocketWriter = null,
-		activeRemoteWriter = null;
-	const releaseRemoteWriter = () => {
-		if (activeRemoteWriter) {
-			try {
-				activeRemoteWriter.releaseLock();
-			} catch (e) {}
-			activeRemoteWriter = null;
-		}
-		currentSocketWriter = null;
-	};
-	const getRemoteWriter = () => {
-		const s = remoteConnWrapper.socket;
-		if (!s) return null;
-		if (s !== currentSocketWriter) {
-			releaseRemoteWriter();
-			currentSocketWriter = s;
-			activeRemoteWriter = s.writable.getWriter();
-		}
-		return activeRemoteWriter;
-	};
-	const upstreamQueue = createUpstreamQueue({
-		getWriter: getRemoteWriter,
-		releaseWriter: releaseRemoteWriter,
-		retryConnect: async () => {
-			if (typeof remoteConnWrapper.retryConnect === "function") {
-				await remoteConnWrapper.retryConnect();
-			}
-		},
-		closeConnection: () => {
-			try {
-				remoteConnWrapper.socket?.close();
-			} catch (e) {}
-			closeSocketQuietly(serverSock);
-		},
-		name: "vIeesWSQueue",
-	});
-	const writeToRemote = async (chunk, allowRetry = true) => {
-		return upstreamQueue.writeAndAwait(chunk, allowRetry);
-	};
-	const processWsMessage = async (chunk) => {
-		const bytes = chunk.byteLength || 0;
-		addBytes(bytes);
-		if (isDnsQuery) {
-			await forwardvIeesUDP(chunk, serverSock, null, addBytes, targetDns);
-			return;
-		}
-		if (isHeaderParsed) {
-			if (remoteConnWrapper.connectingPromise) {
-				await remoteConnWrapper.connectingPromise;
-			}
-			await writeToRemote(chunk);
-			return;
-		}
-		if (!isHeaderParsed) {
-			chunkBuffer = concatBytes(chunkBuffer, chunk);
-			if (chunkBuffer.byteLength < 24) return;
-			let optLen = chunkBuffer[17];
-			let requiredLen = 18 + optLen + 4; 
-			if (chunkBuffer.byteLength < requiredLen) return;
-			let addrType = chunkBuffer[18 + optLen + 3];
-			if (addrType === 1) {
-				requiredLen += 4;
-			} else if (addrType === 2) {
-				requiredLen += 1;
-				if (chunkBuffer.byteLength < requiredLen) return;
-				requiredLen += chunkBuffer[18 + optLen + 4];
-			} else if (addrType === 3) {
-				requiredLen += 16;
-			} else {
-				serverSock.close();
-				return;
-			}
-			if (chunkBuffer.byteLength < requiredLen) return;
-			if (isHeaderParsing) return;
-			isHeaderParsing = true;
-			reqUUID = extractUUIDFromvIees(chunkBuffer);
-			if (!reqUUID) {
-				serverSock.close();
-				return;
-			}
-			let user = null;
-			try {
-				user = await env.DB.prepare("SELECT * FROM users WHERE uuid = ?").bind(reqUUID).first();
-			} catch (e) {}
-			if (!user) {
-				serverSock.close();
-				return;
-			}
-			if (request) {
-				const reqUrl = new URL(request.url);
-				const expectedPath = "/stream/PANEL_ZEUS/" + ((user.uuid || "").split("-")[4] || "default");
-				if (reqUrl.pathname !== expectedPath) {
-					serverSock.close();
-					return;
-				}
-			}
-			username = user.username;
-			validUUID = reqUUID;
-			let currentReqs = USER_REQ_CACHE.get(username) || 0;
-			USER_REQ_CACHE.set(username, currentReqs + 1);
-			if (!GLOBAL_TRAFFIC_CACHE.has(username)) {
-				GLOBAL_TRAFFIC_CACHE.set(username, 0);
-			}
-			if (isOfflineSet || serverSock.readyState !== WebSocket.OPEN) {
-				return;
-			}
-			if (user.is_active === 0) {
-				serverSock.close();
-				return;
-			}
-			if (user.limit_gb && user.used_gb >= user.limit_gb) {
-				serverSock.close();
-				return;
-			}
-			if (user.limit_req && user.used_req + (USER_REQ_CACHE.get(username) || 0) > user.limit_req) {
-				serverSock.close();
-				return;
-			}
-			if (user.expiry_days && user.created_at) {
-				const created = new Date(user.created_at);
-				const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-				if (new Date() > expiryDate) {
-					try {
-						await env.DB.prepare("UPDATE users SET is_active = 0, last_active = 0 WHERE uuid = ?").bind(reqUUID).run();
-					} catch (e) {}
-					serverSock.close();
-					return;
-				}
-			}
-			if (user.block_porn === 1 && user.block_ads === 1) {
-				targetDns = "94.140.14.15";
-				targetDoh = "https://family.adguard-dns.com/dns-query";
-			} else if (user.block_porn === 1) {
-				targetDns = "1.1.1.3";
-				targetDoh = "https://family.cloudflare-dns.com/dns-query";
-			} else if (user.block_ads === 1) {
-				targetDns = "94.140.14.14";
-				targetDoh = "https://dns.adguard-dns.com/dns-query";
-			}
-			if (clientIP && clientIP !== "unknown") {
-				let activeIps = {};
-				try { activeIps = JSON.parse(user.active_ips || "{}"); } catch (e) {}
-				const now = Date.now();
-				for (const [ip, data] of Object.entries(activeIps)) {
-					const lastSeen = data && typeof data === "object" ? data.timestamp : data;
-					if (now - lastSeen > 20000) delete activeIps[ip];
-				}
-				let isNewIp = false;
-				if (!activeIps[clientIP]) {
-					const sortedIps = Object.keys(activeIps);
-					if (user.ip_limit && user.ip_limit > 0 && sortedIps.length >= user.ip_limit) {
-						serverSock.close();
-						return;
-					}
-					activeIps[clientIP] = { timestamp: now, count: 1 };
-					isNewIp = true;
-				} else {
-					if (typeof activeIps[clientIP] === "object") {
-						activeIps[clientIP].timestamp = now;
-						activeIps[clientIP].count = (activeIps[clientIP].count || 0) + 1;
-					} else {
-						activeIps[clientIP] = { timestamp: now, count: 1 };
-					}
-				}
-				const lastWrite = GLOBAL_LAST_ACTIVE_WRITE.get(username) || 0;
-				if (isNewIp || (now - lastWrite > 30000)) {
-					GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-					const updateTask = async () => {
-						try {
-							await env.DB.prepare("UPDATE users SET active_ips = ?, last_active = ? WHERE uuid = ?").bind(JSON.stringify(activeIps), now, reqUUID).run();
-						} catch (e) {}
-					};
-					if (ctx) ctx.waitUntil(updateTask());
-					else updateTask();
-				}
-			}
-			isHeaderParsed = true;
-			let activeCount = ACTIVE_CONNECTIONS_COUNT.get(username) || 0;
-			ACTIVE_CONNECTIONS_COUNT.set(username, activeCount + 1);
-			hasCountedAsActive = true;
-			if (activeCount === 0) {
-				const setOnlineTask = async () => {
-					try {
-						const now = Date.now();
-						GLOBAL_LAST_ACTIVE_WRITE.set(username, now);
-						await env.DB.prepare("UPDATE users SET last_active = ? WHERE username = ?").bind(now, username).run();
-					} catch (e) {}
-				};
-				if (ctx) ctx.waitUntil(setOnlineTask());
-				else setOnlineTask();
-			}
-			try {
-				let offset = 17;
-				const optLen = chunkBuffer[offset++];
-				offset += optLen;
-				const cmd = chunkBuffer[offset++];
-				const port = (chunkBuffer[offset++] << 8) | chunkBuffer[offset++];
-				const addrType = chunkBuffer[offset++];
-				let addr = "";
-				if (addrType === 1) {
-					addr = `${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}.${chunkBuffer[offset++]}`;
-				} else if (addrType === 2) {
-					const domainLen = chunkBuffer[offset++];
-					addr = TEXT_DECODER.decode(chunkBuffer.slice(offset, offset + domainLen));
-					offset += domainLen;
-				} else if (addrType === 3) {
-					const v6 = [];
-					for (let i = 0; i < 8; i++) {
-						v6.push(((chunkBuffer[offset++] << 8) | chunkBuffer[offset++]).toString(16));
-					}
-					addr = v6.join(":");
-				}
-				const rawData = chunkBuffer.slice(offset);
-				const respHeader = new Uint8Array([chunkBuffer[0], 0]);
-				if ((user.block_ads === 1 || user.block_porn === 1) && addrType === 2 && port !== 53) {
-					try {
-						const dnsCheck = await dohQuery(addr, "A", targetDoh);
-						const isBlocked = dnsCheck.some((r) => r.data === "0.0.0.0" || r.data === "::" || r.data === "176.103.130.130");
-						if (isBlocked) {
-							serverSock.close();
-							return;
-						}
-						const resolvedRecord = dnsCheck.find((r) => r.type === 1 || r.type === 28);
-						if (resolvedRecord && resolvedRecord.data) {
-							addr = resolvedRecord.data;
-						}
-					} catch (e) {}
-				}
-				if (cmd === 2) {
-					if (port === 53) {
-						isDnsQuery = true;
-						await forwardvIeesUDP(rawData, serverSock, respHeader, addBytes, targetDns);
-					} else {
-						serverSock.close();
-					}
-					return;
-				}
-				if (port === 25 || port === 22 || /^(0\.|127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|localhost$|::1|::ffff:|fd[0-9a-f]{2}:|fe80:)/i.test(addr)) {
-					serverSock.close();
-					return;
-				}
-				const connectTCP = async (dataPayload = null, useFallback = true) => {
-					if (remoteConnWrapper.connectingPromise) {
-						await remoteConnWrapper.connectingPromise;
-						return;
-					}
-					const task = (async () => {
-							let s = null;
-							const socks5 = getSelectedUserProxy(user?.user_socks5, request);
-							if (socks5) {
-								try {
-									s = await connectProxy(socks5, addr, port, dataPayload);
-								} catch (proxyErr) {
-									if (user.auto_rotate_user_proxy === 1) {
-										const replaceTask = replaceBrokenProxy(user.username, env, socks5);
-										if (ctx) ctx.waitUntil(replaceTask);
-										else replaceTask.catch(() => {});
-									}
-									throw proxyErr;
-								}
-							} else {
-								s = await connectDirectWithRegionalFallback(env, request, addr, port, dataPayload, targetDoh);
-							}
-						remoteConnWrapper.socket = s;
-						s.closed.catch(() => {}).finally(() => closeSocketQuietly(serverSock));
-						connectStreams(s, serverSock, respHeader, null, addBytes);
-					})();
-					remoteConnWrapper.connectingPromise = task;
-					try {
-						await task;
-					} finally {
-						if (remoteConnWrapper.connectingPromise === task) {
-							remoteConnWrapper.connectingPromise = null;
-						}
-					}
-				};
-				remoteConnWrapper.retryConnect = async () => connectTCP(null, false);
-				await connectTCP(rawData, true);
-			} catch (e) {
-				serverSock.close();
-			}
-		}
-	};
-	const handleWsError = (err) => {
-		if (wsFailed) return;
-		wsFailed = true;
-		wsStopped = true;
-		clearTimeout(heartbeat);
-		wsQueueBytes = 0;
-		wsQueueItems = 0;
-		upstreamQueue.clear();
-		releaseRemoteWriter();
-		closeSocketQuietly(serverSock);
-		setOffline();
-	};
-	const pushToChain = (task) => {
-		wsChain = wsChain.then(task).catch(handleWsError);
-	};
-	serverSock.addEventListener("message", (event) => {
-		if (wsStopped || wsFailed) return;
-		if (typeof event.data === "string") return;
-		const size = event.data.byteLength || 0;
-		const nextBytes = wsQueueBytes + size;
-		const nextItems = wsQueueItems + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-			handleWsError(new Error("ws queue overflow"));
-			return;
-		}
-		wsQueueBytes = nextBytes;
-		wsQueueItems = nextItems;
-		pushToChain(async () => {
-			wsQueueBytes = Math.max(0, wsQueueBytes - size);
-			wsQueueItems = Math.max(0, wsQueueItems - 1);
-			if (wsFailed) return;
-			await processWsMessage(event.data);
-		});
-	});
-	serverSock.addEventListener("close", () => {
-		clearTimeout(heartbeat);
-		closeSocketQuietly(serverSock);
-		setOffline();
-		if (wsFinished) return;
-		wsFinished = true;
-		wsStopped = true;
-		pushToChain(async () => {
-			if (wsFailed) return;
-			await upstreamQueue.awaitEmpty();
-			releaseRemoteWriter();
-		});
-	});
-	serverSock.addEventListener("error", (err) => {
-		handleWsError(err);
-	});
-	return new Response(null, { status: 101, webSocket: clientSock });
-}
-async function getCfUsage(env) {
-	if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return { today: 0, total: 0 };
-	try {
-		const now = new Date();
-		const startOfDay = new Date(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()).toISOString();
-		const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString();
-		const q = `query {
-      viewer {
-        accounts(filter: {accountTag: "${env.CF_ACCOUNT_ID}"}) {
-          today: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${startOfDay}"}) {
-            sum { requests }
+  async fetch(请求735, 本地值734, 本地值733) {
+    try {
+      const 是否网页套接字 = 请求735.headers.get('Upgrade') === atob('d2Vic29ja2V0');
+      const 是否值732 = 请求735.method === 'POST';
+      const 请求网址731 = new URL(请求735.url);
+      const 路径值730 = 请求网址731.pathname.split('/').filter(参数值729 => 参数值729);
+      if (!是否网页套接字 && !是否值732 && 请求网址731.pathname !== '/') {
+        const 值值728 = (本地值734.u || 本地值734.U || '').toLowerCase();
+        const 值值727 = (本地值734.d || 本地值734.D || '').toLowerCase();
+        const 首次值 = 路径值730[0] || '';
+        const 清理值 = 值值727.startsWith('/') ? 值值727.substring(1) : 值值727;
+        if (首次值 !== 值值728 && (清理值 ? 首次值 !== 清理值 : false)) {
+          return new Response('Not Found', {
+            status: 404
+          });
+        }
+      }
+      await 处理值键值值(本地值734);
+      认证令牌 = (本地值734.u || 本地值734.U || 认证令牌).toLowerCase();
+      const 值路径 = (本地值734.d || 本地值734.D || 认证令牌).toLowerCase();
+      const 本地值726 = 获取配置值('p', 本地值734.p || 本地值734.P);
+      let 值自定义地址 = false;
+      const 手动地区725 = 获取配置值('wk', 本地值734.wk || 本地值734.WK);
+      if (手动地区725 && 手动地区725.trim()) {
+        手动工作器地区 = 手动地区725.trim().toUpperCase();
+        当前工作器地区 = 手动工作器地区;
+      } else if (本地值726 && 本地值726.trim()) {
+        值自定义地址 = true;
+        当前工作器地区 = 'CUSTOM';
+      } else {
+        当前工作器地区 = await 检测工作器地区(请求735);
+      }
+      const 地区匹配控制724 = 获取配置文本值('rm', 配置默认值.rm, 本地值734.rm || 本地值734.RM);
+      启用地区匹配 = !(地区匹配控制724 && 地区匹配控制724.toLowerCase() === 'no');
+      const 值回退723 = 获取配置文本值('p', 配置默认值.p, 本地值734.p || 本地值734.P);
+      回退地址 = 值回退723 ? 值回退723.trim() : '';
+      代理5配置 = 获取配置文本值('s', 配置默认值.s, 本地值734.s || 本地值734.S);
+      if (代理5配置) {
+        try {
+          已解析代理5配置 = 解析代理配置(代理5配置);
+          是否代理已启用 = true;
+        } catch (错误722) {
+          是否代理已启用 = false;
+        }
+      } else {
+        已解析代理5配置 = {};
+        是否代理已启用 = false;
+      }
+      const 自定义优选 = 获取配置值('yx', 本地值734.yx || 本地值734.YX);
+      if (自定义优选) {
+        try {
+          const 优选列表721 = 自定义优选.split(',').map(项目720 => 项目720.trim()).filter(项目719 => 项目719);
+          自定义优选地址列表 = [];
+          自定义优选域名列表 = [];
+          优选列表721.forEach(项目718 => {
+            let 节点名称717 = '';
+            let 地址部分716 = 项目718;
+            if (项目718.includes('#')) {
+              const 部分列表715 = 项目718.split('#');
+              地址部分716 = 部分列表715[0].trim();
+              节点名称717 = 部分列表715[1].trim();
+            }
+            const {
+              address: 地址714,
+              port: 端口713
+            } = 解析地址值端口(地址部分716);
+            if (!节点名称717) {
+              节点名称717 = '自定义优选-' + 地址714 + (端口713 ? ':' + 端口713 : '');
+            }
+            if (是否有效地址(地址714)) {
+              自定义优选地址列表.push({
+                ip: 地址714,
+                port: 端口713,
+                isp: 节点名称717
+              });
+            } else {
+              自定义优选域名列表.push({
+                domain: 地址714,
+                port: 端口713,
+                name: 节点名称717
+              });
+            }
+          });
+        } catch (错误712) {
+          自定义优选地址列表 = [];
+          自定义优选域名列表 = [];
+        }
+      }
+      const 值控制711 = 获取配置文本值('qj', 配置默认值.qj, 本地值734.qj || 本地值734.QJ);
+      启用代理降级 = !!(值控制711 && 值控制711.toLowerCase() === 'no');
+      const 值控制710 = 获取配置文本值('dkby', 配置默认值.dkby, 本地值734.dkby || 本地值734.DKBY);
+      禁用非传输层安全 = !!(值控制710 && 值控制710.toLowerCase() === 'yes');
+      const 值控制709 = 获取配置文本值('yxby', 配置默认值.yxby, 本地值734.yxby || 本地值734.YXBY);
+      禁用优选 = !!(值控制709 && 值控制709.toLowerCase() === 'yes');
+      启用明文 = 获取配置开关值('ev', true, 本地值734.ev);
+      启用木马 = 获取配置开关值('et', false, 本地值734.et);
+      传输路径 = 获取配置文本值('tp', 配置默认值.tp, 本地值734.tp);
+      启用扩展传输 = 获取配置开关值('ex', false, 本地值734.ex);
+      订阅转换接口 = 获取配置文本值('scu', 配置默认值.scu, 本地值734.scu);
+      启用优选域名 = 获取配置开关值('epd', true, 本地值734.epd || 本地值734.EPD);
+      启用优选地址 = 获取配置开关值('epi', true, 本地值734.epi || 本地值734.EPI);
+      启用仓库优选 = 获取配置开关值('egi', true, 本地值734.egi || 本地值734.EGI);
+      启用原生地址 = 获取配置开关值('ena', false, 本地值734.ena || 本地值734.ENA);
+      启用加密客户端问候 = 获取配置开关值('ech', false, 本地值734.ech || 本地值734.ECH);
+
+      // 加载自定义DNS和ECH域名配置
+      自定义域名系统 = 获取配置文本值('customDNS', 配置默认值.customDNS).trim() || 配置默认值.customDNS;
+      自定义加密客户端问候域名 = 获取配置文本值('customECHDomain', 配置默认值.customECHDomain).trim() || 配置默认值.customECHDomain;
+      自定义应用层协议协商 = 规范化应用层协议协商(获取配置文本值('alpn', 配置默认值.alpn, 本地值734.alpn || 本地值734.ALPN));
+
+      // 如果启用了ECH，自动启用仅TLS模式（避免80端口干扰）
+      // ECH需要TLS才能工作，所以必须禁用非TLS节点
+      if (启用加密客户端问候) {
+        禁用非传输层安全 = true;
+        // 检查 KV 中是否有 dkby: yes，没有就直接写入
+        const 当前值 = 获取配置值('dkby', '');
+        if (当前值 !== 'yes') {
+          await 设置配置值('dkby', 'yes');
+        }
+      }
+      if (!启用明文 && !启用木马 && !启用扩展传输) {
+        启用明文 = true;
+      }
+      优选地址源 = 获取配置文本值('yxURL', 配置默认值.yxURL, 本地值734.yxURL || 本地值734.YXURL);
+      自定义路径 = 获取配置文本值('d', 配置默认值.d, 本地值734.d || 本地值734.D);
+      const 网址698 = new URL(请求735.url);
+      if (网址698.pathname.includes('/api/config')) {
+        const 路径部分列表697 = 网址698.pathname.split('/').filter(参数值696 => 参数值696);
+        const 接口索引695 = 路径部分列表697.indexOf('api');
+        if (接口索引695 > 0) {
+          const 路径值694 = 路径部分列表697.slice(0, 接口索引695);
+          const 路径值693 = 路径值694.join('/');
+          let 是否有效692 = false;
+          if (自定义路径 && 自定义路径.trim()) {
+            const 清理自定义路径691 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim().substring(1) : 自定义路径.trim();
+            是否有效692 = 路径值693 === 清理自定义路径691;
+          } else {
+            是否有效692 = 是否有效格式(路径值693) && 路径值693 === 认证令牌;
           }
-          total: workersInvocationsAdaptive(limit: 10, filter: {datetime_geq: "${thirtyDaysAgo}"}) {
-            sum { requests }
+          if (是否有效692) {
+            return await 处理配置接口(请求735, 本地值734);
+          } else {
+            return new Response(JSON.stringify({
+              error: '路径验证失败'
+            }), {
+              status: 403,
+              headers: {
+                'Content-Type': 'application/json'
+              }
+            });
+          }
+        }
+        return new Response(JSON.stringify({
+          error: '无效的API路径'
+        }), {
+          status: 404,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      if (网址698.pathname.includes('/api/preferred-ips')) {
+        const 路径部分列表690 = 网址698.pathname.split('/').filter(参数值689 => 参数值689);
+        const 接口索引 = 路径部分列表690.indexOf('api');
+        if (接口索引 > 0) {
+          const 路径值688 = 路径部分列表690.slice(0, 接口索引);
+          const 路径值687 = 路径值688.join('/');
+          let 是否有效686 = false;
+          if (自定义路径 && 自定义路径.trim()) {
+            const 清理自定义路径685 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim().substring(1) : 自定义路径.trim();
+            是否有效686 = 路径值687 === 清理自定义路径685;
+          } else {
+            是否有效686 = 是否有效格式(路径值687) && 路径值687 === 认证令牌;
+          }
+          if (是否有效686) {
+            return await 处理优选地址列表接口(请求735);
+          } else {
+            return new Response(JSON.stringify({
+              error: '路径验证失败'
+            }), {
+              status: 403,
+              headers: {
+                'Content-Type': 'application/json'
+              }
+            });
+          }
+        }
+        return new Response(JSON.stringify({
+          error: '无效的API路径'
+        }), {
+          status: 404,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      if (网址698.pathname.includes('/api/update')) {
+        const 路径部分列表680 = 网址698.pathname.split('/').filter(参数值679 => 参数值679);
+        const 接口索引678 = 路径部分列表680.indexOf('api');
+        if (接口索引678 > 0) {
+          const 路径值677 = 路径部分列表680.slice(0, 接口索引678);
+          const 路径值676 = 路径值677.join('/');
+          let 是否有效675 = false;
+          if (自定义路径 && 自定义路径.trim()) {
+            const 清理自定义路径674 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim().substring(1) : 自定义路径.trim();
+            是否有效675 = 路径值676 === 清理自定义路径674;
+          } else {
+            是否有效675 = 是否有效格式(路径值676) && 路径值676 === 认证令牌;
+          }
+          if (!是否有效675) {
+            return new Response(JSON.stringify({ error: '路径验证失败' }), { status: 403, headers: { 'Content-Type': 'application/json' } });
+          }
+          return 请求735.method === 'POST' ? await 处理更新应用接口(请求735, 本地值734) : await 处理更新检查接口(请求735, 本地值734);
+        }
+        return new Response(JSON.stringify({ error: '无效的API路径' }), { status: 404, headers: { 'Content-Type': 'application/json' } });
+      }
+      if (请求735.method === 'POST' && 启用扩展传输) {
+        const 结果值684 = await 处理扩展超文本值(请求735);
+        if (结果值684) {
+          本地值733.waitUntil(结果值684.closed);
+          return new Response(结果值684.readable, {
+            headers: {
+              'X-Accel-Buffering': 'no',
+              'Cache-Control': 'no-store',
+              Connection: 'keep-alive',
+              'User-Agent': 'Go-http-client/2.0',
+              'Content-Type': 'application/grpc'
+            }
+          });
+        }
+        return new Response('Internal Server Error', {
+          status: 500
+        });
+      }
+      if (请求735.headers.get('Upgrade') === atob('d2Vic29ja2V0')) {
+        return await 处理网页套接字请求(请求735);
+      }
+      if (请求735.method === 'GET') {
+        // 处理 /{UUID}/region 或 /{自定义路径}/region
+        if (网址698.pathname.endsWith('/region')) {
+          const 路径部分列表683 = 网址698.pathname.split('/').filter(参数值682 => 参数值682);
+          if (路径部分列表683.length === 2 && 路径部分列表683[1] === 'region') {
+            const 路径值681 = 路径部分列表683[0];
+            let 是否有效680 = false;
+            if (自定义路径 && 自定义路径.trim()) {
+              // 使用自定义路径
+              const 清理自定义路径679 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim().substring(1) : 自定义路径.trim();
+              是否有效680 = 路径值681 === 清理自定义路径679;
+            } else {
+              // 使用UUID路径
+              是否有效680 = 是否有效格式(路径值681) && 路径值681 === 认证令牌;
+            }
+            if (是否有效680) {
+              const 本地值678 = 获取配置值('p', 本地值734.p || 本地值734.P);
+              const 手动地区677 = 获取配置值('wk', 本地值734.wk || 本地值734.WK);
+              if (手动地区677 && 手动地区677.trim()) {
+                return new Response(JSON.stringify({
+                  region: 手动地区677.trim().toUpperCase(),
+                  detectionMethod: '手动指定地区',
+                  manualRegion: 手动地区677.trim().toUpperCase(),
+                  timestamp: new Date().toISOString()
+                }), {
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              } else if (本地值678 && 本地值678.trim()) {
+                return new Response(JSON.stringify({
+                  region: 'CUSTOM',
+                  detectionMethod: 解码64('6Ieq5a6a5LmJUHJveHlJUOaooeW8jw=='),
+                  ci: 本地值678,
+                  timestamp: new Date().toISOString()
+                }), {
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              } else {
+                const 值地区 = await 检测工作器地区(请求735);
+                return new Response(JSON.stringify({
+                  region: 值地区,
+                  detectionMethod: 'API检测',
+                  timestamp: new Date().toISOString()
+                }), {
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              }
+            } else {
+              return new Response(JSON.stringify({
+                error: '访问被拒绝',
+                message: '路径验证失败'
+              }), {
+                status: 403,
+                headers: {
+                  'Content-Type': 'application/json'
+                }
+              });
+            }
+          }
+        }
+
+        // 处理 /{UUID}/test-api 或 /{自定义路径}/test-api
+        if (网址698.pathname.endsWith('/test-api')) {
+          const 路径部分列表676 = 网址698.pathname.split('/').filter(参数值675 => 参数值675);
+          if (路径部分列表676.length === 2 && 路径部分列表676[1] === 'test-api') {
+            const 路径值 = 路径部分列表676[0];
+            let 是否有效 = false;
+            if (自定义路径 && 自定义路径.trim()) {
+              // 使用自定义路径
+              const 清理自定义路径674 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim().substring(1) : 自定义路径.trim();
+              是否有效 = 路径值 === 清理自定义路径674;
+            } else {
+              // 使用UUID路径
+              是否有效 = 是否有效格式(路径值) && 路径值 === 认证令牌;
+            }
+            if (是否有效) {
+              try {
+                const 测试地区 = await 检测工作器地区(请求735);
+                return new Response(JSON.stringify({
+                  detectedRegion: 测试地区,
+                  message: 'API测试完成',
+                  timestamp: new Date().toISOString()
+                }), {
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              } catch (错误673) {
+                return new Response(JSON.stringify({
+                  error: 错误673.message,
+                  message: 'API测试失败'
+                }), {
+                  status: 500,
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              }
+            } else {
+              return new Response(JSON.stringify({
+                error: '访问被拒绝',
+                message: '路径验证失败'
+              }), {
+                status: 403,
+                headers: {
+                  'Content-Type': 'application/json'
+                }
+              });
+            }
+          }
+        }
+        if (网址698.pathname === '/') {
+          // 检查是否有自定义首页URL配置
+          const 自定义值 = 获取配置值('homepage', 本地值734.homepage || 本地值734.HOMEPAGE);
+          if (自定义值 && 自定义值.trim()) {
+            try {
+              // 从自定义URL获取内容
+              const 值响应 = await fetch(自定义值.trim(), {
+                method: 'GET',
+                headers: {
+                  'User-Agent': 请求735.headers.get('User-Agent') || 'Mozilla/5.0',
+                  'Accept': 请求735.headers.get('Accept') || '*/*',
+                  'Accept-Language': 请求735.headers.get('Accept-Language') || 'en-US,en;q=0.9'
+                },
+                redirect: 'follow'
+              });
+              if (值响应.ok) {
+                // 获取响应内容
+                const 内容类型672 = 值响应.headers.get('Content-Type') || 'text/html; charset=utf-8';
+                const 内容671 = await 值响应.text();
+
+                // 返回自定义首页内容
+                return new Response(内容671, {
+                  status: 值响应.status,
+                  headers: {
+                    'Content-Type': 内容类型672,
+                    'Cache-Control': 'no-cache, no-store, must-revalidate'
+                  }
+                });
+              }
+            } catch (错误670) {
+              // 如果获取失败，继续使用默认终端页面
+              console.error('获取自定义首页失败:', 错误670);
+            }
+          }
+          // 优先检查Cookie中的语言设置
+          const 凭据头部669 = 请求735.headers.get('Cookie') || '';
+          let 语言来源凭据668 = null;
+          if (凭据头部669) {
+            const 本地值667 = 凭据头部669.split(';').map(丙值666 => 丙值666.trim());
+            for (const 凭据665 of 本地值667) {
+              if (凭据665.startsWith('preferredLanguage=')) {
+                语言来源凭据668 = 凭据665.split('=')[1];
+                break;
+              }
+            }
+          }
+          let 是否值664 = false;
+          if (语言来源凭据668 === 'fa' || 语言来源凭据668 === 'fa-IR') {
+            是否值664 = true;
+          } else if (语言来源凭据668 === 'zh' || 语言来源凭据668 === 'zh-CN') {
+            是否值664 = false;
+          } else {
+            // 如果没有Cookie，使用浏览器语言检测
+            const 接受语言663 = 请求735.headers.get('Accept-Language') || '';
+            const 浏览器语言662 = 接受语言663.split(',')[0].split('-')[0].toLowerCase();
+            是否值664 = 浏览器语言662 === 'fa' || 接受语言663.includes('fa-IR') || 接受语言663.includes('fa');
+          }
+          const 语言 = 是否值664 ? 'fa' : 'zh-CN';
+          const 语言值661 = 是否值664 ? 'fa-IR' : 'zh-CN';
+          const 本地值660 = {
+            zh: {
+              title: '终端 v2.9.8c',
+              terminal: '终端 v2.9.8c',
+              congratulations: '恭喜你来到这',
+              enterU: '请输入你U变量的值',
+              enterD: '请输入你D变量的值',
+              command: '命令: connect [',
+              uuid: 'UUID',
+              path: 'PATH',
+              inputU: '输入U变量的内容并且回车...',
+              inputD: '输入D变量的内容并且回车...',
+              connecting: '正在连接...',
+              invading: '正在入侵...',
+              success: '连接成功！返回结果...',
+              error: '错误: 无效的UUID格式',
+              reenter: '请重新输入有效的UUID'
+            },
+            fa: {
+              title: 'ترمینال v2.9.8c',
+              terminal: 'ترمینال v2.9.8c',
+              congratulations: 'تبریک می‌گوییم به شما',
+              enterU: 'لطفا مقدار متغیر U خود را وارد کنید',
+              enterD: 'لطفا مقدار متغیر D خود را وارد کنید',
+              command: 'دستور: connect [',
+              uuid: 'UUID',
+              path: 'PATH',
+              inputU: 'محتویات متغیر U را وارد کرده و Enter را بزنید...',
+              inputD: 'محتویات متغیر D را وارد کرده و Enter را بزنید...',
+              connecting: 'در حال اتصال...',
+              invading: 'در حال نفوذ...',
+              success: 'اتصال موفق! در حال بازگشت نتیجه...',
+              error: 'خطا: فرمت UUID نامعتبر',
+              reenter: 'لطفا UUID معتبر را دوباره وارد کنید'
+            }
+          };
+          const 翻译值659 = 本地值660[是否值664 ? 'fa' : 'zh'];
+          const 终端页面 = `<!DOCTYPE html>
+    <html lang="${语言值661}" dir="${是否值664 ? 'rtl' : 'ltr'}">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>${翻译值659.title}</title>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Vazirmatn:wght@400;500;600;700&display=swap');
+            :root {
+                --md-bg: #080a0e;
+                --md-bg-2: #0b0e14;
+                --md-surface: #10141c;
+                --md-surface-2: #141a24;
+                --md-surface-3: #1b2230;
+                --md-primary: #c8f135;
+                --md-primary-d: #a6cf1d;
+                --md-on-primary: #0a0f05;
+                --md-secondary: #5b8cff;
+                --md-secondary-d: #3f5fb0;
+                --md-tertiary: #ffb454;
+                --md-yellow: #ffb454;
+                --md-success: #3ddc84;
+                --md-error: #ff5d73;
+                --md-warning: #ffb454;
+                --md-text: #eef2f7;
+                --md-text-dim: #9aa6b8;
+                --md-outline: rgba(238,242,247,0.18);
+                --md-font: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                --cp-bg: var(--md-bg);
+                --cp-bg-2: var(--md-bg-2);
+                --cp-cyan: var(--md-primary);
+                --cp-cyan-d: var(--md-primary-d);
+                --cp-pink: var(--md-secondary);
+                --cp-pink-d: var(--md-secondary-d);
+                --cp-purple: var(--md-tertiary);
+                --cp-yellow: var(--md-yellow);
+                --cp-mint: var(--md-success);
+                --cp-red: var(--md-error);
+                --cp-text: var(--md-text);
+                --cp-text-dim: var(--md-text-dim);
+                --cp-border: var(--md-outline);
+                --cp-grid: transparent;
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            html, body { height: 100%; }
+            body {
+                font-family: var(--md-font);
+                background:
+                    radial-gradient(circle at 15% 15%, rgba(200,241,53,0.16) 0%, transparent 40%),
+                    radial-gradient(circle at 85% 85%, rgba(91,140,255,0.14) 0%, transparent 40%),
+                    var(--md-bg);
+                color: var(--md-text);
+                min-height: 100vh;
+                overflow-x: hidden;
+                position: relative;
+                display: flex; justify-content: center; align-items: center;
+                padding: 24px;
+            }
+            body::before, body::after { content: none; }
+            .matrix-bg, .matrix-code-rain, .matrix-column, .matrix-rain { display: none !important; }
+
+            .terminal {
+                width: 100%; max-width: 440px;
+                background: var(--md-surface);
+                border: 1px solid var(--md-outline);
+                border-radius: 28px;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.45), 0 2px 8px rgba(0,0,0,0.3);
+                position: relative; z-index: 1;
+                overflow: hidden;
+            }
+            .terminal::before { content: none; }
+            .terminal-header {
+                background: var(--md-surface-2);
+                padding: 20px 24px;
+                border-bottom: 1px solid var(--md-outline);
+                display: flex; align-items: center; gap: 14px;
+                position: relative;
+            }
+            .terminal-header::after { content: none; }
+            .terminal-buttons { display: flex; gap: 8px; }
+            .terminal-button {
+                width: 11px; height: 11px; border-radius: 50%;
+                background: var(--md-secondary);
+                border: none;
+            }
+            .terminal-button:nth-child(2) { background: var(--md-warning); }
+            .terminal-button:nth-child(3) { background: var(--md-success); }
+            .terminal-title {
+                color: var(--md-text);
+                font-size: 15px; font-weight: 500;
+                letter-spacing: 0.01em;
+            }
+            .terminal-title::before { content: ""; }
+            .terminal-body {
+                padding: 28px 24px; max-height: 60vh;
+                overflow-y: auto; font-size: 14.5px;
+                line-height: 1.7;
+                position: relative;
+            }
+            .terminal-body::-webkit-scrollbar { width: 6px; }
+            .terminal-body::-webkit-scrollbar-thumb {
+                background: var(--md-primary-d); border-radius: 3px;
+            }
+            .terminal-line {
+                margin-bottom: 14px; display: flex; align-items: center; gap: 10px;
+                flex-wrap: wrap;
+            }
+            .terminal-prompt {
+                display: none;
+            }
+            .terminal-prompt::before { content: none; }
+            .terminal-input {
+                background: var(--md-surface-2);
+                border: 1.5px solid var(--md-outline);
+                border-radius: 16px;
+                outline: none;
+                color: var(--md-text);
+                font-family: inherit;
+                font-size: 15px; flex: 1; min-width: 0;
+                padding: 14px 16px;
+                caret-color: var(--md-primary);
+                transition: border-color 0.2s ease, box-shadow 0.2s ease;
+            }
+            .terminal-input:focus {
+                border-color: var(--md-primary);
+                box-shadow: 0 0 0 3px rgba(200,241,53,0.18);
+            }
+            .terminal-input::placeholder { color: var(--md-text-dim); opacity: 0.75; }
+            .terminal-cursor { display: none; }
+            .terminal-output { color: var(--md-text-dim); margin: 4px 0; }
+            .terminal-error  { color: var(--md-error); margin: 4px 0; font-weight: 500; }
+            .terminal-success{ color: var(--md-success); margin: 4px 0; font-weight: 500; }
+
+            .cp-hud {
+                position: fixed; top: 20px; right: 20px;
+                color: var(--md-text-dim);
+                font-family: var(--md-font);
+                font-size: 11px; letter-spacing: 0.05em;
+                text-align: right;
+                opacity: 0.7;
+                z-index: 1000;
+                display: none;
+            }
+            .cp-hud .cp-hud-label { color: var(--md-primary); }
+            .cp-hud .cp-hud-line { display: block; }
+            .cp-lang-wrapper {
+                position: fixed; top: 20px; left: 20px; z-index: 1000;
+                display: flex; align-items: center; gap: 8px;
+            }
+            .cp-lang-tag { display: none; }
+            #languageSelector {
+                background: var(--md-surface-2);
+                border: 1px solid var(--md-outline);
+                border-radius: 20px;
+                color: var(--md-text);
+                padding: 8px 16px;
+                font-family: inherit;
+                font-size: 13px;
+                cursor: pointer;
+            }
+            #languageSelector option { background: var(--md-surface-2); color: var(--md-text); }
+
+            /* FX toggle */
+            .cp-fx-toggle {
+                position: fixed; top: 20px; right: 20px; z-index: 1001;
+                background: var(--md-surface-2);
+                border: 1px solid var(--md-outline);
+                border-radius: 20px;
+                color: var(--md-text-dim);
+                padding: 8px 16px;
+                font-family: inherit;
+                font-size: 12px;
+                cursor: pointer;
+                transition: all 0.2s ease;
+                display: inline-flex; align-items: center; gap: 8px;
+            }
+            .cp-fx-toggle:hover { color: var(--md-primary); border-color: var(--md-primary); }
+            .cp-fx-toggle .cp-fx-dot { width: 8px; height: 8px; background: var(--md-success); border-radius: 50%; transition: all 0.2s; }
+            body.fx-off .cp-fx-toggle .cp-fx-dot { background: transparent; border: 1px solid var(--md-text-dim); }
+
+            .cp-glitch {
+                font-family: var(--md-font);
+                font-weight: 500;
+                color: var(--md-text);
+            }
+        </style>
+    </head>
+    <body>
+        <div class="matrix-bg"></div>
+        <div class="matrix-code-rain" id="matrixCodeRain"></div>
+            <div class="cp-hud">
+                <span class="cp-hud-line"><span class="cp-hud-label">SYS::</span> ${翻译值659.terminal}</span>
+                <span class="cp-hud-line"><span class="cp-hud-label">NODE::</span> NIGHT_CITY</span>
+                <span class="cp-hud-line"><span class="cp-hud-label">LINK::</span> SECURE / ENC</span>
+            </div>
+            <div class="cp-lang-wrapper">
+                <span class="cp-lang-tag">LANG_</span>
+                <select id="languageSelector" onchange="切换语言(this.value)">
+                    <option value="zh" ${!是否值664 ? 'selected' : ''}>🇨🇳 中文</option>
+                    <option value="fa" ${是否值664 ? 'selected' : ''}>🇮🇷 فارسی</option>
+                </select>
+            </div>
+            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="window.切换页面特效()" title="${是否值664 ? 'تغییر افکت‌های صفحه' : '切换页面特效'}" aria-label="FX toggle">
+                <span class="cp-fx-dot" aria-hidden="true"></span>
+                <span id="cpFxLabel">FX: ON</span>
+            </button>
+        <div class="terminal">
+            <div class="terminal-header">
+                <div class="terminal-buttons">
+                    <div class="terminal-button"></div>
+                    <div class="terminal-button"></div>
+                    <div class="terminal-button"></div>
+                </div>
+                    <div class="terminal-title cp-glitch">${翻译值659.terminal}</div>
+            </div>
+            <div class="terminal-body" id="terminalBody">
+                <div class="terminal-line">
+                    <span class="terminal-prompt">root:~$</span>
+                        <span class="terminal-output">${翻译值659.congratulations}</span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">root:~$</span>
+                        <span class="terminal-output">${自定义路径 && 自定义路径.trim() ? 翻译值659.enterD : 翻译值659.enterU}</span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">root:~$</span>
+                        <span class="terminal-output">${翻译值659.command}${自定义路径 && 自定义路径.trim() ? 翻译值659.path : 翻译值659.uuid}]</span>
+                </div>
+                <div class="terminal-line">
+                    <span class="terminal-prompt">root:~$</span>
+                        <input type="text" class="terminal-input" id="uuidInput" placeholder="${自定义路径 && 自定义路径.trim() ? 翻译值659.inputD : 翻译值659.inputU}" autofocus>
+                    <span class="terminal-cursor"></span>
+                </div>
+            </div>
+        </div>
+        <script>
+// 页面特效图形化开关 (localStorage 持久化)
+window.应用页面特效 = function () {
+  var 本地值10009 = localStorage.getItem('cp-fx-off') === '1';
+  document.body.classList.toggle('fx-off', 本地值10009);
+  var 本地值10008 = document.getElementById('cpFxLabel');
+  if (本地值10008) 本地值10008.textContent = 本地值10009 ? 'FX: OFF' : 'FX: ON';
+  if (本地值10009) {
+    var 本地值10007 = document.getElementById('matrixCodeRain');
+    if (本地值10007) 本地值10007.innerHTML = '';
+  } else if (typeof 创建矩阵雨 === 'function') {
+    var 结果值 = document.getElementById('matrixCodeRain');
+    if (结果值 && !结果值.firstChild) 创建矩阵雨();
+  }
+};
+window.切换页面特效 = function () {
+  var 本地值10006 = localStorage.getItem('cp-fx-off') === '1';
+  localStorage.setItem('cp-fx-off', 本地值10006 ? '0' : '1');
+  window.应用页面特效();
+};
+(function () {
+  if (localStorage.getItem('cp-fx-off') === '1') {
+    document.documentElement.classList.add('fx-off-preload');
+    document.addEventListener('DOMContentLoaded', function () {
+      document.body.classList.add('fx-off');
+    });
+  }
+})();
+function 创建矩阵雨() {
+  if (document.body && document.body.classList.contains('fx-off')) return;
+  const 矩阵值 = document.getElementById('matrixCodeRain');
+  if (!矩阵值) return;
+  const 赛博字符列表 = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$%#@!?<>+=ABCDEF';
+  const 调色板 = ['#c8f135', '#5b8cff', '#ffb454', '#3ddc84'];
+  const 列数 = Math.floor(window.innerWidth / 20);
+  for (let 索引值 = 0; 索引值 < 列数; 索引值++) {
+    const 列10005 = document.createElement('div');
+    列10005.className = 'matrix-column';
+    列10005.style.left = 索引值 * 20 + 'px';
+    列10005.style.animationDelay = -Math.random() * 15 + 's';
+    列10005.style.animationDuration = Math.random() * 14 + 8 + 's';
+    列10005.style.fontSize = Math.random() * 4 + 12 + 'px';
+    列10005.style.opacity = (Math.random() * 0.7 + 0.3).toFixed(2);
+    let 文本 = '';
+    const 字符数量 = Math.floor(Math.random() * 30 + 18);
+    for (let 次索引值 = 0; 次索引值 < 字符数量; 次索引值++) {
+      const 字符 = 赛博字符列表[Math.floor(Math.random() * 赛博字符列表.length)];
+      const 值强调 = Math.random() > 0.85;
+      const 颜色 = 值强调 ? 调色板[Math.floor(Math.random() * 调色板.length)] : '';
+      文本 += 颜色 ? '<span style="color:' + 颜色 + ';">' + 字符 + '</span><br>' : '<span>' + 字符 + '</span><br>';
+    }
+    列10005.innerHTML = 文本;
+    矩阵值.appendChild(列10005);
+  }
+  setInterval(function () {
+    const 列列表 = 矩阵值.querySelectorAll('.matrix-column');
+    列列表.forEach(function (列) {
+      if (Math.random() > 0.94) {
+        const 字符列表 = 列.querySelectorAll('span');
+        if (字符列表.length > 0) {
+          const 目标 = 字符列表[Math.floor(Math.random() * 字符列表.length)];
+          const 本地值10004 = 目标.style.color;
+          目标.style.color = '#ffffff';
+          目标.style.textShadow = '0 0 10px #ffffff, 0 0 18px #c8f135';
+          setTimeout(function () {
+            目标.style.color = 本地值10004;
+            目标.style.textShadow = '';
+          }, 200);
+        }
+      }
+    });
+  }, 110);
+}
+function 是否有效唯一标识(唯一标识) {
+  const 唯一标识正则 = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return 唯一标识正则.test(唯一标识);
+}
+function 添加终端行(内容, 类型 = 'output') {
+  const 终端主体 = document.getElementById('terminalBody');
+  const 行 = document.createElement('div');
+  行.className = 'terminal-line';
+  const 提示符 = document.createElement('span');
+  提示符.className = 'terminal-prompt';
+  提示符.textContent = 'root:~$';
+  const 输出 = document.createElement('span');
+  输出.className = 'terminal-' + 类型;
+  输出.textContent = 内容;
+  行.appendChild(提示符);
+  行.appendChild(输出);
+  终端主体.appendChild(行);
+  终端主体.scrollTop = 终端主体.scrollHeight;
+}
+function 处理唯一标识输入() {
+  const 输入10003 = document.getElementById('uuidInput');
+  const 输入值 = 输入10003.value.trim();
+  const 自定义路径 = '${自定义路径}';
+  if (输入值) {
+    添加终端行(atob('Y29ubmVjdCA=') + 输入值, 'output');
+    const 本地值 = {
+      zh: {
+        connecting: '正在连接...',
+        invading: '正在入侵...',
+        success: '连接成功！返回结果...',
+        error: '错误: 无效的UUID格式',
+        reenter: '请重新输入有效的UUID'
+      },
+      fa: {
+        connecting: 'در حال اتصال...',
+        invading: 'در حال نفوذ...',
+        success: 'اتصال موفق! در حال بازگشت نتیجه...',
+        error: 'خطا: فرمت UUID نامعتبر',
+        reenter: 'لطفا UUID معتبر را دوباره وارد کنید'
+      }
+    };
+    const 浏览器语言 = navigator.language || navigator.userLanguage || '';
+    const 是否值 = 浏览器语言.includes('fa') || 浏览器语言.includes('fa-IR');
+    const 翻译值 = 本地值[是否值 ? 'fa' : 'zh'];
+    if (自定义路径) {
+      const 清理输入 = 输入值.startsWith('/') ? 输入值 : '/' + 输入值;
+      添加终端行(翻译值.connecting, 'output');
+      setTimeout(() => {
+        添加终端行(翻译值.success, 'success');
+        setTimeout(() => {
+          window.location.href = 清理输入;
+        }, 1000);
+      }, 500);
+    } else {
+      if (是否有效唯一标识(输入值)) {
+        添加终端行(翻译值.invading, 'output');
+        setTimeout(() => {
+          添加终端行(翻译值.success, 'success');
+          setTimeout(() => {
+            window.location.href = '/' + 输入值;
+          }, 1000);
+        }, 500);
+      } else {
+        添加终端行(翻译值.error, 'error');
+        添加终端行(翻译值.reenter, 'output');
+      }
+    }
+    输入10003.value = '';
+  }
+}
+function 切换语言(语言) {
+  localStorage.setItem('preferredLanguage', 语言);
+  // 设置Cookie（有效期1年）
+  const 过期日期10002 = new Date();
+  过期日期10002.setFullYear(过期日期10002.getFullYear() + 1);
+  document.cookie = 'preferredLanguage=' + 语言 + '; path=/; expires=' + 过期日期10002.toUTCString() + '; SameSite=Lax';
+  // 刷新页面，不使用URL参数
+  window.location.reload();
+}
+
+// 页面加载时检查 localStorage 和 Cookie，并清理URL参数
+window.addEventListener('DOMContentLoaded', function () {
+  function 获取凭据(名称) {
+    const 值 = '; ' + document.cookie;
+    const 部分列表 = 值.split('; ' + 名称 + '=');
+    if (部分列表.length === 2) return 部分列表.pop().split(';').shift();
+    return null;
+  }
+  const 已保存语言 = localStorage.getItem('preferredLanguage') || 获取凭据('preferredLanguage');
+  const 网址参数 = new URLSearchParams(window.location.search);
+  const 网址语言 = 网址参数.get('lang');
+
+  // 如果URL中有语言参数，移除它并设置Cookie
+  if (网址语言) {
+    const 当前网址 = new URL(window.location.href);
+    当前网址.searchParams.delete('lang');
+    const 新网址 = 当前网址.toString();
+
+    // 设置Cookie
+    const 过期日期10001 = new Date();
+    过期日期10001.setFullYear(过期日期10001.getFullYear() + 1);
+    document.cookie = 'preferredLanguage=' + 网址语言 + '; path=/; expires=' + 过期日期10001.toUTCString() + '; SameSite=Lax';
+    localStorage.setItem('preferredLanguage', 网址语言);
+
+    // 使用history API移除URL参数，不刷新页面
+    window.history.replaceState({}, '', 新网址);
+  } else if (已保存语言) {
+    // 如果localStorage中有但Cookie中没有，同步到Cookie
+    const 过期日期 = new Date();
+    过期日期.setFullYear(过期日期.getFullYear() + 1);
+    document.cookie = 'preferredLanguage=' + 已保存语言 + '; path=/; expires=' + 过期日期.toUTCString() + '; SameSite=Lax';
+  }
+});
+document.addEventListener('DOMContentLoaded', function () {
+  try {
+    创建矩阵雨();
+  } catch (事件值10000) {}
+  const 输入 = document.getElementById('uuidInput');
+  if (输入) {
+    输入.focus();
+    输入.addEventListener('keypress', function (事件值) {
+      if (事件值.key === 'Enter') {
+        处理唯一标识输入();
+      }
+    });
+  }
+});
+</script>
+    </body>
+    </html>`;
+          return new Response(终端页面, {
+            status: 200,
+            headers: {
+              'Content-Type': 'text/html; charset=utf-8'
+            }
+          });
+        }
+        if (自定义路径 && 自定义路径.trim()) {
+          const 清理自定义路径 = 自定义路径.trim().startsWith('/') ? 自定义路径.trim() : '/' + 自定义路径.trim();
+          const 规范化自定义路径 = 清理自定义路径.endsWith('/') && 清理自定义路径.length > 1 ? 清理自定义路径.slice(0, -1) : 清理自定义路径;
+          const 规范化路径 = 网址698.pathname.endsWith('/') && 网址698.pathname.length > 1 ? 网址698.pathname.slice(0, -1) : 网址698.pathname;
+          if (规范化路径 === 规范化自定义路径) {
+            return await 处理订阅值(请求735, 认证令牌);
+          }
+          if (规范化路径 === 规范化自定义路径 + '/sub') {
+            return await 处理订阅请求(请求735, 认证令牌, 网址698);
+          }
+          if (网址698.pathname.length > 1 && 网址698.pathname !== '/') {
+            const 用户658 = 网址698.pathname.replace(/\/$/, '').replace('/sub', '').substring(1);
+            if (是否有效格式(用户658)) {
+              return new Response(JSON.stringify({
+                error: '访问被拒绝',
+                message: '当前 Worker 已启用自定义路径模式，UUID 访问已禁用'
+              }), {
+                status: 403,
+                headers: {
+                  'Content-Type': 'application/json'
+                }
+              });
+            }
+          }
+        } else {
+          if (网址698.pathname.length > 1 && 网址698.pathname !== '/' && !网址698.pathname.includes('/sub')) {
+            const 用户657 = 网址698.pathname.replace(/\/$/, '').substring(1);
+            if (是否有效格式(用户657)) {
+              if (用户657 === 认证令牌) {
+                return await 处理订阅值(请求735, 用户657);
+              } else {
+                return new Response(JSON.stringify({
+                  error: 'UUID错误 请注意变量名称是u不是uuid'
+                }), {
+                  status: 403,
+                  headers: {
+                    'Content-Type': 'application/json'
+                  }
+                });
+              }
+            }
+          }
+          if (网址698.pathname.includes('/sub')) {
+            const 路径部分列表 = 网址698.pathname.split('/');
+            if (路径部分列表.length === 2 && 路径部分列表[1] === 'sub') {
+              const 用户656 = 路径部分列表[0].substring(1);
+              if (是否有效格式(用户656)) {
+                if (用户656 === 认证令牌) {
+                  return await 处理订阅请求(请求735, 用户656, 网址698);
+                } else {
+                  return new Response(JSON.stringify({
+                    error: 'UUID错误'
+                  }), {
+                    status: 403,
+                    headers: {
+                      'Content-Type': 'application/json'
+                    }
+                  });
+                }
+              }
+            }
+          }
+        }
+        if (网址698.pathname.toLowerCase().includes(`/${值路径}`)) {
+          return await 处理订阅请求(请求735, 认证令牌);
+        }
+      }
+      return new Response(JSON.stringify({
+        error: 'Not Found'
+      }), {
+        status: 404,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    } catch (错误655) {
+      return new Response(错误655.toString(), {
+        status: 500
+      });
+    }
+  }
+};
+function 生成值配置654(链接列表653) {
+  return btoa(链接列表653.join('\n'));
+}
+
+// 解析分享链接并生成客户端节点配置
+function 解析链接值值节点(链接652) {
+  try {
+    // 解析第一类链接
+    if (链接652.startsWith(解码64('dmxlc3M6Ly8='))) {
+      const 网址651 = new URL(链接652);
+      const 名称650 = decodeURIComponent(网址651.hash.substring(1));
+      const 唯一标识649 = 网址651.username;
+      const 本地值648 = 网址651.hostname;
+      const 端口647 = parseInt(网址651.port) || 443;
+      const 参数646 = new URLSearchParams(网址651.search);
+      const 传输层安全645 = 参数646.get('security') === 'tls' || 参数646.get('tls') === 'true';
+      const 本地值644 = 参数646.get('type') || 'ws';
+      const 路径643 = 参数646.get('path') || '/?ed=2048';
+      const 主机642 = 参数646.get('host') || 本地值648;
+      const 本地值641 = 参数646.get('sni') || 主机642;
+      const 应用层协议协商原始640 = 参数646.get('alpn') || '';
+      const 本地值639 = 参数646.get('fp') || 参数646.get('client-fingerprint') || 'chrome';
+      const 加密客户端问候638 = 参数646.get('ech');
+      const 节点637 = {
+        name: 名称650,
+        type: 解码64('dmxlc3M='),
+        server: 本地值648,
+        port: 端口647,
+        uuid: 唯一标识649,
+        tls: 传输层安全645,
+        network: 本地值644,
+        'client-fingerprint': 本地值639
+      };
+      if (传输层安全645) {
+        节点637.servername = 本地值641;
+        if (应用层协议协商原始640) 节点637.alpn = 应用层协议协商原始640.split(',').map(甲值636 => 甲值636.trim()).filter(Boolean);
+        节点637['skip-cert-verify'] = false;
+      }
+      if (本地值644 === 'ws') {
+        节点637['ws-opts'] = {
+          path: 路径643,
+          headers: {
+            Host: 主机642
+          }
+        };
+      }
+      if (加密客户端问候638) {
+        const 加密客户端问候域名635 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        节点637['ech-opts'] = {
+          enable: true,
+          'query-server-name': 加密客户端问候域名635
+        };
+      }
+      return 节点637;
+    }
+
+    // 解析第二类链接
+    if (链接652.startsWith(解码64('dHJvamFuOi8v'))) {
+      const 网址634 = new URL(链接652);
+      const 名称633 = decodeURIComponent(网址634.hash.substring(1));
+      const 密码632 = 网址634.username;
+      const 本地值631 = 网址634.hostname;
+      const 端口630 = parseInt(网址634.port) || 443;
+      const 参数629 = new URLSearchParams(网址634.search);
+      const 本地值628 = 参数629.get('type') || 'ws';
+      const 路径 = 参数629.get('path') || '/?ed=2048';
+      const 主机627 = 参数629.get('host') || 本地值631;
+      const 服务名称指示626 = 参数629.get('sni') || 主机627;
+      const 应用层协议协商原始 = 参数629.get('alpn') || '';
+      const 加密客户端问候 = 参数629.get('ech');
+      const 节点 = {
+        name: 名称633,
+        type: 解码64('dHJvamFu'),
+        server: 本地值631,
+        port: 端口630,
+        password: 密码632,
+        network: 本地值628,
+        sni: 服务名称指示626,
+        'skip-cert-verify': false
+      };
+      if (应用层协议协商原始) 节点.alpn = 应用层协议协商原始.split(',').map(甲值625 => 甲值625.trim()).filter(Boolean);
+      if (本地值628 === 'ws') {
+        节点['ws-opts'] = {
+          path: 路径,
+          headers: {
+            Host: 主机627
+          }
+        };
+      }
+      if (加密客户端问候) {
+        const 加密客户端问候域名624 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        节点['ech-opts'] = {
+          enable: true,
+          'query-server-name': 加密客户端问候域名624
+        };
+      }
+      return 节点;
+    }
+  } catch (事件值623) {
+    return null;
+  }
+  return null;
+}
+
+// ============================================================
+// 内部格式转换器 - 不依赖外部服务
+// ============================================================
+
+// 用于 YAML 引号包裹（避免 IPv6 方括号、逗号等被解析为数组）
+function 处理本地值622(取值621) {
+  if (取值621 == null) return '""';
+  const 字符串值620 = String(取值621);
+  return '"' + 字符串值620.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+// URL.hostname 对 IPv6 会带方括号，直接写入 YAML 会被当成数组
+function 规范化值主机(主机名619) {
+  if (!主机名619) return 主机名619;
+  const 头值618 = String(主机名619);
+  if (头值618.startsWith('[') && 头值618.endsWith(']')) return 头值618.slice(1, -1);
+  return 头值618;
+}
+
+// Clash 策略组 proxies：策略组 + 全部节点（避免分组里只有「节点选择」没有具体节点）
+function 处理值选择值(名称列表617, 本地值616 = {}) {
+  const {
+    directFirst: 直连首次615 = false,
+    extraGroups: 值值614 = []
+  } = 本地值616;
+  const 节点行列表 = 名称列表617.length ? 名称列表617.map(数量值613 => `      - ${处理本地值622(数量值613)}`).join('\n') : '      - DIRECT';
+  const 行列表612 = [];
+  if (直连首次615) {
+    行列表612.push('      - "🎯 全球直连"', '      - "🚀 节点选择"');
+  } else {
+    行列表612.push('      - "🚀 节点选择"', '      - "🎯 全球直连"');
+  }
+  for (const 本地值611 of 值值614) 行列表612.push(`      - ${处理本地值622(本地值611)}`);
+  行列表612.push(节点行列表);
+  return 行列表612.join('\n');
+}
+
+// Surge / Loon 策略组列表：策略组 + 全部节点
+function 处理值值列表(名称列表610, 本地值609 = {}) {
+  const {
+    directFirst: 直连首次 = false,
+    extraGroups: 值值608 = [],
+    compact: 本地值607 = false
+  } = 本地值609;
+  const 本地值606 = 本地值607 ? ',' : ', ';
+  const 列表605 = 名称列表610.length ? 名称列表610.join(本地值606) : 'DIRECT';
+  const 部分列表604 = [];
+  if (直连首次) 部分列表604.push('🎯 全球直连', '🚀 节点选择');else 部分列表604.push('🚀 节点选择', '🎯 全球直连');
+  部分列表604.push(...值值608);
+  if (名称列表610.length) 部分列表604.push(列表605);
+  return 部分列表604.join(本地值606);
+}
+
+// 解析任意分享链接为通用节点对象
+function 解析值链接(链接603) {
+  try {
+    if (链接603.startsWith(解码64('dmxlc3M6Ly8='))) {
+      const 网址602 = new URL(链接603);
+      const 参数值601 = new URLSearchParams(网址602.search);
+      return {
+        proto: 解码64('dmxlc3M='),
+        name: decodeURIComponent(网址602.hash.substring(1)) || 网址602.hostname + ':' + 网址602.port,
+        uuid: 网址602.username,
+        server: 规范化值主机(网址602.hostname),
+        port: parseInt(网址602.port) || 443,
+        tls: 参数值601.get('security') === 'tls' || 参数值601.get('security') === 'reality',
+        network: 参数值601.get('type') || 'ws',
+        path: 参数值601.get('path') || '/?ed=2048',
+        host: 规范化值主机(参数值601.get('host') || 网址602.hostname),
+        sni: 规范化值主机(参数值601.get('sni') || 参数值601.get('host') || 网址602.hostname),
+        alpn: (参数值601.get('alpn') || '').split(',').map(字符串值600 => 字符串值600.trim()).filter(Boolean),
+        fp: 参数值601.get('fp') || 'chrome',
+        flow: 参数值601.get('flow') || '',
+        encryption: 参数值601.get('encryption') || 'none',
+        mode: 参数值601.get('mode') || '',
+        ech: 参数值601.get('ech') || ''
+      };
+    }
+    if (链接603.startsWith(解码64('dHJvamFuOi8v'))) {
+      const 网址599 = new URL(链接603);
+      const 参数值 = new URLSearchParams(网址599.search);
+      return {
+        proto: 解码64('dHJvamFu'),
+        name: decodeURIComponent(网址599.hash.substring(1)) || 网址599.hostname + ':' + 网址599.port,
+        password: decodeURIComponent(网址599.username),
+        server: 规范化值主机(网址599.hostname),
+        port: parseInt(网址599.port) || 443,
+        tls: true,
+        network: 参数值.get('type') || 'ws',
+        path: 参数值.get('path') || '/?ed=2048',
+        host: 规范化值主机(参数值.get('host') || 网址599.hostname),
+        sni: 规范化值主机(参数值.get('sni') || 参数值.get('host') || 网址599.hostname),
+        alpn: (参数值.get('alpn') || '').split(',').map(字符串值598 => 字符串值598.trim()).filter(Boolean),
+        fp: 参数值.get('fp') || 'chrome',
+        ech: 参数值.get('ech') || ''
+      };
+    }
+  } catch (事件值597) {}
+  return null;
+}
+
+// 单个节点 → Clash 块级 YAML（避免 flow style 解析错误）
+function 构建值节点行(数量值596) {
+  const 行列表595 = [];
+  const 本地值594 = 规范化值主机(数量值596.server);
+  const 主机593 = 规范化值主机(数量值596.host) || 本地值594;
+  const 服务名称指示592 = 规范化值主机(数量值596.sni) || 主机593;
+  行列表595.push(`  - name: ${处理本地值622(数量值596.name)}`);
+  行列表595.push(`    type: ${数量值596.proto}`);
+  行列表595.push(`    server: ${处理本地值622(本地值594)}`);
+  行列表595.push(`    port: ${数量值596.port}`);
+  if (数量值596.proto === 解码64('dmxlc3M=')) {
+    行列表595.push(`    uuid: ${数量值596.uuid}`);
+    行列表595.push(`    udp: true`);
+    行列表595.push(`    tls: ${数量值596.tls ? 'true' : 'false'}`);
+    if (数量值596.flow) 行列表595.push(`    flow: ${处理本地值622(数量值596.flow)}`);
+    行列表595.push(`    client-fingerprint: ${处理本地值622(数量值596.fp || 'chrome')}`);
+  } else if (数量值596.proto === 解码64('dHJvamFu')) {
+    行列表595.push(`    password: ${处理本地值622(数量值596.password)}`);
+    行列表595.push(`    udp: true`);
+    行列表595.push(`    client-fingerprint: ${处理本地值622(数量值596.fp || 'chrome')}`);
+  }
+  if (数量值596.tls) {
+    行列表595.push(`    servername: ${处理本地值622(服务名称指示592)}`);
+    if (数量值596.alpn && 数量值596.alpn.length) {
+      行列表595.push(`    alpn: [${数量值596.alpn.map(甲值591 => 处理本地值622(甲值591)).join(', ')}]`);
+    }
+    行列表595.push(`    skip-cert-verify: false`);
+  }
+  if (数量值596.network === 'ws' || 数量值596.network === 'xhttp') {
+    行列表595.push(`    network: ws`);
+    行列表595.push(`    ws-opts:`);
+    行列表595.push(`      path: ${处理本地值622(数量值596.path)}`);
+    行列表595.push(`      headers:`);
+    行列表595.push(`        Host: ${处理本地值622(主机593)}`);
+  } else if (数量值596.network === 'grpc') {
+    行列表595.push(`    network: grpc`);
+    行列表595.push(`    grpc-opts:`);
+    行列表595.push(`      grpc-service-name: ${处理本地值622(数量值596.path)}`);
+  }
+  if (数量值596.ech) {
+    const 加密客户端问候域名590 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+    行列表595.push(`    ech-opts:`);
+    行列表595.push(`      enable: true`);
+    行列表595.push(`      query-server-name: ${处理本地值622(加密客户端问候域名590)}`);
+  }
+  return 行列表595.join('\n');
+}
+
+// 内部生成 Clash YAML（完整规则集：Loyalsoldier rule-providers）
+function 生成值值589(链接列表588, 本地值587 = {}) {
+  const 节点列表586 = 链接列表588.map(解析值链接).filter(数量值585 => 数量值585 && (数量值585.proto === 解码64('dmxlc3M=') || 数量值585.proto === 解码64('dHJvamFu')));
+  const 名称列表584 = 节点列表586.map(数量值583 => 数量值583.name);
+  const 域名系统值582 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+  const 头部581 = ['mixed-port: 7890', 'allow-lan: true', 'mode: rule', 'log-level: info', 'ipv6: true', 'external-controller: 127.0.0.1:9090', 'unified-delay: true', 'tcp-concurrent: true', 'geodata-mode: true', 'geo-auto-update: true', 'geo-update-interval: 24', 'geox-url:', '  geoip: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geoip.dat"', '  geosite: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/geosite.dat"', '  mmdb: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/country.mmdb"', '  asn: "https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@release/GeoLite2-ASN.mmdb"', 'sniffer:', '  enable: true', '  force-dns-mapping: true', '  parse-pure-ip: true', '  sniff:', '    HTTP:', '      ports: [80, 8080-8880]', '      override-destination: true', '    TLS:', '      ports: [443, 8443]', '    QUIC:', '      ports: [443, 8443]', 'dns:', '  enable: true', '  listen: 0.0.0.0:1053', '  ipv6: true', '  enhanced-mode: fake-ip', '  fake-ip-range: 198.18.0.1/16', '  fake-ip-filter:', '    - "*.lan"', '    - "+.local"', '    - "+.market.xiaomi.com"', '    - "+.msftconnecttest.com"', '    - "+.msftncsi.com"', '    - "localhost.ptlogin2.qq.com"', '    - "+.srv.nintendo.net"', '    - "+.stun.playstation.net"', '    - "+.xboxlive.com"', '  default-nameserver:', '    - 223.5.5.5', '    - 119.29.29.29', '  nameserver:', `    - ${域名系统值582}`, '    - https://119.29.29.29/dns-query', '  fallback:', '    - https://1.1.1.1/dns-query', '    - https://8.8.8.8/dns-query', '  fallback-filter:', '    geoip: true', '    geoip-code: CN', '    ipcidr:', '      - 240.0.0.0/4', ''];
+  const 值值580 = ['proxies:'];
+  for (const 数量值579 of 节点列表586) 值值580.push(构建值节点行(数量值579));
+  const 节点仅 = 名称列表584.length ? 名称列表584.map(数量值578 => `      - ${处理本地值622(数量值578)}`).join('\n') : '      - DIRECT';
+  const 值值577 = [解码64('cHJveHktZ3JvdXBzOg=='), '  - name: "🚀 节点选择"', '    type: select', '    proxies:', '      - "🎯 全球直连"', 节点仅, '  - name: "🌍 国外媒体"', '    type: select', '    proxies:', 处理值选择值(名称列表584), '  - name: "📺 哔哩哔哩"', '    type: select', '    proxies:', 处理值选择值(名称列表584, {
+    directFirst: true
+  }), '  - name: "📹 油管视频"', '    type: select', '    proxies:', 处理值选择值(名称列表584, {
+    extraGroups: ['🌍 国外媒体']
+  }), '  - name: "🎬 奈飞视频"', '    type: select', '    proxies:', 处理值选择值(名称列表584, {
+    extraGroups: ['🌍 国外媒体']
+  }), '  - name: "📲 电报信息"', '    type: select', '    proxies:', 处理值选择值(名称列表584), '  - name: "🌐 谷歌服务"', '    type: select', '    proxies:', 处理值选择值(名称列表584), '  - name: "🤖 OpenAI"', '    type: select', '    proxies:', 处理值选择值(名称列表584), '  - name: "Ⓜ️ 微软服务"', '    type: select', '    proxies:', 处理值选择值(名称列表584, {
+    directFirst: true
+  }), '  - name: "🍎 苹果服务"', '    type: select', '    proxies:', 处理值选择值(名称列表584, {
+    directFirst: true
+  }), '  - name: "🎯 全球直连"', '    type: select', '    proxies:', '      - DIRECT', '  - name: "🛑 全球拦截"', '    type: select', '    proxies:', '      - REJECT', '      - DIRECT', '  - name: "🍃 应用净化"', '    type: select', '    proxies:', '      - REJECT', '      - DIRECT', '  - name: "🐟 漏网之鱼"', '    type: select', '    proxies:', 处理值选择值(名称列表584), ''];
+
+  // Loyalsoldier 规则源 - CDN: jsDelivr
+  const 值基础576 = 解码64('aHR0cHM6Ly9mYXN0bHkuanNkZWxpdnIubmV0L2doL0xveWFsc29sZGllci9jbGFzaC1ydWxlc0ByZWxlYXNl');
+  const 提供器 = (名称575, 本地值574) => [`  ${名称575}:`, `    type: http`, `    behavior: ${本地值574}`, `    url: "${值基础576}/${名称575}.txt"`, `    path: ./rulesets/loyalsoldier/${名称575}.txt`, `    interval: 86400`].join('\n');
+  const 规则值 = ['rule-providers:', 提供器('reject', 'domain'), 提供器('icloud', 'domain'), 提供器('apple', 'domain'), 提供器('google', 'domain'), 提供器(解码64('cHJveHk='), 'domain'), 提供器('direct', 'domain'), 提供器('private', 'domain'), 提供器('gfw', 'domain'), 提供器('greatfire', 'domain'), 提供器('tld-not-cn', 'domain'), 提供器('telegramcidr', 'ipcidr'), 提供器('cncidr', 'ipcidr'), 提供器('lancidr', 'ipcidr'), 提供器('applications', 'classical'), ''];
+  const 规则列表 = ['rules:', '  - DOMAIN-SUFFIX,acl4.ssr,🎯 全球直连', '  - DOMAIN-SUFFIX,local,🎯 全球直连', 解码64('ICAtIERPTUFJTixjbGFzaC5yYXpvcmQudG9wLPCfjq8g5YWo55CD55u06L+e'), '  - DOMAIN,yacd.haishan.me,🎯 全球直连', '  - DOMAIN,yacd.metacubex.one,🎯 全球直连', '  - DOMAIN,d.metacubex.one,🎯 全球直连', '  - DOMAIN-SUFFIX,googleapis.cn,🌐 谷歌服务', '  - DOMAIN-SUFFIX,gstatic.com,🌐 谷歌服务', '  - DOMAIN-SUFFIX,xn--ngstr-lra8j.com,🌐 谷歌服务', '  - DOMAIN-SUFFIX,googlevideo.com,📹 油管视频', '  - DOMAIN-SUFFIX,googleusercontent.com,🌐 谷歌服务', '  - DOMAIN-KEYWORD,youtube,📹 油管视频', '  - DOMAIN-SUFFIX,youtube.com,📹 油管视频', '  - DOMAIN-SUFFIX,youtu.be,📹 油管视频', '  - DOMAIN-KEYWORD,netflix,🎬 奈飞视频', '  - DOMAIN-SUFFIX,nflxext.com,🎬 奈飞视频', '  - DOMAIN-SUFFIX,nflxso.net,🎬 奈飞视频', '  - DOMAIN-SUFFIX,nflxvideo.net,🎬 奈飞视频', '  - DOMAIN-SUFFIX,nflximg.com,🎬 奈飞视频', '  - DOMAIN-SUFFIX,nflximg.net,🎬 奈飞视频', '  - DOMAIN-SUFFIX,netflix.com,🎬 奈飞视频', '  - DOMAIN-SUFFIX,netflix.net,🎬 奈飞视频', '  - DOMAIN-SUFFIX,bilibili.com,📺 哔哩哔哩', '  - DOMAIN-SUFFIX,bilivideo.com,📺 哔哩哔哩', '  - DOMAIN-SUFFIX,hdslb.com,📺 哔哩哔哩', '  - DOMAIN-KEYWORD,openai,🤖 OpenAI', '  - DOMAIN-KEYWORD,chatgpt,🤖 OpenAI', '  - DOMAIN-SUFFIX,openai.com,🤖 OpenAI', '  - DOMAIN-SUFFIX,chatgpt.com,🤖 OpenAI', '  - DOMAIN-SUFFIX,oaistatic.com,🤖 OpenAI', '  - DOMAIN-SUFFIX,oaiusercontent.com,🤖 OpenAI', '  - DOMAIN-SUFFIX,anthropic.com,🤖 OpenAI', '  - DOMAIN-SUFFIX,claude.ai,🤖 OpenAI', '  - DOMAIN-SUFFIX,perplexity.ai,🤖 OpenAI', '  - DOMAIN-SUFFIX,gemini.google.com,🤖 OpenAI', '  - RULE-SET,applications,🎯 全球直连', '  - RULE-SET,private,🎯 全球直连', '  - RULE-SET,reject,🛑 全球拦截', '  - RULE-SET,icloud,🍎 苹果服务', '  - RULE-SET,apple,🍎 苹果服务', '  - RULE-SET,google,🌐 谷歌服务', 解码64('ICAtIFJVTEUtU0VULHByb3h5LPCfmoAg6IqC54K56YCJ5oup'), '  - RULE-SET,gfw,🚀 节点选择', '  - RULE-SET,greatfire,🚀 节点选择', '  - RULE-SET,tld-not-cn,🚀 节点选择', '  - RULE-SET,direct,🎯 全球直连', '  - RULE-SET,lancidr,🎯 全球直连,no-resolve', '  - RULE-SET,cncidr,🎯 全球直连,no-resolve', '  - RULE-SET,telegramcidr,📲 电报信息,no-resolve', '  - GEOIP,LAN,🎯 全球直连,no-resolve', '  - GEOIP,CN,🎯 全球直连,no-resolve', '  - MATCH,🐟 漏网之鱼'];
+  return [头部581.join('\n'), 值值580.join('\n'), '', 值值577.join('\n'), 规则值.join('\n'), 规则列表.join('\n'), ''].join('\n');
+}
+
+// 内部生成 JSON 客户端配置（完整规则集：MetaCubeX 镜像）
+function 生成值值数据对象(链接列表573) {
+  const 节点列表572 = 链接列表573.map(解析值链接).filter(数量值571 => 数量值571 && (数量值571.proto === 解码64('dmxlc3M=') || 数量值571.proto === 解码64('dHJvamFu')));
+  const 域名系统值570 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+  const 出站值 = 节点列表572.map(数量值569 => 数量值569.name);
+  function 处理节点值出站(数量值568) {
+    const 输出567 = {
+      type: 数量值568.proto,
+      tag: 数量值568.name,
+      server: 规范化值主机(数量值568.server),
+      server_port: 数量值568.port
+    };
+    if (数量值568.proto === 解码64('dmxlc3M=')) {
+      输出567.uuid = 数量值568.uuid;
+      if (数量值568.flow) 输出567.flow = 数量值568.flow;
+    } else {
+      输出567.password = 数量值568.password;
+    }
+    if (数量值568.tls) {
+      输出567.tls = {
+        enabled: true,
+        server_name: 数量值568.sni,
+        insecure: false,
+        utls: {
+          enabled: true,
+          fingerprint: 数量值568.fp || 'chrome'
+        }
+      };
+      if (数量值568.alpn && 数量值568.alpn.length) 输出567.tls.alpn = 数量值568.alpn;
+      if (数量值568.ech) {
+        输出567.tls.ech = {
+          enabled: true,
+          pq_signature_schemes_enabled: false,
+          dynamic_record_sizing_disabled: false
+        };
+      }
+    }
+    if (数量值568.network === 'ws' || 数量值568.network === 'xhttp') {
+      输出567.transport = {
+        type: 'ws',
+        path: 数量值568.path,
+        headers: {
+          Host: 数量值568.host
+        },
+        max_early_data: 2048,
+        early_data_header_name: 'Sec-WebSocket-Protocol'
+      };
+    } else if (数量值568.network === 'grpc') {
+      输出567.transport = {
+        type: 'grpc',
+        service_name: 数量值568.path
+      };
+    }
+    return 输出567;
+  }
+
+  // 远端 SRS 文件（CDN：jsDelivr 镜像 MetaCubeX 转换的 SagerNet 数据）
+  const 值基础值 = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geosite';
+  const 值基础地址 = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/geoip';
+  const 值规则566 = 本地值565 => ({
+    tag: `geosite-${本地值565}`,
+    type: 'remote',
+    format: 'binary',
+    url: `${值基础值}/${本地值565}.srs`,
+    download_detour: 'direct'
+  });
+  const 地址规则 = 本地值564 => ({
+    tag: `geoip-${本地值564}`,
+    type: 'remote',
+    format: 'binary',
+    url: `${值基础地址}/${本地值564}.srs`,
+    download_detour: 'direct'
+  });
+  const 配置 = {
+    log: {
+      level: 'info',
+      timestamp: true
+    },
+    dns: {
+      servers: [{
+        tag: 'remote',
+        address: 域名系统值570,
+        detour: 'select'
+      }, {
+        tag: 'local',
+        address: '223.5.5.5',
+        detour: 'direct'
+      }, {
+        tag: 'fakeip',
+        address: 'fakeip'
+      }, {
+        tag: 'block',
+        address: 'rcode://success'
+      }],
+      rules: [{
+        outbound: 'any',
+        server: 'local'
+      }, {
+        rule_set: 'geosite-category-ads-all',
+        server: 'block'
+      }, {
+        rule_set: 'geosite-cn',
+        server: 'local'
+      }, {
+        query_type: ['A', 'AAAA'],
+        server: 'fakeip'
+      }],
+      fakeip: {
+        enabled: true,
+        inet4_range: '198.18.0.0/15',
+        inet6_range: 'fc00::/18'
+      },
+      independent_cache: true,
+      strategy: 'ipv4_only'
+    },
+    inbounds: [{
+      type: 'mixed',
+      tag: 'mixed-in',
+      listen: '127.0.0.1',
+      listen_port: 2080,
+      sniff: true,
+      sniff_override_destination: true
+    }, {
+      type: 'tun',
+      tag: 'tun-in',
+      interface_name: 解码64('c2luZy1ib3g='),
+      address: ['172.19.0.1/30', 'fdfe:dcba:9876::1/126'],
+      mtu: 9000,
+      auto_route: true,
+      strict_route: true,
+      stack: 'mixed',
+      sniff: true,
+      sniff_override_destination: true
+    }],
+    outbounds: [{
+      type: 'selector',
+      tag: 'select',
+      outbounds: ['direct', ...出站值],
+      default: 出站值[0] || 'direct'
+    }, {
+      type: 'selector',
+      tag: '🌍 国外媒体',
+      outbounds: ['select', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '📲 电报信息',
+      outbounds: ['select', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '🌐 谷歌服务',
+      outbounds: ['select', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '🤖 OpenAI',
+      outbounds: ['select', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: 'Ⓜ️ 微软服务',
+      outbounds: ['direct', 'select', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '🍎 苹果服务',
+      outbounds: ['direct', 'select', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '📺 哔哩哔哩',
+      outbounds: ['direct', 'select', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '📹 油管视频',
+      outbounds: ['select', '🌍 国外媒体', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '🎬 奈飞视频',
+      outbounds: ['select', '🌍 国外媒体', 'direct', ...出站值]
+    }, {
+      type: 'selector',
+      tag: '🎯 全球直连',
+      outbounds: ['direct']
+    }, {
+      type: 'selector',
+      tag: '🐟 漏网之鱼',
+      outbounds: ['select', 'direct', ...出站值]
+    }, ...节点列表572.map(处理节点值出站), {
+      type: 'direct',
+      tag: 'direct'
+    }, {
+      type: 'block',
+      tag: 'block'
+    }, {
+      type: 'dns',
+      tag: 'dns-out'
+    }],
+    route: {
+      rule_set: [值规则566('cn'), 值规则566('private'), 值规则566('apple'), 值规则566('apple-cn'), 值规则566('microsoft'), 值规则566('microsoft@cn'), 值规则566('google'), 值规则566('telegram'), 值规则566('openai'), 值规则566('anthropic'), 值规则566('youtube'), 值规则566('netflix'), 值规则566('disney'), 值规则566('spotify'), 值规则566('tiktok'), 值规则566('twitter'), 值规则566('facebook'), 值规则566('github'), 值规则566('geolocation-!cn'), 值规则566('category-ads-all'), 地址规则('cn'), 地址规则('private'), 地址规则('telegram')],
+      rules: [{
+        protocol: 'dns',
+        outbound: 'dns-out'
+      }, {
+        ip_is_private: true,
+        outbound: 'direct'
+      }, {
+        rule_set: 'geosite-category-ads-all',
+        outbound: 'block'
+      }, {
+        rule_set: 'geosite-private',
+        outbound: 'direct'
+      }, {
+        rule_set: 'geosite-apple-cn',
+        outbound: 'direct'
+      }, {
+        rule_set: 'geosite-microsoft@cn',
+        outbound: 'direct'
+      }, {
+        rule_set: 'geosite-apple',
+        outbound: '🍎 苹果服务'
+      }, {
+        rule_set: 'geosite-microsoft',
+        outbound: 'Ⓜ️ 微软服务'
+      }, {
+        rule_set: 'geosite-openai',
+        outbound: '🤖 OpenAI'
+      }, {
+        rule_set: 'geosite-anthropic',
+        outbound: '🤖 OpenAI'
+      }, {
+        rule_set: 'geosite-telegram',
+        outbound: '📲 电报信息'
+      }, {
+        rule_set: 'geoip-telegram',
+        outbound: '📲 电报信息'
+      }, {
+        rule_set: 'geosite-google',
+        outbound: '🌐 谷歌服务'
+      }, {
+        rule_set: 'geosite-youtube',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-netflix',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-disney',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-spotify',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-tiktok',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-twitter',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-facebook',
+        outbound: '🌍 国外媒体'
+      }, {
+        rule_set: 'geosite-github',
+        outbound: 'select'
+      }, {
+        rule_set: 'geosite-geolocation-!cn',
+        outbound: 'select'
+      }, {
+        rule_set: 'geosite-cn',
+        outbound: 'direct'
+      }, {
+        rule_set: 'geoip-cn',
+        outbound: 'direct'
+      }, {
+        ip_is_private: true,
+        outbound: 'direct'
+      }],
+      final: '🐟 漏网之鱼',
+      auto_detect_interface: true
+    },
+    experimental: {
+      cache_file: {
+        enabled: true,
+        store_fakeip: true
+      },
+      clash_api: {
+        external_controller: '127.0.0.1:9090'
+      }
+    }
+  };
+  return JSON.stringify(配置, null, 2);
+}
+
+// ACL4SSR 规则源（CDN：jsDelivr 镜像 GitHub）
+const 值基础 = 解码64('aHR0cHM6Ly9mYXN0bHkuanNkZWxpdnIubmV0L2doL0FDTDRTU1IvQUNMNFNTUkBtYXN0ZXIvQ2xhc2g=');
+const 值规则 = 名称563 => `${值基础}/${名称563}.list`;
+
+// 内部生成 ini 客户端配置（完整 ACL4SSR 规则集）
+function 生成值值562(链接列表561) {
+  const 节点列表560 = 链接列表561.map(解析值链接).filter(数量值559 => 数量值559 && 数量值559.proto === 解码64('dHJvamFu'));
+  const 域名系统值558 = 自定义域名系统 || '223.5.5.5';
+  const 名称列表557 = 节点列表560.map(数量值556 => 数量值556.name);
+  const 行列表555 = ['[General]', 'loglevel = notify', 'internet-test-url = http://www.apple.com/library/test/success.html', 解码64('cHJveHktdGVzdC11cmwgPSBodHRwOi8vd3d3LmdzdGF0aWMuY29tL2dlbmVyYXRlXzIwNA=='), 'test-timeout = 3', `dns-server = ${域名系统值558.replace(/^https?:\/\//, '').replace(/\/.*$/, '')}, 119.29.29.29, system`, 'encrypted-dns-server = https://223.5.5.5/dns-query, https://1.12.12.12/dns-query', 'ipv6 = true', 'allow-wifi-access = false', 'wifi-access-http-port = 6152', 解码64('d2lmaS1hY2Nlc3Mtc29ja3M1LXBvcnQgPSA2MTUz'), 解码64('c2tpcC1wcm94eSA9IDEyNy4wLjAuMSwgMTkyLjE2OC4wLjAvMTYsIDEwLjAuMC4wLzgsIDE3Mi4xNi4wLjAvMTIsIGxvY2FsaG9zdCwgKi5sb2NhbCwgY2FwdGl2ZS5hcHBsZS5jb20='), 'exclude-simple-hostnames = true', 'show-error-page-for-reject = true', '', 解码64('W1Byb3h5XQ==')];
+  for (const 数量值554 of 节点列表560) {
+    const 服务名称指示 = 数量值554.sni;
+    行列表555.push(`${数量值554.name} = ${解码64('dHJvamFu')}, ${数量值554.server}, ${数量值554.port}, password=${数量值554.password}, sni=${服务名称指示}, ws=true, ws-path=${数量值554.path}, ws-headers=Host:${数量值554.host}, skip-cert-verify=false, tfo=true`);
+  }
+  if (!节点列表560.length) {
+    行列表555.push('Direct = direct');
+  }
+  行列表555.push('');
+  行列表555.push(解码64('W1Byb3h5IEdyb3VwXQ=='));
+  const 列表553 = 名称列表557.length ? 名称列表557.join(', ') : 'DIRECT';
+  行列表555.push(`🚀 节点选择 = select, 🎯 全球直连, ${列表553}`);
+  行列表555.push(`🌍 国外媒体 = select, ${处理值值列表(名称列表557)}`);
+  行列表555.push(`📺 哔哩哔哩 = select, ${处理值值列表(名称列表557, {
+    directFirst: true
+  })}`);
+  行列表555.push(`📹 油管视频 = select, ${处理值值列表(名称列表557, {
+    extraGroups: ['🌍 国外媒体']
+  })}`);
+  行列表555.push(`🎬 奈飞视频 = select, ${处理值值列表(名称列表557, {
+    extraGroups: ['🌍 国外媒体']
+  })}`);
+  行列表555.push(`📲 电报信息 = select, ${处理值值列表(名称列表557)}`);
+  行列表555.push(`🌐 谷歌服务 = select, ${处理值值列表(名称列表557)}`);
+  行列表555.push(`🤖 OpenAI = select, ${处理值值列表(名称列表557)}`);
+  行列表555.push(`Ⓜ️ 微软服务 = select, ${处理值值列表(名称列表557, {
+    directFirst: true
+  })}`);
+  行列表555.push(`🍎 苹果服务 = select, ${处理值值列表(名称列表557, {
+    directFirst: true
+  })}`);
+  行列表555.push(`🎯 全球直连 = select, DIRECT`);
+  行列表555.push(`🛑 全球拦截 = select, REJECT, DIRECT`);
+  行列表555.push(`🐟 漏网之鱼 = select, ${处理值值列表(名称列表557)}`);
+  行列表555.push('');
+  行列表555.push('[Rule]');
+  行列表555.push(`RULE-SET,${值规则('LocalAreaNetwork')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('UnBan')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('BanAD')},🛑 全球拦截`);
+  行列表555.push(`RULE-SET,${值规则('BanProgramAD')},🛑 全球拦截`);
+  行列表555.push(`RULE-SET,${值规则('GoogleFCM')},🌐 谷歌服务`);
+  行列表555.push(`RULE-SET,${值规则('GoogleCN')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('SteamCN')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('Microsoft')},Ⓜ️ 微软服务`);
+  行列表555.push(`RULE-SET,${值规则('Apple')},🍎 苹果服务`);
+  行列表555.push(`RULE-SET,${值规则('Telegram')},📲 电报信息`);
+  行列表555.push(`RULE-SET,${值规则('OpenAi')},🤖 OpenAI`);
+  行列表555.push(`RULE-SET,${值规则('Claude')},🤖 OpenAI`);
+  行列表555.push(`RULE-SET,${值规则('Copilot')},🤖 OpenAI`);
+  行列表555.push(`RULE-SET,${值规则('Netflix')},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则('YouTube')},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则('Disney')},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则('Spotify')},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则('TikTok')},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则('BiliBili')},📺 哔哩哔哩`);
+  行列表555.push(`RULE-SET,${值规则(解码64('UHJveHlNZWRpYQ=='))},🌍 国外媒体`);
+  行列表555.push(`RULE-SET,${值规则(解码64('UHJveHlHRldsaXN0'))},🚀 节点选择`);
+  行列表555.push(`RULE-SET,${值规则('ChinaDomain')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('ChinaCompanyIp')},🎯 全球直连`);
+  行列表555.push(`RULE-SET,${值规则('ChinaIp')},🎯 全球直连`);
+  行列表555.push('GEOIP,CN,🎯 全球直连');
+  行列表555.push('FINAL,🐟 漏网之鱼,dns-failed');
+  return 行列表555.join('\n');
+}
+
+// 内部生成另一类 ini 客户端配置
+function 生成值值552(链接列表551) {
+  const 节点列表550 = 链接列表551.map(解析值链接).filter(数量值549 => 数量值549 && (数量值549.proto === 解码64('dmxlc3M=') || 数量值549.proto === 解码64('dHJvamFu')));
+  const 名称列表548 = 节点列表550.map(数量值547 => 数量值547.name);
+  const 行列表546 = ['[General]', 'ip-mode = dual', `dns-server = ${(自定义域名系统 || '223.5.5.5').replace(/^https?:\/\//, '').replace(/\/.*$/, '')},119.29.29.29,system`, 'doh-server = https://223.5.5.5/dns-query, https://1.12.12.12/dns-query', 解码64('YWxsb3ctdWRwLXByb3h5ID0gdHJ1ZQ=='), 'allow-wifi-access = false', 'sni-sniffing = true', 解码64('c2tpcC1wcm94eSA9IDEyNy4wLjAuMSwxOTIuMTY4LjAuMC8xNiwxMC4wLjAuMC84LDE3Mi4xNi4wLjAvMTIsbG9jYWxob3N0LCoubG9jYWwsY2FwdGl2ZS5hcHBsZS5jb20='), 'bypass-tun = 10.0.0.0/8,100.64.0.0/10,127.0.0.0/8,169.254.0.0/16,172.16.0.0/12,192.0.0.0/24,192.0.2.0/24,192.88.99.0/24,192.168.0.0/16,198.51.100.0/24,203.0.113.0/24,224.0.0.0/4,255.255.255.255/32', '', 解码64('W1Byb3h5XQ==')];
+  for (const 数量值545 of 节点列表550) {
+    if (数量值545.proto === 解码64('dmxlc3M=')) {
+      const 部分列表544 = [`${数量值545.server}`, `${数量值545.port}`, `udp=true`, `username=${数量值545.uuid}`, `transport=ws`, `path=${数量值545.path}`, `host=${数量值545.host}`, `over-tls=${数量值545.tls ? 'true' : 'false'}`];
+      if (数量值545.tls) {
+        部分列表544.push(`tls-name=${数量值545.sni}`);
+        if (数量值545.alpn && 数量值545.alpn.length) 部分列表544.push(`alpn=${数量值545.alpn.join(':')}`);
+        部分列表544.push(`skip-cert-verify=false`);
+      }
+      行列表546.push(`${数量值545.name} = ${解码64('dmxlc3M=')},${部分列表544.join(',')}`);
+    } else {
+      const 部分列表543 = [`${数量值545.server}`, `${数量值545.port}`, `password=${数量值545.password}`, `transport=ws`, `path=${数量值545.path}`, `host=${数量值545.host}`, `over-tls=true`, `tls-name=${数量值545.sni}`];
+      if (数量值545.alpn && 数量值545.alpn.length) 部分列表543.push(`alpn=${数量值545.alpn.join(':')}`);
+      部分列表543.push(`skip-cert-verify=false`);
+      行列表546.push(`${数量值545.name} = ${解码64('dHJvamFu')},${部分列表543.join(',')}`);
+    }
+  }
+  行列表546.push('');
+  行列表546.push(解码64('W1Byb3h5IEdyb3VwXQ=='));
+  const 列表542 = 名称列表548.length ? 名称列表548.join(',') : 'DIRECT';
+  行列表546.push(`🚀 节点选择 = select,🎯 全球直连,${列表542}`);
+  行列表546.push(`🌍 国外媒体 = select,${处理值值列表(名称列表548, {
+    compact: true
+  })}`);
+  行列表546.push(`📺 哔哩哔哩 = select,${处理值值列表(名称列表548, {
+    directFirst: true,
+    compact: true
+  })}`);
+  行列表546.push(`📹 油管视频 = select,${处理值值列表(名称列表548, {
+    extraGroups: ['🌍 国外媒体'],
+    compact: true
+  })}`);
+  行列表546.push(`🎬 奈飞视频 = select,${处理值值列表(名称列表548, {
+    extraGroups: ['🌍 国外媒体'],
+    compact: true
+  })}`);
+  行列表546.push(`📲 电报信息 = select,${处理值值列表(名称列表548, {
+    compact: true
+  })}`);
+  行列表546.push(`🌐 谷歌服务 = select,${处理值值列表(名称列表548, {
+    compact: true
+  })}`);
+  行列表546.push(`🤖 OpenAI = select,${处理值值列表(名称列表548, {
+    compact: true
+  })}`);
+  行列表546.push(`Ⓜ️ 微软服务 = select,${处理值值列表(名称列表548, {
+    directFirst: true,
+    compact: true
+  })}`);
+  行列表546.push(`🍎 苹果服务 = select,${处理值值列表(名称列表548, {
+    directFirst: true,
+    compact: true
+  })}`);
+  行列表546.push(`🎯 全球直连 = select,DIRECT`);
+  行列表546.push(`🛑 全球拦截 = select,REJECT,DIRECT`);
+  行列表546.push(`🐟 漏网之鱼 = select,${处理值值列表(名称列表548, {
+    compact: true
+  })}`);
+  行列表546.push('');
+  行列表546.push('[Remote Rule]');
+  行列表546.push(`${值规则('LocalAreaNetwork')}, policy=🎯 全球直连, tag=局域网, enabled=true`);
+  行列表546.push(`${值规则('BanAD')}, policy=🛑 全球拦截, tag=广告拦截, enabled=true`);
+  行列表546.push(`${值规则('BanProgramAD')}, policy=🛑 全球拦截, tag=应用广告, enabled=true`);
+  行列表546.push(`${值规则('GoogleCN')}, policy=🎯 全球直连, tag=GoogleCN, enabled=true`);
+  行列表546.push(`${值规则('SteamCN')}, policy=🎯 全球直连, tag=SteamCN, enabled=true`);
+  行列表546.push(`${值规则('Microsoft')}, policy=Ⓜ️ 微软服务, tag=微软, enabled=true`);
+  行列表546.push(`${值规则('Apple')}, policy=🍎 苹果服务, tag=苹果, enabled=true`);
+  行列表546.push(`${值规则('Telegram')}, policy=📲 电报信息, tag=电报, enabled=true`);
+  行列表546.push(`${值规则('OpenAi')}, policy=🤖 OpenAI, tag=OpenAI, enabled=true`);
+  行列表546.push(`${值规则('Netflix')}, policy=🌍 国外媒体, tag=Netflix, enabled=true`);
+  行列表546.push(`${值规则('YouTube')}, policy=🌍 国外媒体, tag=YouTube, enabled=true`);
+  行列表546.push(`${值规则('Disney')}, policy=🌍 国外媒体, tag=Disney, enabled=true`);
+  行列表546.push(`${值规则('Spotify')}, policy=🌍 国外媒体, tag=Spotify, enabled=true`);
+  行列表546.push(`${值规则('TikTok')}, policy=🌍 国外媒体, tag=TikTok, enabled=true`);
+  行列表546.push(`${值规则('BiliBili')}, policy=📺 哔哩哔哩, tag=哔哩哔哩, enabled=true`);
+  行列表546.push(`${值规则(解码64('UHJveHlNZWRpYQ=='))}, policy=🌍 国外媒体, tag=${解码64('5Luj55CG5aqS5L2T')}, enabled=true`);
+  行列表546.push(`${值规则(解码64('UHJveHlHRldsaXN0'))}, policy=🚀 节点选择, tag=${解码64('5Luj55CG5YiX6KGo')}, enabled=true`);
+  行列表546.push(`${值规则('ChinaDomain')}, policy=🎯 全球直连, tag=中国域名, enabled=true`);
+  行列表546.push(`${值规则('ChinaIp')}, policy=🎯 全球直连, tag=中国IP, enabled=true`);
+  行列表546.push('');
+  行列表546.push('[Rule]');
+  行列表546.push('GEOIP,CN,🎯 全球直连');
+  行列表546.push('FINAL,🐟 漏网之鱼');
+  return 行列表546.join('\n');
+}
+
+// 内部生成圈叉配置（完整 ACL4SSR 远端 filter 资源）
+function 生成值值(链接列表541) {
+  const 节点列表 = 链接列表541.map(解析值链接).filter(数量值540 => 数量值540 && (数量值540.proto === 解码64('dmxlc3M=') || 数量值540.proto === 解码64('dHJvamFu')));
+  const 名称列表 = 节点列表.map(数量值539 => 数量值539.name);
+  const 圈叉基础配置 = 解码64('aHR0cHM6Ly9mYXN0bHkuanNkZWxpdnIubmV0L2doL2JsYWNrbWF0cml4Ny9pb3NfcnVsZV9zY3JpcHRAbWFzdGVyL3J1bGUvUXVhbnR1bXVsdFg=');
+  const 行列表538 = ['[general]', 'network_check_url=http://www.gstatic.com/generate_204', 'server_check_url=http://www.gstatic.com/generate_204', 'profile_img_url=https://fastly.jsdelivr.net/gh/byJoey/cfnew@main/snippets/logo.png', 'dns_exclusion_list=*.cmpassport.com, *.jegotrip.com.cn, *.icloud.com, *.icloud.com.cn, *.apple.com, *.weibo.com, *.qq.com', 'running_mode_trigger=filter', '', '[dns]', `server=${(自定义域名系统 || '223.5.5.5').replace(/^https?:\/\//, '').replace(/\/.*$/, '')}`, 'server=119.29.29.29', 'server=https://223.5.5.5/dns-query', 'server=https://1.12.12.12/dns-query', '', '[server_local]'];
+  for (const 数量值537 of 节点列表) {
+    if (数量值537.proto === 解码64('dmxlc3M=')) {
+      const 部分列表536 = [`${数量值537.server}:${数量值537.port}`, `method=none`, `password=${数量值537.uuid}`, `obfs=${数量值537.tls ? 'wss' : 'ws'}`, `obfs-host=${数量值537.host}`, `obfs-uri=${数量值537.path}`];
+      if (数量值537.tls) 部分列表536.push(`tls-verification=true`, `tls13=true`);
+      部分列表536.push(`tag=${数量值537.name}`);
+      行列表538.push(`${解码64('dmxlc3M=')}=${部分列表536.join(', ')}`);
+    } else {
+      const 部分列表535 = [`${数量值537.server}:${数量值537.port}`, `password=${数量值537.password}`, `over-tls=true`, `tls-host=${数量值537.sni}`, `obfs=wss`, `obfs-host=${数量值537.host}`, `obfs-uri=${数量值537.path}`, `tls-verification=true`, `tag=${数量值537.name}`];
+      行列表538.push(`${解码64('dHJvamFu')}=${部分列表535.join(', ')}`);
+    }
+  }
+  行列表538.push('');
+  行列表538.push('[policy]');
+  const 列表534 = 名称列表.length ? 名称列表.join(', ') : 'direct';
+  行列表538.push(`static=🚀 节点选择, ${列表534}, direct, img-url=${解码64('aHR0cHM6Ly9mYXN0bHkuanNkZWxpdnIubmV0L2doL0tvb2xzb24vUXVyZUBtYXN0ZXIvSWNvblNldC9Db2xvci9Qcm94eS5wbmc=')}`);
+  行列表538.push(`static=🌍 国外媒体, ${处理值值列表(名称列表)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/ForeignMedia.png`);
+  行列表538.push(`static=📺 哔哩哔哩, ${处理值值列表(名称列表, {
+    directFirst: true
+  })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/bilibili.png`);
+  行列表538.push(`static=📹 油管视频, ${处理值值列表(名称列表, {
+    extraGroups: ['🌍 国外媒体']
+  })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/YouTube.png`);
+  行列表538.push(`static=🎬 奈飞视频, ${处理值值列表(名称列表, {
+    extraGroups: ['🌍 国外媒体']
+  })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Netflix.png`);
+  行列表538.push(`static=📲 电报信息, ${处理值值列表(名称列表)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Telegram.png`);
+  行列表538.push(`static=🌐 谷歌服务, ${处理值值列表(名称列表)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Google.png`);
+  行列表538.push(`static=🤖 OpenAI, ${处理值值列表(名称列表)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/ChatGPT.png`);
+  行列表538.push(`static=Ⓜ️ 微软服务, ${处理值值列表(名称列表, {
+    directFirst: true
+  })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Microsoft.png`);
+  行列表538.push(`static=🍎 苹果服务, ${处理值值列表(名称列表, {
+    directFirst: true
+  })}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Apple.png`);
+  行列表538.push(`static=🎯 全球直连, direct, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Direct.png`);
+  行列表538.push(`static=🛑 全球拦截, reject, direct, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Advertising.png`);
+  行列表538.push(`static=🐟 漏网之鱼, ${处理值值列表(名称列表)}, img-url=https://fastly.jsdelivr.net/gh/Koolson/Qure@master/IconSet/Color/Final.png`);
+  行列表538.push('');
+  行列表538.push('[filter_remote]');
+  行列表538.push(`${圈叉基础配置}/Lan/Lan.list, tag=局域网, force-policy=🎯 全球直连, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Advertising/Advertising.list, tag=广告拦截, force-policy=🛑 全球拦截, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Microsoft/Microsoft.list, tag=微软, force-policy=Ⓜ️ 微软服务, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Apple/Apple.list, tag=苹果, force-policy=🍎 苹果服务, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Telegram/Telegram.list, tag=电报, force-policy=📲 电报信息, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Google/Google.list, tag=谷歌, force-policy=🌐 谷歌服务, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/OpenAI/OpenAI.list, tag=OpenAI, force-policy=🤖 OpenAI, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Claude/Claude.list, tag=Claude, force-policy=🤖 OpenAI, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/YouTube/YouTube.list, tag=YouTube, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Netflix/Netflix.list, tag=Netflix, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Disney/Disney.list, tag=Disney, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Spotify/Spotify.list, tag=Spotify, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/TikTok/TikTok.list, tag=TikTok, force-policy=🌍 国外媒体, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/BiliBili/BiliBili.list, tag=哔哩哔哩, force-policy=📺 哔哩哔哩, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/Global/Global.list, tag=全球加速, force-policy=🚀 节点选择, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push(`${圈叉基础配置}/ChinaMax/ChinaMax.list, tag=中国直连, force-policy=🎯 全球直连, update-interval=86400, opt-parser=false, enabled=true`);
+  行列表538.push('');
+  行列表538.push('[filter_local]');
+  行列表538.push('geoip, cn, 🎯 全球直连');
+  行列表538.push('final, 🐟 漏网之鱼');
+  return 行列表538.join('\n');
+}
+
+// 兼容旧调用名
+async function 生成值配置533(链接列表532) {
+  return 生成值值589(链接列表532);
+}
+function 生成值配置531(链接列表530) {
+  return 生成值值562(链接列表530);
+}
+function 生成值配置529(链接列表528) {
+  return 生成值值552(链接列表528);
+}
+function 生成值值配置527(链接列表526) {
+  return 生成值值(链接列表526);
+}
+function 生成值值配置(链接列表525) {
+  return 生成值值数据对象(链接列表525);
+}
+function 生成值配置(链接列表524) {
+  return btoa(链接列表524.join('\n'));
+}
+function 生成值2值配置(链接列表523) {
+  return btoa(链接列表523.join('\n'));
+}
+
+// 全局变量存储ECH调试信息
+let 加密客户端问候调试值 = '';
+async function 获取加密客户端问候配置(域名522) {
+  if (!启用加密客户端问候) {
+    加密客户端问候调试值 = 'ECH功能已禁用';
+    return null;
+  }
+  加密客户端问候调试值 = '';
+  const 调试步骤 = [];
+  try {
+    // 优先使用 Google DNS 查询 cloudflare-ech.com 的 ECH 配置
+    调试步骤.push('尝试使用 Google DNS 查询 cloudflare-ech.com...');
+    const 加密客户端问候域名网址 = `https://v.recipes/dns/dns.google/dns-query?name=cloudflare-ech.com&type=65`;
+    const 加密客户端问候响应 = await fetch(加密客户端问候域名网址, {
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+    调试步骤.push(`Google DNS 响应状态: ${加密客户端问候响应.status}`);
+    if (加密客户端问候响应.ok) {
+      const 加密客户端问候数据 = await 加密客户端问候响应.json();
+      调试步骤.push(`Google DNS 返回数据: ${JSON.stringify(加密客户端问候数据).substring(0, 200)}...`);
+      if (加密客户端问候数据.Answer && 加密客户端问候数据.Answer.length > 0) {
+        调试步骤.push(`找到 ${加密客户端问候数据.Answer.length} 条答案记录`);
+        for (const 本地值521 of 加密客户端问候数据.Answer) {
+          if (本地值521.data) {
+            调试步骤.push(`解析答案数据: ${typeof 本地值521.data}, 长度: ${String(本地值521.data).length}`);
+            // Google DNS 返回的数据格式可能不同，需要解析
+            const 数据字符串520 = typeof 本地值521.data === 'string' ? 本地值521.data : JSON.stringify(本地值521.data);
+            const 加密客户端问候值519 = 数据字符串520.match(/ech=([^\s"']+)/);
+            if (加密客户端问候值519 && 加密客户端问候值519[1]) {
+              加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n✅ 成功从 Google DNS 获取 ECH 配置';
+              return 加密客户端问候值519[1];
+            }
+            // 如果没有找到，尝试直接使用 data（可能是 base64 编码的）
+            if (本地值521.data && !数据字符串520.includes('ech=')) {
+              try {
+                const 已解码518 = atob(本地值521.data);
+                调试步骤.push(`尝试 base64 解码，解码后长度: ${已解码518.length}`);
+                const 已解码值517 = 已解码518.match(/ech=([^\s"']+)/);
+                if (已解码值517 && 已解码值517[1]) {
+                  加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n✅ 成功从 Google DNS (base64解码) 获取 ECH 配置';
+                  return 已解码值517[1];
+                }
+              } catch (事件值516) {
+                调试步骤.push(`base64 解码失败: ${事件值516.message}`);
+              }
+            }
+          }
+        }
+      } else {
+        调试步骤.push('Google DNS 未返回答案记录');
+      }
+    } else {
+      调试步骤.push(`Google DNS 请求失败: ${加密客户端问候响应.status}`);
+    }
+
+    // 如果 cloudflare-ech.com 查询失败，尝试使用 Google DNS 查询目标域名的 HTTPS 记录
+    调试步骤.push(`尝试使用 Google DNS 查询目标域名 ${域名522}...`);
+    const 加密域名查询网址 = `https://v.recipes/dns/dns.google/dns-query?name=${encodeURIComponent(域名522)}&type=65`;
+    const 响应515 = await fetch(加密域名查询网址, {
+      headers: {
+        'Accept': 'application/json'
+      }
+    });
+    调试步骤.push(`Google DNS (目标域名) 响应状态: ${响应515.status}`);
+    if (响应515.ok) {
+      const 数据514 = await 响应515.json();
+      调试步骤.push(`Google DNS (目标域名) 返回数据: ${JSON.stringify(数据514).substring(0, 200)}...`);
+      if (数据514.Answer && 数据514.Answer.length > 0) {
+        调试步骤.push(`找到 ${数据514.Answer.length} 条答案记录`);
+        for (const 本地值513 of 数据514.Answer) {
+          if (本地值513.data) {
+            const 数据字符串 = typeof 本地值513.data === 'string' ? 本地值513.data : JSON.stringify(本地值513.data);
+            const 加密客户端问候值512 = 数据字符串.match(/ech=([^\s"']+)/);
+            if (加密客户端问候值512 && 加密客户端问候值512[1]) {
+              加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n✅ 成功从 Google DNS (目标域名) 获取 ECH 配置';
+              return 加密客户端问候值512[1];
+            }
+            // 尝试 base64 解码
+            try {
+              const 已解码511 = atob(本地值513.data);
+              const 已解码值 = 已解码511.match(/ech=([^\s"']+)/);
+              if (已解码值 && 已解码值[1]) {
+                加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n✅ 成功从 Google DNS (目标域名, base64解码) 获取 ECH 配置';
+                return 已解码值[1];
+              }
+            } catch (事件值510) {
+              调试步骤.push(`base64 解码失败: ${事件值510.message}`);
+            }
+          }
+        }
+      } else {
+        调试步骤.push('Google DNS (目标域名) 未返回答案记录');
+      }
+    } else {
+      调试步骤.push(`Google DNS (目标域名) 请求失败: ${响应515.status}`);
+    }
+
+    // 如果 Google DNS 失败，尝试使用 Cloudflare DNS 作为备选
+    调试步骤.push('尝试使用 Cloudflare DNS 作为备选...');
+    const 云墙加密客户端问候网址 = `https://cloudflare-dns.com/dns-query?name=cloudflare-ech.com&type=65`;
+    const 云墙响应 = await fetch(云墙加密客户端问候网址, {
+      headers: {
+        'Accept': 'application/dns-json'
+      }
+    });
+    调试步骤.push(`Cloudflare DNS 响应状态: ${云墙响应.status}`);
+    if (云墙响应.ok) {
+      const 云墙数据 = await 云墙响应.json();
+      调试步骤.push(`Cloudflare DNS 返回数据: ${JSON.stringify(云墙数据).substring(0, 200)}...`);
+      if (云墙数据.Answer && 云墙数据.Answer.length > 0) {
+        调试步骤.push(`找到 ${云墙数据.Answer.length} 条答案记录`);
+        for (const 本地值509 of 云墙数据.Answer) {
+          if (本地值509.data) {
+            const 加密客户端问候值 = 本地值509.data.match(/ech=([^\s"']+)/);
+            if (加密客户端问候值 && 加密客户端问候值[1]) {
+              加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n✅ 成功从 Cloudflare DNS 获取 ECH 配置';
+              return 加密客户端问候值[1];
+            }
+          }
+        }
+      } else {
+        调试步骤.push('Cloudflare DNS 未返回答案记录');
+      }
+    } else {
+      调试步骤.push(`Cloudflare DNS 请求失败: ${云墙响应.status}`);
+    }
+    加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n❌ 所有DNS查询均失败，未获取到ECH配置';
+    return null;
+  } catch (错误508) {
+    加密客户端问候调试值 = 调试步骤.join('\\n') + '\\n❌ 获取ECH配置时发生错误: ' + 错误508.message;
+    return null;
+  }
+}
+async function 处理订阅请求(请求507, 用户506, 网址505 = null) {
+  if (!网址505) 网址505 = new URL(请求507.url);
+  const 最终链接列表 = [];
+  const 工作器域名504 = 网址505.hostname;
+  const 目标503 = 网址505.searchParams.get('target') || 'base64';
+  const 别名命名器502 = 创建值节点命名器(false);
+
+  // 如果启用了ECH，使用自定义值
+  let 加密客户端问候配置501 = null;
+  if (启用加密客户端问候) {
+    const 域名系统值500 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+    const 加密客户端问候域名499 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+    加密客户端问候配置501 = `${加密客户端问候域名499}+${域名系统值500}`;
+  }
+  async function 添加节点列表来源列表(列表498) {
+    if (启用明文) {
+      最终链接列表.push(...生成链接列表来源源(列表498, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502));
+    }
+    if (启用木马) {
+      最终链接列表.push(...(await 生成木马链接列表来源源(列表498, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502)));
+    }
+    if (启用扩展传输) {
+      最终链接列表.push(...生成扩展超文本链接列表来源源(列表498, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502));
+    }
+  }
+  if (启用原生地址) {
+    if (当前工作器地区 === 'CUSTOM') {
+      const 原生列表497 = [{
+        ip: 工作器域名504,
+        isp: '原生地址'
+      }];
+      await 添加节点列表来源列表(原生列表497);
+    } else {
+      try {
+        const 原生列表496 = [{
+          ip: 工作器域名504,
+          isp: '原生地址'
+        }];
+        await 添加节点列表来源列表(原生列表496);
+      } catch (错误495) {
+        if (!当前工作器地区) {
+          当前工作器地区 = await 检测工作器地区(请求507);
+        }
+        const 值备用地址494 = await 获取值备用地址(当前工作器地区);
+        if (值备用地址494) {
+          回退地址 = 值备用地址494.domain + ':' + 值备用地址494.port;
+          const 备用列表493 = [{
+            ip: 值备用地址494.domain,
+            isp: 解码64('UHJveHlJUC0=') + 当前工作器地区
+          }];
+          await 添加节点列表来源列表(备用列表493);
+        } else {
+          const 原生列表 = [{
+            ip: 工作器域名504,
+            isp: '原生地址'
+          }];
+          await 添加节点列表来源列表(原生列表);
+        }
+      }
+    }
+  }
+  const 是否有自定义优选 = 自定义优选地址列表.length > 0 || 自定义优选域名列表.length > 0;
+  if (禁用优选) {} else if (是否有自定义优选) {
+    if (自定义优选地址列表.length > 0 && 启用优选地址) {
+      await 添加节点列表来源列表(自定义优选地址列表);
+    }
+    if (自定义优选域名列表.length > 0 && 启用优选域名) {
+      const 自定义域名列表 = 自定义优选域名列表.map(丁值492 => ({
+        ip: 丁值492.domain,
+        isp: 丁值492.name || 丁值492.domain
+      }));
+      await 添加节点列表来源列表(自定义域名列表);
+    }
+  } else {
+    if (启用优选域名) {
+      const 域名列表 = 直连域名列表.map(丁值491 => ({
+        ip: 丁值491.domain,
+        isp: 丁值491.name || 丁值491.domain
+      }));
+      await 添加节点列表来源列表(域名列表);
+    }
+    if (启用优选地址) {
+      if (!优选地址源) {
+        try {
+          const 值地址列表490 = await 获取值地址列表();
+          if (值地址列表490.length > 0) {
+            await 添加节点列表来源列表(值地址列表490);
+          }
+        } catch (错误489) {
+          if (!当前工作器地区) {
+            当前工作器地区 = await 检测工作器地区(请求507);
+          }
+          const 值备用地址488 = await 获取值备用地址(当前工作器地区);
+          if (值备用地址488) {
+            回退地址 = 值备用地址488.domain + ':' + 值备用地址488.port;
+            const 备用列表487 = [{
+              ip: 值备用地址488.domain,
+              isp: 解码64('UHJveHlJUC0=') + 当前工作器地区
+            }];
+            await 添加节点列表来源列表(备用列表487);
           }
         }
       }
-    }`;
-		const res = await fetch("https://api.cloudflare.com/client/v4/graphql", {
-			method: "POST",
-			headers: { Authorization: "Bearer " + env.CF_API_TOKEN, "Content-Type": "application/json" },
-			body: JSON.stringify({ query: q }),
-		});
-		const j = await res.json();
-		const acc = j?.data?.viewer?.accounts?.[0];
-		const todayReqs = acc?.today?.[0]?.sum?.requests || 0;
-		const totalReqs = acc?.total?.[0]?.sum?.requests || todayReqs;
-		return { today: todayReqs, total: totalReqs };
-	} catch (e) {
-		return { today: 0, total: 0 };
-	}
+    }
+    if (启用仓库优选) {
+      try {
+        const 新地址列表 = await 获取值解析新地址列表();
+        if (新地址列表.length > 0) {
+          if (启用明文) {
+            最终链接列表.push(...生成链接列表来源新地址列表(新地址列表, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502));
+          }
+          if (启用木马) {
+            最终链接列表.push(...(await 生成木马链接列表来源新地址列表(新地址列表, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502)));
+          }
+          if (启用扩展传输) {
+            最终链接列表.push(...生成扩展超文本链接列表来源源(新地址列表, 用户506, 工作器域名504, 加密客户端问候配置501, false, 别名命名器502));
+          }
+        }
+      } catch (错误486) {
+        if (!当前工作器地区) {
+          当前工作器地区 = await 检测工作器地区(请求507);
+        }
+        const 值备用地址485 = await 获取值备用地址(当前工作器地区);
+        if (值备用地址485) {
+          回退地址 = 值备用地址485.domain + ':' + 值备用地址485.port;
+          const 备用列表 = [{
+            ip: 值备用地址485.domain,
+            isp: 解码64('UHJveHlJUC0=') + 当前工作器地区
+          }];
+          await 添加节点列表来源列表(备用列表);
+        }
+      }
+    }
+  }
+  if (最终链接列表.length === 0) {
+    const 错误备注 = "所有节点获取失败";
+    const 协议484 = atob('dmxlc3M=');
+    const 错误链接 = `${协议484}://00000000-0000-0000-0000-000000000000@127.0.0.1:80?encryption=none&security=none&type=ws&host=error.com&path=%2F#${encodeURIComponent(错误备注)}`;
+    最终链接列表.push(错误链接);
+  }
+  let 订阅内容;
+  let 内容类型483 = 'text/plain; charset=utf-8';
+  switch (目标503.toLowerCase()) {
+    case atob('Y2xhc2g='):
+    case atob('Y2xhc2hy'):
+    case 解码64('c3Rhc2g='):
+    case 'meta':
+    case 解码64('Y2xhc2htZXRh'):
+      订阅内容 = 生成值值589(最终链接列表);
+      内容类型483 = 'text/yaml; charset=utf-8';
+      break;
+    case atob('c3VyZ2U='):
+    case atob('c3VyZ2Uy'):
+    case atob('c3VyZ2Uz'):
+    case atob('c3VyZ2U0'):
+      订阅内容 = 生成值值562(最终链接列表);
+      内容类型483 = 'text/plain; charset=utf-8';
+      break;
+    case atob('cXVhbnR1bXVsdA=='):
+    case atob('cXVhbng='):
+    case 解码64('cXVhbng='):
+      订阅内容 = 生成值值(最终链接列表);
+      内容类型483 = 'text/plain; charset=utf-8';
+      break;
+    case atob('c3M='):
+    case atob('c3Ny'):
+      订阅内容 = btoa(最终链接列表.join('\n'));
+      break;
+    case atob('djJyYXk='):
+      订阅内容 = btoa(最终链接列表.join('\n'));
+      break;
+    case atob('bG9vbg=='):
+      订阅内容 = 生成值值552(最终链接列表);
+      内容类型483 = 'text/plain; charset=utf-8';
+      break;
+    case atob('c2luZ2JveA=='):
+    case 解码64('c2luZy1ib3g='):
+    case 解码64('c2luZ2JveA=='):
+      订阅内容 = 生成值值数据对象(最终链接列表);
+      内容类型483 = 'application/json; charset=utf-8';
+      break;
+    default:
+      订阅内容 = btoa(最终链接列表.join('\n'));
+  }
+  const 响应头部列表 = {
+    'Content-Type': 内容类型483,
+    'Cache-Control': 'no-store, no-cache, must-revalidate, max-age=0'
+  };
+
+  // 添加ECH状态到响应头
+  if (启用加密客户端问候) {
+    响应头部列表['X-ECH-Status'] = 'ENABLED';
+    if (加密客户端问候配置501) {
+      响应头部列表['X-ECH-Config-Length'] = String(加密客户端问候配置501.length);
+    }
+  }
+  return new Response(订阅内容, {
+    headers: 响应头部列表
+  });
 }
-function isIPv4(value) {
-	const parts = String(value || "").split(".");
-	return parts.length === 4 && parts.every((part) => /^\d{1,3}$/.test(part) && Number(part) >= 0 && Number(part) <= 255);
+function 生成链接列表来源源(列表482, 用户481, 工作器域名480, 加密客户端问候配置479 = null, 跳过编号478 = false, 别名命名器477 = null) {
+  const 云墙超文本端口476 = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  const 云墙安全超文本端口475 = [443, 2053, 2083, 2087, 2096, 8443];
+  const 默认安全超文本值474 = [443];
+  const 默认超文本值473 = 禁用非传输层安全 ? [] : [80];
+  const 链接列表472 = [];
+  const 网页套接字路径471 = '/?ed=2048';
+  const 协议470 = atob('dmxlc3M=');
+  const 制作节点名称469 = 别名命名器477 || 创建值节点命名器(跳过编号478);
+  for (const 项目468 of 列表482) {
+    const 安全地址467 = 项目468.ip.includes(':') ? `[${项目468.ip}]` : 项目468.ip;
+    let 值值生成466 = [];
+    if (项目468.port) {
+      const 端口465 = 项目468.port;
+      if (云墙安全超文本端口475.includes(端口465)) {
+        值值生成466.push({
+          port: 端口465,
+          tls: true
+        });
+      } else if (云墙超文本端口476.includes(端口465)) {
+        if (!禁用非传输层安全) {
+          值值生成466.push({
+            port: 端口465,
+            tls: false
+          });
+        }
+      } else {
+        值值生成466.push({
+          port: 端口465,
+          tls: true
+        });
+      }
+    } else {
+      默认安全超文本值474.forEach(端口464 => {
+        值值生成466.push({
+          port: 端口464,
+          tls: true
+        });
+      });
+      默认超文本值473.forEach(端口463 => {
+        值值生成466.push({
+          port: 端口463,
+          tls: false
+        });
+      });
+    }
+    for (const {
+      port: 端口462,
+      tls: 传输层安全461
+    } of 值值生成466) {
+      const 网页套接字节点名称460 = 制作节点名称469(项目468);
+      if (传输层安全461) {
+        const 网页套接字参数459 = new URLSearchParams({
+          encryption: 'none',
+          security: 'tls',
+          sni: 工作器域名480,
+          fp: 启用加密客户端问候 ? 'chrome' : 'randomized',
+          type: 'ws',
+          host: 工作器域名480,
+          path: 网页套接字路径471
+        });
+        处理值应用层协议协商值(网页套接字参数459);
+
+        // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+        if (启用加密客户端问候) {
+          const 域名系统值458 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+          const 加密客户端问候域名457 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+          网页套接字参数459.set('ech', `${加密客户端问候域名457}+${域名系统值458}`);
+        }
+        链接列表472.push(`${协议470}://${用户481}@${安全地址467}:${端口462}?${网页套接字参数459.toString()}#${encodeURIComponent(网页套接字节点名称460)}`);
+      } else {
+        const 网页套接字参数456 = new URLSearchParams({
+          encryption: 'none',
+          security: 'none',
+          type: 'ws',
+          host: 工作器域名480,
+          path: 网页套接字路径471
+        });
+        链接列表472.push(`${协议470}://${用户481}@${安全地址467}:${端口462}?${网页套接字参数456.toString()}#${encodeURIComponent(网页套接字节点名称460)}`);
+      }
+    }
+  }
+  return 链接列表472;
 }
-function convertToUint8Array(data) {
-	if (data instanceof Uint8Array) return data;
-	if (data instanceof ArrayBuffer) return new Uint8Array(data);
-	if (ArrayBuffer.isView(data)) return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
-	return new Uint8Array(data || 0);
+async function 生成木马链接列表来源源(列表455, 用户454, 工作器域名453, 加密客户端问候配置452 = null, 跳过编号451 = false, 别名命名器450 = null) {
+  const 云墙超文本端口449 = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  const 云墙安全超文本端口448 = [443, 2053, 2083, 2087, 2096, 8443];
+  const 默认安全超文本值 = [443];
+  const 默认超文本值 = 禁用非传输层安全 ? [] : [80];
+  const 链接列表447 = [];
+  const 网页套接字路径446 = '/?ed=2048';
+  const 密码445 = 传输路径 || 用户454;
+  const 制作节点名称444 = 别名命名器450 || 创建值节点命名器(跳过编号451);
+  for (const 项目443 of 列表455) {
+    const 安全地址442 = 项目443.ip.includes(':') ? `[${项目443.ip}]` : 项目443.ip;
+    let 值值生成 = [];
+    if (项目443.port) {
+      const 端口441 = 项目443.port;
+      if (云墙安全超文本端口448.includes(端口441)) {
+        值值生成.push({
+          port: 端口441,
+          tls: true
+        });
+      } else if (云墙超文本端口449.includes(端口441)) {
+        if (!禁用非传输层安全) {
+          值值生成.push({
+            port: 端口441,
+            tls: false
+          });
+        }
+      } else {
+        值值生成.push({
+          port: 端口441,
+          tls: true
+        });
+      }
+    } else {
+      默认安全超文本值.forEach(端口440 => {
+        值值生成.push({
+          port: 端口440,
+          tls: true
+        });
+      });
+      默认超文本值.forEach(端口439 => {
+        值值生成.push({
+          port: 端口439,
+          tls: false
+        });
+      });
+    }
+    for (const {
+      port: 端口438,
+      tls: 传输层安全
+    } of 值值生成) {
+      const 网页套接字节点名称437 = 制作节点名称444(项目443);
+      if (传输层安全) {
+        const 网页套接字参数436 = new URLSearchParams({
+          security: 'tls',
+          sni: 工作器域名453,
+          fp: 'chrome',
+          type: 'ws',
+          host: 工作器域名453,
+          path: 网页套接字路径446
+        });
+        处理值应用层协议协商值(网页套接字参数436);
+
+        // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+        if (启用加密客户端问候) {
+          const 域名系统值435 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+          const 加密客户端问候域名434 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+          网页套接字参数436.set('ech', `${加密客户端问候域名434}+${域名系统值435}`);
+        }
+        链接列表447.push(`${atob('dHJvamFuOi8v')}${密码445}@${安全地址442}:${端口438}?${网页套接字参数436.toString()}#${encodeURIComponent(网页套接字节点名称437)}`);
+      } else {
+        const 网页套接字参数 = new URLSearchParams({
+          security: 'none',
+          type: 'ws',
+          host: 工作器域名453,
+          path: 网页套接字路径446
+        });
+        链接列表447.push(`${atob('dHJvamFuOi8v')}${密码445}@${安全地址442}:${端口438}?${网页套接字参数.toString()}#${encodeURIComponent(网页套接字节点名称437)}`);
+      }
+    }
+  }
+  return 链接列表447;
 }
-function concatBytes(...chunkList) {
-	if (chunkList.length === 2) {
-		const a = convertToUint8Array(chunkList[0]);
-		const b = convertToUint8Array(chunkList[1]);
-		if (!a.byteLength) return b;
-		if (!b.byteLength) return a;
-		const merged = new Uint8Array(a.byteLength + b.byteLength);
-		merged.set(a, 0);
-		merged.set(b, a.byteLength);
-		return merged;
-	}
-	const chunks = chunkList.map(convertToUint8Array);
-	let total = 0;
-	for (const c of chunks) total += c.byteLength;
-	const result = new Uint8Array(total);
-	let offset = 0;
-	for (const c of chunks) {
-		result.set(c, offset);
-		offset += c.byteLength;
-	}
-	return result;
+async function 获取值地址列表() {
+  const 值4网址1 = "https://www.wetest.vip/page/cloudflare/address_v4.html";
+  const 值6网址1 = "https://www.wetest.vip/page/cloudflare/address_v6.html";
+  let 结果列表433 = [];
+
+  // 读取筛选配置（默认全部启用）
+  const 值4已启用 = 获取配置值('ipv4', '') === '' || 获取配置值('ipv4', 'yes') !== 'no';
+  const 值6已启用 = 获取配置值('ipv6', '') === '' || 获取配置值('ipv6', 'yes') !== 'no';
+  const 值值432 = 获取配置值('ispMobile', '') === '' || 获取配置值('ispMobile', 'yes') !== 'no';
+  const 值值431 = 获取配置值('ispUnicom', '') === '' || 获取配置值('ispUnicom', 'yes') !== 'no';
+  const 值值430 = 获取配置值('ispTelecom', '') === '' || 获取配置值('ispTelecom', 'yes') !== 'no';
+  try {
+    const 获取承诺列表 = [];
+    if (值4已启用) {
+      获取承诺列表.push(获取值解析值(值4网址1));
+    } else {
+      获取承诺列表.push(Promise.resolve([]));
+    }
+    if (值6已启用) {
+      获取承诺列表.push(获取值解析值(值6网址1));
+    } else {
+      获取承诺列表.push(Promise.resolve([]));
+    }
+    const [值4列表, 值6列表] = await Promise.all(获取承诺列表);
+    结果列表433 = [...值4列表, ...值6列表];
+
+    // 按运营商筛选
+    if (结果列表433.length > 0) {
+      结果列表433 = 结果列表433.filter(项目429 => {
+        const 本地值428 = 项目429.isp || '';
+        if (本地值428.includes('移动') && !值值432) return false;
+        if (本地值428.includes('联通') && !值值431) return false;
+        if (本地值428.includes('电信') && !值值430) return false;
+        return true;
+      });
+    }
+    if (结果列表433.length > 0) {
+      return 结果列表433;
+    }
+  } catch (事件值427) {}
+  return [];
 }
-function closeSocketQuietly(socket) {
-	try {
-		if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CLOSING) {
-			socket.close();
-		}
-	} catch (e) {}
+async function 获取值解析值(网址426) {
+  try {
+    const 响应425 = await fetch(网址426, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0'
+      }
+    });
+    if (!响应425.ok) {
+      return [];
+    }
+    const 页面 = await 响应425.text();
+    const 结果列表424 = [];
+    const 值正则423 = /<tr[\s\S]*?<\/tr>/g;
+    const 值正则422 = /<td data-label="线路名称">(.+?)<\/td>[\s\S]*?<td data-label="优选地址">([\d.:a-fA-F]+)<\/td>[\s\S]*?<td data-label="数据中心">(.+?)<\/td>/;
+    let 本地值421;
+    while ((本地值421 = 值正则423.exec(页面)) !== null) {
+      const 值页面420 = 本地值421[0];
+      const 值值419 = 值页面420.match(值正则422);
+      if (值值419 && 值值419[1] && 值值419[2]) {
+        const 机房 = 值值419[3] ? 值值419[3].trim().replace(/<.*?>/g, '') : '';
+        结果列表424.push({
+          isp: 值值419[1].trim().replace(/<.*?>/g, ''),
+          ip: 值值419[2].trim(),
+          colo: 机房
+        });
+      }
+    }
+    if (结果列表424.length === 0) {}
+    return 结果列表424;
+  } catch (错误418) {
+    return [];
+  }
 }
-async function dohQuery(domain, recordType, targetDoh = DOH_RESOLVER) {
-	const cacheKey = `${domain}:${recordType}:${targetDoh}`;
-	if (DNS_CACHE.has(cacheKey)) {
-		const cached = DNS_CACHE.get(cacheKey);
-		if (Date.now() < cached.expires) return cached.data;
-		DNS_CACHE.delete(cacheKey);
-	}
-	try {
-		const typeMap = { A: 1, AAAA: 28 };
-		const qtype = typeMap[recordType.toUpperCase()] || 1;
-		const encodeDomain = (name) => {
-			const parts = name.endsWith(".") ? name.slice(0, -1).split(".") : name.split(".");
-			const bufs = [];
-			for (const label of parts) {
-				const enc = TEXT_ENCODER.encode(label);
-				bufs.push(new Uint8Array([enc.length]), enc);
-			}
-			bufs.push(new Uint8Array([0]));
-			return concatBytes(...bufs);
-		};
-		const qname = encodeDomain(domain);
-		const query = new Uint8Array(12 + qname.length + 4);
-		const qview = new DataView(query.buffer);
-		qview.setUint16(0, crypto.getRandomValues(new Uint16Array(1))[0]);
-		qview.setUint16(2, 0x0100);
-		qview.setUint16(4, 1);
-		query.set(qname, 12);
-		qview.setUint16(12 + qname.length, qtype);
-		qview.setUint16(12 + qname.length + 2, 1);
-		const response = await fetch(targetDoh, {
-			method: "POST",
-			headers: {
-				"Content-Type": "application/dns-message",
-				Accept: "application/dns-message",
-			},
-			body: query,
-		});
-		if (!response.ok) return [];
-		const buf = new Uint8Array(await response.arrayBuffer());
-		const dv = new DataView(buf.buffer);
-		const qdcount = dv.getUint16(4);
-		const ancount = dv.getUint16(6);
-		const parseName = (pos) => {
-			const labels = [];
-			let p = pos,
-				jumped = false,
-				endPos = -1,
-				safe = 128;
-			while (p < buf.length && safe-- > 0) {
-				const len = buf[p];
-				if (len === 0) {
-					if (!jumped) endPos = p + 1;
-					break;
-				}
-				if ((len & 0xc0) === 0xc0) {
-					if (!jumped) endPos = p + 2;
-					p = ((len & 0x3f) << 8) | buf[p + 1];
-					jumped = true;
-					continue;
-				}
-				labels.push(TEXT_DECODER.decode(buf.slice(p + 1, p + 1 + len)));
-				p += len + 1;
-			}
-			if (endPos === -1) endPos = p + 1;
-			return [labels.join("."), endPos];
-		};
-		let offset = 12;
-		for (let i = 0; i < qdcount; i++) {
-			const [, end] = parseName(offset);
-			offset = Number(end) + 4;
-		}
-		const answers = [];
-		for (let i = 0; i < ancount && offset < buf.length; i++) {
-			const [name, nameEnd] = parseName(offset);
-			offset = Number(nameEnd);
-			const type = dv.getUint16(offset);
-			offset += 2;
-			offset += 2;
-			const ttl = dv.getUint32(offset);
-			offset += 4;
-			const rdlen = dv.getUint16(offset);
-			offset += 2;
-			const rdata = buf.slice(offset, offset + rdlen);
-			offset += rdlen;
-			let data;
-			if (type === 1 && rdlen === 4) {
-				data = `${rdata[0]}.${rdata[1]}.${rdata[2]}.${rdata[3]}`;
-			} else if (type === 28 && rdlen === 16) {
-				const segs = [];
-				for (let j = 0; j < 16; j += 2) segs.push(((rdata[j] << 8) | rdata[j + 1]).toString(16));
-				data = segs.join(":");
-			} else {
-				data = Array.from(rdata)
-					.map((b) => b.toString(16).padStart(2, "0"))
-					.join("");
-			}
-			answers.push({ name, type, TTL: ttl, data });
-		}
-		if (DNS_CACHE.size >= DNS_CACHE_MAX_ENTRIES) {
-			const oldestKey = DNS_CACHE.keys().next().value;
-			if (oldestKey !== undefined) DNS_CACHE.delete(oldestKey);
-		}
-		DNS_CACHE.set(cacheKey, { data: answers, expires: Date.now() + DNS_CACHE_TTL });
-		return answers;
-	} catch (e) {
-		return [];
-	}
-}
-function createUpstreamQueue({ getWriter, releaseWriter, retryConnect, closeConnection, name = "UpstreamQueue" }) {
-	let chunks = [];
-	let head = 0;
-	let queuedBytes = 0;
-	let draining = false;
-	let closed = false;
-	let bundleBuffer = null;
-	let idleResolvers = [];
-	let activeCompletions = null;
-	const settleCompletions = (completions, err = null) => {
-		if (!completions) return;
-		for (const comp of completions) {
-			if (comp) {
-				if (err) comp.reject(err);
-				else comp.resolve();
-			}
-		}
-	};
-	const rejectQueued = (err) => {
-		for (let i = head; i < chunks.length; i++) {
-			const item = chunks[i];
-			if (item && item.completions) settleCompletions(item.completions, err);
-		}
-	};
-	const compact = () => {
-		if (head > 32 && head * 2 >= chunks.length) {
-			chunks = chunks.slice(head);
-			head = 0;
-		}
-	};
-	const resolveIdle = () => {
-		if (queuedBytes || draining || !idleResolvers.length) return;
-		const resolvers = idleResolvers;
-		idleResolvers = [];
-		for (const resolve of resolvers) resolve();
-	};
-	const clear = (err = null) => {
-		const closeErr = err || (closed ? new Error(`${name}: queue closed`) : null);
-		if (closeErr) {
-			rejectQueued(closeErr);
-			settleCompletions(activeCompletions, closeErr);
-			activeCompletions = null;
-		}
-		chunks = [];
-		head = 0;
-		queuedBytes = 0;
-		resolveIdle();
-	};
-	const shift = () => {
-		if (head >= chunks.length) return null;
-		const item = chunks[head];
-		chunks[head++] = undefined;
-		queuedBytes -= item.chunk.byteLength;
-		compact();
-		return item;
-	};
-	const bundle = () => {
-		const first = shift();
-		if (!first) return null;
-		if (head >= chunks.length || first.chunk.byteLength >= UPSTREAM_BUNDLE_TARGET_BYTES) return first;
-		let byteLength = first.chunk.byteLength;
-		let end = head;
-		let allowRetry = first.allowRetry;
-		let completions = first.completions || null;
-		while (end < chunks.length) {
-			const next = chunks[end];
-			const nextLength = byteLength + next.chunk.byteLength;
-			if (nextLength > UPSTREAM_BUNDLE_TARGET_BYTES) break;
-			byteLength = nextLength;
-			allowRetry = allowRetry && next.allowRetry;
-			if (next.completions) completions = completions ? completions.concat(next.completions) : next.completions;
-			end++;
-		}
-		if (end === head) return first;
-		const output = (bundleBuffer ||= new Uint8Array(UPSTREAM_BUNDLE_TARGET_BYTES));
-		output.set(first.chunk);
-		let offset = first.chunk.byteLength;
-		while (head < end) {
-			const next = chunks[head];
-			chunks[head++] = undefined;
-			queuedBytes -= next.chunk.byteLength;
-			output.set(next.chunk, offset);
-			offset += next.chunk.byteLength;
-		}
-		compact();
-		return { chunk: output.subarray(0, byteLength), allowRetry, completions };
-	};
-	const drain = async () => {
-		if (draining || closed) return;
-		draining = true;
-		try {
-			let batchCount = 0;
-			for (;;) {
-				if (closed) break;
-				const item = bundle();
-				if (!item) break;
-				let writer = getWriter();
-				if (!writer) throw new Error(`${name}: remote writer unavailable`);
-				const completions = item.completions || null;
-				activeCompletions = completions;
-				try {
-					try {
-						await writer.write(item.chunk);
-					} catch (err) {
-						releaseWriter?.();
-						if (!item.allowRetry || typeof retryConnect !== "function") throw err;
-						await retryConnect();
-						writer = getWriter();
-						if (!writer) throw err;
-						await writer.write(item.chunk);
-					}
-					settleCompletions(completions);
-				} catch (err) {
-					settleCompletions(completions, err);
-					throw err;
-				} finally {
-					if (activeCompletions === completions) activeCompletions = null;
-				}
-				batchCount++;
-				if (batchCount >= 16) {
-					await Promise.resolve();
-					batchCount = 0;
-				}
-			}
-		} catch (err) {
-			closed = true;
-			clear(err);
-			try {
-				closeConnection?.(err);
-			} catch (_) {}
-		} finally {
-			draining = false;
-			if (!closed && head < chunks.length) queueMicrotask(drain);
-			else resolveIdle();
-		}
-	};
-	const enqueue = (data, allowRetry = true, waitForFlush = false) => {
-		if (closed) return false;
-		if (!getWriter()) return false;
-		const chunk = convertToUint8Array(data);
-		if (!chunk.byteLength) return true;
-		const nextBytes = queuedBytes + chunk.byteLength;
-		const nextItems = chunks.length - head + 1;
-		if (nextBytes > UPSTREAM_QUEUE_MAX_BYTES || nextItems > UPSTREAM_QUEUE_MAX_ITEMS) {
-			closed = true;
-			const err = Object.assign(new Error(`${name}: upload queue overflow (${nextBytes}B/${nextItems})`), { isQueueOverflow: true });
-			clear(err);
-			try {
-				closeConnection?.(err);
-			} catch (_) {}
-			throw err;
-		}
-		let completionPromise = null;
-		let completions = null;
-		if (waitForFlush) {
-			completions = [];
-			completionPromise = new Promise((resolve, reject) => completions.push({ resolve, reject }));
-		}
-		chunks.push({ chunk, allowRetry, completions });
-		queuedBytes = nextBytes;
-		if (!draining) queueMicrotask(drain);
-		return waitForFlush ? completionPromise.then(() => true) : true;
-	};
-	return {
-		writeAndAwait(data, allowRetry = true) {
-			return enqueue(data, allowRetry, true);
-		},
-		async awaitEmpty() {
-			if (!queuedBytes && !draining) return;
-			await new Promise((resolve) => idleResolvers.push(resolve));
-		},
-		clear() {
-			closed = true;
-			clear();
-		},
-	};
-}
-function createDownstreamSender(webSocket, headerData = null) {
-	const MAX_CAP = 128 * 1024;
-	const MIN_CAP = 8 * 1024;
-	let currentPacketCap = 32 * 1024;
-	const tailBytes = 512;
-	let header = headerData;
-	let pendingBuffer = null;
-	let pendingBytes = 0;
-	let flushPromise = null;
-	let microtaskQueued = false;
-	const adjustSmartBuffer = () => {
-		const buffered = webSocket.bufferedAmount || 0;
-		if (buffered > 256 * 1024) {
-			currentPacketCap = Math.max(MIN_CAP, Math.floor(currentPacketCap / 2));
-		} else if (buffered < 32 * 1024) {
-			currentPacketCap = Math.min(MAX_CAP, currentPacketCap * 2);
-		}
-	};
-	const sendRawChunk = async (chunk) => {
-		if (webSocket.readyState !== 1) throw new Error("ws.readyState is not open");
-		webSocket.send(chunk);
-	};
-	const attachResponseHeader = (chunk) => {
-		if (!header) return chunk;
-		const merged = new Uint8Array(header.length + chunk.byteLength);
-		merged.set(header, 0);
-		merged.set(chunk, header.length);
-		header = null;
-		return merged;
-	};
-	const flush = async () => {
-		microtaskQueued = false;
-		while (flushPromise) await flushPromise;
-		if (!pendingBytes) return;
-		const output = pendingBuffer.slice(0, pendingBytes);
-		adjustSmartBuffer();
-		pendingBytes = 0;
-		flushPromise = sendRawChunk(output).finally(() => {
-			flushPromise = null;
-		});
-		return flushPromise;
-	};
-	return {
-		async sendDirect(data) {
-			let chunk = convertToUint8Array(data);
-			if (!chunk.byteLength) return;
-			chunk = attachResponseHeader(chunk);
-			await sendRawChunk(chunk);
-		},
-		async send(data) {
-			let chunk = convertToUint8Array(data);
-			if (!chunk.byteLength) return;
-			chunk = attachResponseHeader(chunk);
-			let offset = 0;
-			const totalBytes = chunk.byteLength;
-			while (offset < totalBytes) {
-				if (!pendingBytes && totalBytes - offset >= currentPacketCap) {
-					const sendBytes = Math.min(currentPacketCap, totalBytes - offset);
-					const view = offset || sendBytes !== totalBytes ? chunk.subarray(offset, offset + sendBytes) : chunk;
-					await sendRawChunk(view);
-					offset += sendBytes;
-					adjustSmartBuffer();
-					continue;
-				}
-				const copyBytes = Math.min(currentPacketCap - pendingBytes, totalBytes - offset);
-				if (!pendingBuffer) pendingBuffer = new Uint8Array(MAX_CAP);
-				pendingBuffer.set(chunk.subarray(offset, offset + copyBytes), pendingBytes);
-				pendingBytes += copyBytes;
-				offset += copyBytes;
-				if (pendingBytes >= currentPacketCap || currentPacketCap - pendingBytes < tailBytes) {
-					await flush();
-				} else if (!microtaskQueued) {
-					microtaskQueued = true;
-					queueMicrotask(() => {
-						if (pendingBytes) flush().catch(() => closeSocketQuietly(webSocket));
-					});
-				}
-			}
-		},
-		flush,
-	};
-}
-async function waitForBackpressure(ws) {
-	if (typeof ws.bufferedAmount === "number") {
-		let maxAttempts = 300;
-		while (ws.bufferedAmount > 512 * 1024 && maxAttempts > 0) {
-			if (ws.readyState !== WebSocket.OPEN) break;
-			await new Promise((r) => setTimeout(r, 5));
-			maxAttempts--;
-		}
-	}
-}
-async function connectStreams(remoteSocket, webSocket, headerData, retryFunc, onBytes) {
-	let header = headerData,
-		hasData = false,
-		reader,
-		useBYOB = false;
-	const BYOB_LIMIT = 128 * 1024;
-	const downstreamSender = createDownstreamSender(webSocket, header);
-	header = null;
-	try {
-		reader = remoteSocket.readable.getReader({ mode: "byob" });
-		useBYOB = true;
-	} catch (e) {
-		reader = remoteSocket.readable.getReader();
-	}
-	try {
-		if (!useBYOB) {
-			while (true) {
-				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
-				const { done, value } = await reader.read();
-				if (done) break;
-				if (!value || value.byteLength === 0) continue;
-				hasData = true;
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-				await downstreamSender.send(value);
-			}
-		} else {
-			let readBuffer = new ArrayBuffer(BYOB_LIMIT);
-			while (true) {
-				if (webSocket.bufferedAmount > 512 * 1024) await waitForBackpressure(webSocket);
-				const { done, value } = await reader.read(new Uint8Array(readBuffer, 0, BYOB_LIMIT));
-				if (done) break;
-				if (!value || value.byteLength === 0) continue;
-				hasData = true;
-				if (typeof onBytes === "function") onBytes(value.byteLength);
-				if (value.byteLength >= DOWNSTREAM_GRAIN_BYTES) {
-					await downstreamSender.flush();
-					await downstreamSender.sendDirect(value);
-					readBuffer = new ArrayBuffer(BYOB_LIMIT);
-				} else {
-					await downstreamSender.send(value);
-					readBuffer = value.buffer.byteLength >= BYOB_LIMIT ? value.buffer : new ArrayBuffer(BYOB_LIMIT);
-				}
-			}
-		}
-		await downstreamSender.flush();
-	} catch (err) {
-		closeSocketQuietly(webSocket);
-	} finally {
-		try {
-			reader.cancel();
-		} catch (e) {}
-		try {
-			reader.releaseLock();
-		} catch (e) {}
-	}
-	if (!hasData && retryFunc) await retryFunc();
-}
-async function connectDirect(address, port, initialData = null, targetDoh = "https://cloudflare-dns.com/dns-query") {
-	const socket = connect({ hostname: address, port: port });
-	await Promise.race([socket.opened, new Promise((_, reject) => setTimeout(() => reject(new Error("timeout")), 5000))]);
-	if (initialData && initialData.byteLength > 0) {
-		const w = socket.writable.getWriter();
-		await w.write(convertToUint8Array(initialData));
-		w.releaseLock();
-	}
-	return socket;
-}
-async function forwardvIeesUDP(udpChunk, webSocket, respHeader, onBytes, dnsServer = "8.8.4.4") {
-    const requestData = convertToUint8Array(udpChunk);
-    let tcpSocket = null;
-    const abortCtl = new AbortController();
-    const timeoutId = setTimeout(() => { try { abortCtl.abort(); } catch (e) {} }, 10000);
+async function 处理网页套接字请求(请求417) {
+  // 从请求URL的path query中读取客户端自定义参数
+  // 从 path query 读取覆盖参数
+  const 请求网址 = new URL(请求417.url);
+  const 请求回退416 = 请求网址.searchParams.get('p') || '';
+  const 请求地区415 = (请求网址.searchParams.get('wk') || '').toUpperCase();
+  const 请求值字符串 = 请求网址.searchParams.get('rm') || '';
+  const 请求值414 = 请求值字符串 ? 请求值字符串.toLowerCase() !== 'no' : null;
+  const 请求代理字符串 = 请求网址.searchParams.get('s') || '';
+  let 请求代理配置413 = null;
+  if (请求代理字符串) {
     try {
-        tcpSocket = connect({ hostname: dnsServer, port: 53 });
-        let vIeesHeader = respHeader;
-        const writer = tcpSocket.writable.getWriter();
-        await writer.write(requestData);
-        writer.releaseLock();
-        await tcpSocket.readable.pipeTo(
-            new WritableStream({
-                async write(chunk) {
-                    const rawResponse = convertToUint8Array(chunk);
-                    if (typeof onBytes === "function") onBytes(rawResponse.byteLength);
-                    if (webSocket.readyState !== WebSocket.OPEN) return;
-                    if (vIeesHeader) {
-                        const merged = new Uint8Array(vIeesHeader.length + rawResponse.byteLength);
-                        merged.set(vIeesHeader, 0);
-                        merged.set(rawResponse, vIeesHeader.length);
-                        webSocket.send(merged.buffer);
-                        vIeesHeader = null;
-                    } else {
-                        webSocket.send(rawResponse);
-                    }
-                },
-            }),
-            { signal: abortCtl.signal },
-        );
-    } catch (e) {
+      请求代理配置413 = 解析代理配置(请求代理字符串);
+    } catch (忽略值412) {}
+  }
+
+  // 检测并设置当前Worker地区，确保WebSocket请求能正确进行就近匹配
+  // 优先级：客户端path参数wk > 全局manualWorkerRegion > 自动检测
+  let 实际地区411 = 当前工作器地区;
+  if (!实际地区411 || 实际地区411 === '') {
+    if (请求地区415) {
+      实际地区411 = 请求地区415;
+    } else if (手动工作器地区 && 手动工作器地区.trim()) {
+      实际地区411 = 手动工作器地区.trim().toUpperCase();
+    } else {
+      实际地区411 = await 检测工作器地区(请求417);
+    }
+  } else if (请求地区415) {
+    实际地区411 = 请求地区415;
+  }
+  const 网页套接字值 = new WebSocketPair();
+  const [客户端值, 值值410] = Object.values(网页套接字值);
+  值值410.accept();
+  值值410.binaryType = 'arraybuffer';
+  let 远程连接值409 = {
+    socket: null,
+    writer: null,
+    drainUpload: null
+  };
+  let 是否域名系统值 = false;
+  let 协议类型 = null;
+  let 值值408 = false;
+  let 传输值 = false;
+  const 值队列 = 创建块队列(传输上传包大小, 传输上传队列上限, 传输上传队列上限 >> 8);
+  const 请求值407 = 请求417.fetcher;
+  function 处理值远程写入器() {
+    try {
+      远程连接值409.writer?.releaseLock();
+    } catch (忽略值406) {}
+    远程连接值409.writer = null;
+  }
+  function 关闭传输() {
+    if (传输值) return;
+    传输值 = true;
+    值队列.clear();
+    处理值远程写入器();
+    try {
+      远程连接值409.socket?.close();
+    } catch (忽略值405) {}
+    关闭套接字值(值值410);
+  }
+  function 处理队列值(块404) {
+    const 数据403 = 处理值值8数组(块404);
+    if (!数据403.byteLength) return true;
+    if (!值队列.sow(数据403)) {
+      关闭传输();
+      return false;
+    }
+    远程连接值409.drainUpload();
+    return true;
+  }
+  async function 处理值值402() {
+    if (值值408 || 传输值 || !远程连接值409.writer) return;
+    值值408 = true;
+    try {
+      for (;;) {
+        if (传输值 || !远程连接值409.writer) break;
+        const [数据401] = 值队列.bundle();
+        if (!数据401) break;
+        await 远程连接值409.writer.write(数据401);
+      }
+    } catch (忽略值400) {
+      关闭传输();
     } finally {
-        clearTimeout(timeoutId);
-        try { if (tcpSocket) tcpSocket.close(); } catch (e) {}
+      值值408 = false;
+      if (!值队列.empty && !传输值 && 远程连接值409.writer) queueMicrotask(处理值值402);
     }
-}
-function extractUUIDFromvIees(data) {
-	if (data.byteLength < 17) return null;
-	const hex = [...data.slice(1, 17)].map((b) => b.toString(16).padStart(2, "0")).join("");
-	return `${hex.substring(0, 8)}-${hex.substring(8, 12)}-${hex.substring(12, 16)}-${hex.substring(16, 20)}-${hex.substring(20)}`;
-}
-function trackRequest(env, ctx) {
-	GLOBAL_REQ_COUNT++;
-	const now = Date.now();
-	if ((now - GLOBAL_LAST_REQ_WRITE > 900000 || GLOBAL_REQ_COUNT > 5000) && GLOBAL_REQ_COUNT > 0) {
-		GLOBAL_LAST_REQ_WRITE = now;
-		const countToSave = GLOBAL_REQ_COUNT;
-		GLOBAL_REQ_COUNT = 0;
-		const task = async () => {
-			try {
-				const today = new Date().toISOString().split("T")[0];
-				await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_total', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
-				const lastDateRow = await env.DB.prepare("SELECT value FROM settings WHERE key = 'req_last_date'").first();
-				if (!lastDateRow || lastDateRow.value !== today) {
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_last_date', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(today, today).run();
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = ?").bind(String(countToSave), String(countToSave)).run();
-				} else {
-					await env.DB.prepare("INSERT INTO settings (key, value) VALUES ('req_today', ?) ON CONFLICT(key) DO UPDATE SET value = CAST(value AS INTEGER) + ?").bind(String(countToSave), String(countToSave)).run();
-				}
-			} catch (e) {}
-		};
-		if (ctx) ctx.waitUntil(task());
-		else task();
-	}
-}
-async function connectProxy(proxyStr, destAddr, destPort, initialData) {
-	let normalized = proxyStr;
-	if (proxyStr.includes("t.me/socks") || proxyStr.includes("tg://socks")) {
-		const server = proxyStr.match(/server=([^&]+)/)?.[1];
-		const port = proxyStr.match(/port=([^&]+)/)?.[1];
-		const user = proxyStr.match(/user=([^&]+)/)?.[1];
-		const pass = proxyStr.match(/pass=([^&]+)/)?.[1];
-		if (server && port) {
-			normalized = user && pass ? `socks5://${user}:${pass}@${server}:${port}` : `socks5://${server}:${port}`;
-		}
-	}
-	const isHttp = normalized.toLowerCase().startsWith("http://") || normalized.toLowerCase().startsWith("https://");
-	const isSocks4 = normalized.toLowerCase().startsWith("socks4://");
-	let cleanStr = normalized.replace(/^(socks4|socks5|socks|http|https):\/\//i, "");
-	if (isHttp) {
-		return await connectHttp(cleanStr, destAddr, destPort, initialData);
-	}
-	if (isSocks4) {
-		return await connectSocks4(cleanStr, destAddr, destPort, initialData);
-	}
-	return await connectSocks5(cleanStr, destAddr, destPort, initialData);
-}
-async function connectSocks4(proxyStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 1080);
-	const socket = connect({ hostname: host, port: port });
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	try {
-		const portHigh = (destPort >> 8) & 0xff;
-		const portLow = destPort & 0xff;
-		let req;
-		if (isIPv4(destAddr)) {
-			const ipBytes = destAddr.split(".").map(Number);
-			req = new Uint8Array([0x04, 0x01, portHigh, portLow, ipBytes[0], ipBytes[1], ipBytes[2], ipBytes[3], 0x00]);
-		} else {
-			const hostBytes = new TextEncoder().encode(destAddr);
-			req = new Uint8Array(9 + hostBytes.length + 1);
-			req[0] = 0x04;
-			req[1] = 0x01;
-			req[2] = portHigh;
-			req[3] = portLow;
-			req[4] = 0x00;
-			req[5] = 0x00;
-			req[6] = 0x00;
-			req[7] = 0x01;
-			req[8] = 0x00;
-			req.set(hostBytes, 9);
-			req[9 + hostBytes.length] = 0x00;
-		}
-		await writer.write(req);
-		let res = await reader.read();
-		if (res.done || !res.value || res.value[0] !== 0x00 || res.value[1] !== 0x5a) {
-			throw new Error("پـروکـسـی SOCKS4 وصل نشد یا اتصال را رد کرد");
-		}
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try {
-			writer.releaseLock();
-		} catch (err) {}
-		try {
-			reader.releaseLock();
-		} catch (err) {}
-		try {
-			socket.close();
-		} catch (err) {}
-		throw e;
-	}
-}
-function parseProxyConfig(proxyStr, defaultPort) {
-	let user = "",
-		pass = "",
-		host = "",
-		port = defaultPort;
-	let auth = false,
-		remain = proxyStr;
-	if (remain.includes("@")) {
-		const atIdx = remain.lastIndexOf("@");
-		const authPart = remain.substring(0, atIdx);
-		remain = remain.substring(atIdx + 1);
-		const colonIdx = authPart.indexOf(":");
-		if (colonIdx !== -1) {
-			user = authPart.substring(0, colonIdx);
-			pass = authPart.substring(colonIdx + 1);
-		} else {
-			user = authPart;
-		}
-		auth = true;
-	}
-	if (remain.startsWith("[")) {
-		const closeIdx = remain.indexOf("]");
-		if (closeIdx !== -1) {
-			host = remain.substring(1, closeIdx);
-			if (remain.length > closeIdx + 1 && remain[closeIdx + 1] === ":") port = parseInt(remain.substring(closeIdx + 2)) || defaultPort;
-		}
-	} else {
-		const lastColon = remain.lastIndexOf(":");
-		if (lastColon !== -1 && remain.indexOf(":") === lastColon) {
-			host = remain.substring(0, lastColon);
-			port = parseInt(remain.substring(lastColon + 1)) || defaultPort;
-		} else {
-			host = remain;
-		}
-	}
-	return { user, pass, host, port, auth };
-}
-async function connectSocks5(socksStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(socksStr, 1080);
-	const socket = connect({ hostname: host, port: port });
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	try {
-		if (auth) {
-			await writer.write(new Uint8Array([0x05, 0x02, 0x00, 0x02]));
-		} else {
-			await writer.write(new Uint8Array([0x05, 0x01, 0x00]));
-		}
-		let res = await reader.read();
-		if (res.done || !res.value || res.value[0] !== 0x05) throw new Error("پاسخ نامعتبر از سرور (پـروکـسـی SOCKS5 نیست یا خاموش است)");
-		const method = res.value[1];
-		if (method === 0x02) {
-			const uEnc = new TextEncoder().encode(user);
-			const pEnc = new TextEncoder().encode(pass);
-			const authReq = new Uint8Array(1 + 1 + uEnc.length + 1 + pEnc.length);
-			authReq[0] = 0x01;
-			authReq[1] = uEnc.length;
-			authReq.set(uEnc, 2);
-			authReq[2 + uEnc.length] = pEnc.length;
-			authReq.set(pEnc, 3 + uEnc.length);
-			await writer.write(authReq);
-			let authRes = await reader.read();
-			if (authRes.done || !authRes.value || authRes.value[1] !== 0x00) throw new Error("نام کاربری یا رمز عبور پـروکـسـی اشتباه است");
-		}
-		let addrType = 0x03;
-		let addrBytes;
-		if (isIPv4(destAddr)) {
-			addrType = 0x01;
-			addrBytes = new Uint8Array(destAddr.split(".").map(Number));
-		} else if (destAddr.includes(":")) {
-			addrType = 0x04;
-			addrBytes = new Uint8Array(16);
-			const blocks = destAddr.split(":");
-			for (let i = 0; i < 8; i++) {
-				const val = parseInt(blocks[i] || "0", 16);
-				addrBytes[i * 2] = (val >> 8) & 0xff;
-				addrBytes[i * 2 + 1] = val & 0xff;
-			}
-		} else {
-			const enc = new TextEncoder().encode(destAddr);
-			addrBytes = new Uint8Array(1 + enc.length);
-			addrBytes[0] = enc.length;
-			addrBytes.set(enc, 1);
-		}
-		const req = new Uint8Array(4 + addrBytes.length + 2);
-		req[0] = 0x05;
-		req[1] = 0x01;
-		req[2] = 0x00;
-		req[3] = addrType;
-		req.set(addrBytes, 4);
-		const portOffset = 4 + addrBytes.length;
-		req[portOffset] = (destPort >> 8) & 0xff;
-		req[portOffset + 1] = destPort & 0xff;
-		await writer.write(req);
-		let connRes = await reader.read();
-		if (connRes.done || !connRes.value || connRes.value[1] !== 0x00) throw new Error("پـروکـسـی وصل شد اما دسترسی به اینترنت آزاد ندارد");
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try {
-			writer.releaseLock();
-		} catch (err) {}
-		try {
-			reader.releaseLock();
-		} catch (err) {}
-		try {
-			socket.close();
-		} catch (err) {}
-		throw e;
-	}
-}
-async function connectHttp(proxyStr, destAddr, destPort, initialData) {
-	const { user, pass, host, port, auth } = parseProxyConfig(proxyStr, 80);
-	const socket = connect({ hostname: host, port: port });
-	const reader = socket.readable.getReader();
-	const writer = socket.writable.getWriter();
-	try {
-		const safeDest = destAddr.includes(":") ? `[${destAddr}]` : destAddr;
-		let req = `CONNECT ${safeDest}:${destPort} HTTP/1.1\r\nHost: ${safeDest}:${destPort}\r\n`;
-		if (auth) {
-			const authBase64 = btoa(`${user}:${pass}`);
-			req += `Proxy-Authorization: Basic ${authBase64}\r\n`;
-		}
-		req += "\r\n";
-		await writer.write(new TextEncoder().encode(req));
-		let resStr = "";
-		const dec = new TextDecoder();
-		while (true) {
-			const res = await reader.read();
-			if (res.done || !res.value) throw new Error("proxy_closed");
-			resStr += dec.decode(res.value, { stream: true });
-			if (resStr.includes("\r\n\r\n")) {
-				const match = resStr.match(/^HTTP\/\d\.\d\s+(\d+)/);
-				if (match && match[1] === "200") {
-					break;
-				} else {
-					throw new Error("proxy_error_" + (match ? match[1] : "unknown"));
-				}
-			}
-		}
-		if (initialData && initialData.byteLength > 0) {
-			await writer.write(convertToUint8Array(initialData));
-		}
-		writer.releaseLock();
-		reader.releaseLock();
-		return socket;
-	} catch (e) {
-		try {
-			writer.releaseLock();
-		} catch (err) {}
-		try {
-			reader.releaseLock();
-		} catch (err) {}
-		try {
-			socket.close();
-		} catch (err) {}
-		throw e;
-	}
-}
-const COMMON_HEAD = `<script>
-	if (localStorage.getItem('color-theme') === 'light') {
-		document.documentElement.classList.remove('dark');
-	} else {
-		document.documentElement.classList.add('dark');
-	}
-</script>
-<script src="https://cdn.tailwindcss.com"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<link href="https://cdn.jsdelivr.net/gh/rastikerdar/vazirmatn@v33.003/Vazirmatn-font-face.css" rel="stylesheet" type="text/css" />
-<script>
-	tailwind.config = {
-		darkMode: 'class',
-		theme: {
-			extend: {
-				fontFamily: { sans: ['Vazirmatn', 'sans-serif'] },
-				colors: { amoled: { bg: '#000105', card: '#040914', input: '#081224', border: '#102040' } }
-			}
-		}
-	}
-</script>`;
-const COMMON_TOAST_HTML = `<div id="toast-container" class="fixed top-5 left-1/2 -translate-x-1/2 z-[9999] flex flex-col gap-2 pointer-events-none"></div>`;
-const COMMON_TOAST_JS = `
-		function showToast(message, type = 'success') {
-			const container = document.getElementById('toast-container');
-			const toast = document.createElement('div');
-			const colors = type === 'error' 
-				? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
-				: 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
-			toast.className = 'px-4 py-3 border rounded-md shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
-			toast.innerText = message;
-			container.appendChild(toast);
-			requestAnimationFrame(() => {
-				toast.classList.remove('-translate-y-full', 'opacity-0');
-			});
-			setTimeout(() => {
-				toast.classList.add('-translate-y-full', 'opacity-0');
-				setTimeout(() => toast.remove(), 300);
-            }, 3000);
-        }
-        window.alert = function(message) {
-            const msgStr = message ? message.toString() : '';
-            if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
-                showToast(msgStr, 'error');
-            } else {
-                showToast(msgStr, 'success');
-            }
-        };
-`;
-const HTML_TEMPLATES = {
-	nginx: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>دسترسی به پـنـل</title>
-    ${COMMON_HEAD}
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-8 text-center flex flex-col items-center gap-4">
-        <div class="p-4 bg-blue-50 dark:bg-blue-900/20 text-blue-500 rounded-full mb-2">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        </div>
-        <h2 class="text-xl font-bold text-gray-900 dark:text-white">ورود به پـنـل مدیریت</h2>
-        <p class="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mt-2">
-            برای ورود به پـنـل، لطفاً عبارت 
-            <span class="inline-block px-2 py-1 bg-gray-100 dark:bg-amoled-input border border-gray-200 dark:border-zinc-800 rounded-md font-mono text-blue-500 font-bold mx-1 shadow-sm" dir="ltr">/panel</span> 
-            را به انتهای آدرس مرورگر خود اضافه کنید.
-        </p>
-        <button onclick="window.location.href='/panel'" class="mt-4 w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition-colors duration-200 shadow-lg font-bold">
-            ورود به پـنـل
-        </button>
-    </div>
-</body>
-</html>`,
-	setup: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>تعریف رمز عبور پـنـل</title>
-    ${COMMON_HEAD}
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-6">
-        <h2 class="text-xl font-bold mb-2 text-center text-blue-600 dark:text-blue-400">تنظیم رمز عبور جدید</h2>
-        <p class="text-sm text-gray-500 dark:text-gray-400 text-center mb-6">این اولین ورود شما به پـنـل مدیریت است. لطفاً رمز عبور خود را تعیین کنید.</p>
-        <form onsubmit="handleSetup(event)" class="space-y-4">
-            <div>
-                <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
-            </div>
-            <div>
-                <label class="block text-sm font-medium mb-1.5">تکرار رمز عبور</label>
-                <input type="password" id="confirm-password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required minlength="4">
-            </div>
-            <button type="submit" id="submit-btn" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">ثبت و ورود</button>
-        </form>
-    </div>
-    ${COMMON_TOAST_HTML}
-    <script>
-        ${COMMON_TOAST_JS};
-        async function handleSetup(event) {
-            event.preventDefault();
-            const password = document.getElementById('password').value;
-            const confirmPassword = document.getElementById('confirm-password').value;
-            const btn = document.getElementById('submit-btn');
-            if (password !== confirmPassword) {
-                alert('⚠️ رمز عبور و تکرار آن مطابقت ندارند!');
-                return;
-            }
-            btn.disabled = true;
-            btn.innerText = 'در حال ثبت...';
-            try {
-                const res = await fetch('/api/setup-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password })
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    alert('✅ رمز عبور با موفقیت تنظیم شد. در حال ورود...');
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 1500);
-                } else {
-                    alert('خطا: ' + (data.error || 'عملیات ناموفق بود'));
-                }
-            } catch (err) {
-                alert('خطا در ارتباط با سرور');
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'ثبت و ورود';
-            }
-        }
-    </script>
-</body>
-</html>`,
-	login: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ورود به پـنـل مدیریت</title>
-    ${COMMON_HEAD}
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex items-center justify-center p-4">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl p-6">
-        <div id="login-section">
-            <h2 class="text-xl font-bold mb-6 text-center text-blue-600 dark:text-blue-400">ورود به پـنـل مدیریت</h2>
-            <form onsubmit="handleLogin(event)" class="space-y-4">
-                <div>
-                    <label class="block text-sm font-medium mb-1.5">رمز عبور</label>
-                    <input type="password" id="password" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm text-center font-mono" required>
-                </div>
-                <button type="submit" id="submit-btn" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">ورود</button>
-            </form>
-            <div class="mt-4 text-center">
-                <button onclick="toggleRecovery(true)" class="text-xs text-blue-500 hover:text-blue-600 transition font-medium">بازیابی رمز پـنـل</button>
-            </div>
-        </div>
-        <div id="recovery-section" class="hidden">
-            <h2 class="text-xl font-bold mb-4 text-center text-orange-600 dark:text-orange-400">بازیابی رمز پـنـل</h2>
-            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300">
-                برای احراز هویت و اثبات مالکیت پـنـل، از طریق دکمه زیر وارد کلودفلر شوید و توکن دریافتی را کپی کرده و در کادر زیر وارد کنید.
-                <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="mt-3 w-full flex items-center justify-center gap-2 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 rounded-md font-bold transition shadow-md">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
-                    دریافت توکن
-                </a>
-            </div>
-            <form onsubmit="handleRecovery(event)" class="space-y-4">
-                <div>
-                    <input type="password" id="api-token" placeholder="توکن را وارد کنید" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-xs text-center font-mono" required>
-                </div>
-                <div class="flex gap-2 pt-2">
-                    <button type="button" onclick="toggleRecovery(false)" class="w-1/3 py-2.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition shadow-sm">انصراف</button>
-                    <button type="submit" id="recover-btn" class="w-2/3 py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition font-bold">بازیابی رمز پـنـل</button>
-                </div>
-            </form>
-        </div>
-    </div>
-    ${COMMON_TOAST_HTML}
-    <script>
-        ${COMMON_TOAST_JS}
-        async function handleLogin(event) {
-            event.preventDefault();
-            const password = document.getElementById('password').value;
-            const btn = document.getElementById('submit-btn');
-            btn.disabled = true;
-            try {
-                const res = await fetch('/api/login', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ password })
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    window.location.reload();
-                } else {
-                    alert('❌ رمز عبور اشتباه است');
-                }
-            } catch (err) {
-                alert('خطا در ارتباط با سرور');
-            } finally {
-                btn.disabled = false;
-            }
-        }
-        function toggleRecovery(show) {
-            document.getElementById('login-section').classList.toggle('hidden', show);
-            document.getElementById('recovery-section').classList.toggle('hidden', !show);
-        }
-        async function handleRecovery(event) {
-            event.preventDefault();
-            const apiToken = document.getElementById('api-token').value;
-            const btn = document.getElementById('recover-btn');
-            btn.disabled = true;
-            btn.innerText = 'در حال بررسی...';
-            try {
-                const res = await fetch('/api/recover', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ api_token: apiToken })
-                });
-                const data = await res.json();
-                if (res.ok && data.success) {
-                    alert('✅ رمز عبور با موفقیت حذف شد. در حال انتقال به صفحه تنظیمات اولیه...');
-                    setTimeout(() => {
-                        window.location.reload();
-                    }, 1500);
-                } else {
-                    alert('❌ ' + (data.error || 'خطا در تایید اطلاعات'));
-                }
-            } catch (err) {
-                alert('خطا در ارتباط با سرور');
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'بازیابی رمز پـنـل';
-            }
-        }
-    </script>
-</body>
-</html>`,
-	panel: `
-<!DOCTYPE html>
-<html lang="fa" dir="rtl">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Z E U S</title>
-    <script>
-        const originalWarn = console.warn;
-        console.warn = (...args) => {
-            if (typeof args[0] === 'string' && args[0].includes('cdn.tailwindcss.com')) return;
-            originalWarn(...args);
-        };
-    </script>
-    ${COMMON_HEAD}
-    <style>
-        body { font-family: 'Vazirmatn', sans-serif; }
-		.dark input[type="checkbox"] {
-            filter: invert(1) hue-rotate(180deg);
-        }
-        ::-webkit-scrollbar {
-            width: 6px;
-            height: 6px;
-        }
-        ::-webkit-scrollbar-track {
-            background: #f3f4f6; 
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb {
-            background: #d1d5db; 
-            border-radius: 4px;
-        }
-        ::-webkit-scrollbar-thumb:hover {
-            background: #9ca3af;
-        }
-        .dark ::-webkit-scrollbar-track {
-            background: #000105; 
-        }
-        .dark ::-webkit-scrollbar-thumb {
-            background: #102040; 
-        }
-        .dark ::-webkit-scrollbar-thumb:hover {
-            background: #172e5c;
-        }
-        * {
-            scrollbar-width: thin;
-            scrollbar-color: #d1d5db #f3f4f6;
-        }
-        .dark * {
-            scrollbar-color: #102040 #000105;
-        }
-        @media (min-width: 769px) {
-            header, main { zoom: 1.18; }
-        }
-        @media (max-width: 768px) {
-            header, main { zoom: 0.90; }
-        }
-        input[type="number"]::-webkit-outer-spin-button,
-        input[type="number"]::-webkit-inner-spin-button {
-            -webkit-appearance: none;
-            margin: 0;
-        }
-        input[type="number"] {
-            -moz-appearance: textfield;
-        }
-    </style>
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen transition-colors duration-200">
-    <header class="border-b border-gray-200 dark:border-amoled-border bg-white dark:bg-amoled-card px-4 py-4">
-        <div class="max-w-6xl mx-auto flex flex-col md:flex-row justify-between items-center gap-4">
-            <div class="flex flex-row flex-wrap justify-center items-center gap-3 w-full md:w-auto">
-                <h1 class="text-lg font-bold flex items-center gap-2" dir="ltr">
-                    ⚡️ Z E U S
-                    <span id="panel-version" class="text-xs px-2 py-0.5 font-semibold bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400 rounded-full">v1.5.10</span>
-                </h1>
-                <div class="flex items-center gap-3 bg-gray-100 dark:bg-zinc-800/60 px-3 py-1.5 rounded-full border border-gray-200 dark:border-zinc-800/80 shadow-sm flex-shrink-0 w-fit">
-                    <a href="https://github.com/zeus-panel/ZEUS-PANEL" target="_blank" rel="noopener noreferrer" class="text-gray-600 hover:text-gray-800 dark:text-gray-400 dark:hover:text-gray-200 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="GitHub">
-                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/>
-                        </svg>
-                    </a>
-                    <a href="https://t.me/PANEL_ZEUS" target="_blank" rel="noopener noreferrer" class="text-sky-500 hover:text-sky-600 dark:hover:text-sky-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Telegram">
-                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="currentColor">
-                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
-                        </svg>
-                    </a>
-                    <a href="https://t.me/ZEUS_PANEL_BOT" target="_blank" rel="noopener noreferrer" class="text-emerald-500 hover:text-emerald-600 dark:hover:text-emerald-400 transition-all transform hover:scale-125 duration-200 flex-shrink-0" title="Bot">
-                        <svg class="w-[22px] h-[22px] flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M12 8V4H8"/>
-                            <rect width="16" height="12" x="4" y="8" rx="2"/>
-                            <path d="M2 14h2"/>
-                            <path d="M20 14h2"/>
-                            <path d="M15 13v2"/>
-                            <path d="M9 13v2"/>
-                        </svg>
-                    </a>
-                </div>
-            </div>
-            <div class="flex items-center justify-center gap-3 w-full md:w-auto mt-2 md:mt-0">
-                <button onclick="toggleSupportModal(true)" 
-                        class="p-2 rounded-md 
-                               bg-red-50 dark:bg-red-950/30 
-                               border border-red-200 dark:border-red-900 
-                               hover:bg-red-100 dark:hover:bg-red-900/50 
-                               transition-all duration-200 
-                               text-red-600 dark:text-red-400 shadow-sm" 
-                        title="حمایت از ما">
-                    <svg class="w-5 h-5 animate-pulse" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12z" />
-                    </svg>
-                </button>
-				<button onclick="restartCore()"
-                        class="p-2 rounded-md 
-                               bg-blue-50 dark:bg-blue-950/30 
-                               border border-blue-200 dark:border-blue-900 
-                               hover:bg-blue-100 dark:hover:bg-blue-900/50 
-                               transition-all duration-200 
-                               text-blue-600 dark:text-blue-400 shadow-sm" 
-                        title="ری استارت پـنـل">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path>
-                    </svg>
-                </button>
-                <button id="theme-toggle" 
-                        class="p-2 rounded-md 
-                               bg-amber-50 dark:bg-amber-950/30 
-                               border border-amber-200 dark:border-amber-900 
-                               hover:bg-amber-100 dark:hover:bg-amber-900/50 
-                               transition-all duration-200 
-                               text-amber-500 dark:text-amber-400 shadow-sm"
-                        title="تغییر تم">
-                    <svg id="sun-icon" class="w-5 h-5 hidden dark:block" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14 12a2 2 0 11-4 0 2 2 0 014 0z"></path>
-                    </svg>
-                    <svg id="moon-icon" class="w-5 h-5 block dark:hidden" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20.354 15.354A9 9 0 018.646 3.646 9.003 9.003 0 0012 21a9.003 9.003 0 008.354-5.646z"></path>
-                    </svg>
-                </button>
-                <button id="update-toggle" onclick="checkForUpdates(true)" 
-                        class="p-2 rounded-md 
-                               bg-green-50 dark:bg-green-950/30 
-                               border border-green-200 dark:border-green-900 
-                               hover:bg-green-100 dark:hover:bg-green-900/50 
-                               transition-all duration-200 
-                               text-green-700 dark:text-green-500 
-                               relative shadow-sm" 
-                        title="آپدیت">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 11l3-3m0 0l3 3m-3-3v8m0-13a9 9 0 110 18 9 9 0 010-18z"></path>
-                    </svg>
-                    <span id="update-badge" class="absolute top-0 right-0 w-2.5 h-2.5 bg-red-500 border-2 border-green-50 dark:border-green-900 rounded-full hidden animate-pulse"></span>
-                </button>
-                <button onclick="toggleSettingsModal(true)" 
-                        class="p-2 rounded-md 
-                               bg-gray-50 dark:bg-zinc-800/50 
-                               border border-gray-200 dark:border-zinc-700 
-                               hover:bg-gray-100 dark:hover:bg-zinc-700/80 
-                               transition-all duration-200 
-                               text-gray-600 dark:text-zinc-400 shadow-sm" 
-                        title="تنظیمات">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path>
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path>
-                    </svg>
-                </button>
-                <button 
-                    onclick="logoutAdmin()" 
-                    class="p-2 rounded-md 
-                           bg-red-50 dark:bg-red-950/30 
-                           border border-red-200 dark:border-red-900 
-                           hover:bg-red-100 dark:hover:bg-red-900/50 
-                           transition-all duration-200 
-                           text-red-600 dark:text-red-400 
-                           shadow-sm hover:shadow-md"
-                    title="خروج">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path>
-                    </svg>
-                </button>
-            </div>
-        </div>
-    </header>
-    <main class="max-w-6xl mx-auto px-4 py-8 pb-56 md:pb-32">
-<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-6">
-    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-indigo-400 dark:hover:border-indigo-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-indigo-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-        <div class="flex items-center justify-between relative z-10">
-            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">تعداد کل کاربران</span>
-            <div class="p-1 bg-indigo-50 dark:bg-indigo-950/30 text-indigo-600 dark:text-indigo-400 rounded-md flex-shrink-0">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-            </div>
-        </div>
-        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
-            <div class="text-lg font-black text-gray-900 dark:text-zinc-100 transition-all leading-none" id="stat-total-users">0</div>
-            <span class="text-[9px] text-indigo-500 dark:text-indigo-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
-                <span class="w-1 h-1 bg-indigo-500 rounded-full animate-ping"></span>
-                کل کاربران تعریف شده
-            </span>
-        </div>
-    </div>
-    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-emerald-400 dark:hover:border-emerald-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-emerald-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-        <div class="flex items-center justify-between relative z-10">
-            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap flex items-center gap-1">
-                <span>کاربران فعال (آنلاین)</span>
-                <button type="button" onclick="openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                </button>
-            </span>
-            <div class="p-1 bg-emerald-50 dark:bg-emerald-950/30 text-emerald-600 dark:text-emerald-400 rounded-md flex-shrink-0">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-            </div>
-        </div>
-        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
-            <div class="text-lg font-black text-emerald-600 dark:text-emerald-400 transition-all leading-none" id="stat-active-users">0</div>
-            <span class="text-[9px] text-emerald-500 dark:text-emerald-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none mb-0.5">
-                <span class="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse"></span>
-                متصل در این لحظه
-            </span>
-        </div>
-    </div>
-    <div id="card-cf-requests" class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-orange-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-        <div class="flex items-center justify-between relative z-10">
-            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ریکوئست‌های روزانه</span>
-            <div class="p-1 bg-orange-50 dark:bg-orange-950/30 text-orange-600 dark:text-orange-400 rounded-md flex-shrink-0">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"></path></svg>
-            </div>
-        </div>
-        <div class="relative z-10 min-w-0 flex-1 w-full mt-0.5">
-            <div class="flex items-end justify-between w-full mb-1.5">
-                <div class="flex items-baseline gap-1">
-                    <span class="text-lg font-black text-orange-600 dark:text-orange-400 transition-all leading-none" id="stat-cf-requests">0</span>
-                    <span class="text-[9px] font-bold text-gray-400 mr-0.5 leading-none">/ 100k</span>
-                    <button id="cf-warning-btn" onclick="openUsageWarning()" class="hidden flex items-center justify-center w-3 h-3 bg-red-100 dark:bg-red-900/40 text-red-600 dark:text-red-400 rounded-full font-bold text-[9px] animate-bounce shadow-sm border border-red-300 dark:border-red-700 mr-1 leading-none">!</button>
-                </div>
-                <span class="text-[9px] text-orange-500 dark:text-orange-400 flex items-center gap-1 font-medium whitespace-nowrap leading-none">
-                    <span>Total: <span id="stat-cf-total">0</span></span>
-                </span>
-            </div>
-            <div class="w-full bg-gray-100 dark:bg-zinc-800 rounded-full h-1">
-                <div id="stat-cf-progress" class="bg-orange-500 h-1 rounded-full transition-all duration-500" style="width: 0%"></div>
-            </div>
-        </div>
-    </div>
-    <div class="bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-blue-400 dark:hover:border-blue-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]">
-        <div class="absolute -right-4 -bottom-4 w-16 h-16 bg-blue-500/10 rounded-full blur-xl group-hover:scale-150 transition duration-500"></div>
-        <div class="flex items-center justify-between relative z-10">
-            <span class="text-[11px] sm:text-xs font-semibold text-gray-500 dark:text-zinc-400 whitespace-nowrap">ترافیک مصرفی سرور</span>
-            <div class="p-1 bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400 rounded-md flex-shrink-0">
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-            </div>
-        </div>
-        <div class="flex items-end justify-between relative z-10 w-full mt-0.5">
-            <div class="text-lg font-black text-blue-600 dark:text-blue-400 transition-all whitespace-nowrap leading-none" id="stat-total-usage">0 GB</div>
-            <span class="text-[9px] text-blue-500 dark:text-blue-400 flex items-center gap-0.5 font-medium whitespace-nowrap leading-none mb-0.5">
-                <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"></path></svg>
-                مجموع
-            </span>
-        </div>
-    </div>
-</div>
-        <div id="loading-state" class="text-center py-12">
-            <span class="text-gray-500 dark:text-gray-400">در حال بارگذاری کاربران...</span>
-        </div>
-        <div class="mb-5 flex flex-col md:flex-row gap-2 justify-between items-center bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2 shadow-sm">
-            <div class="relative w-full md:w-80">
-                <input type="text" id="search-input" oninput="filterAndRenderUsers()" placeholder="جستجوی نام کاربری یا UUID..." class="w-full pl-3 pr-8 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs">
-                <div class="absolute inset-y-0 right-0 flex items-center pr-2.5 pointer-events-none text-gray-400">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"></path></svg>
-                </div>
-            </div>
-            <div class="flex items-center gap-2 w-full md:w-auto">
-                <select id="filter-status" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
-                    <option value="all">🔍 همه</option>
-					<option value="active">✅ فعال</option>
-                    <option value="inactive">❌ غیرفعال</option>
-                    <option value="online">⚡ آنلاین</option>
-                    <option value="offline">💤 آفلاین</option>
-                    <option value="expired">⏳ منقضی</option>
-                </select>
-                <select id="sort-users" onchange="filterAndRenderUsers()" class="flex-1 min-w-0 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer truncate">
-                    <option value="newest">📅 جدیدترین</option>
-                    <option value="name">🔤 نام کاربری (الفبا)</option>
-                    <option value="usage-desc">📊 بیشترین مصرف</option>
-                    <option value="usage-asc">📈 کمترین مصرف</option>
-                    <option value="expiry-asc">⏳ کمترین زمان باقی‌مانده</option>
-                </select>
-            </div>
-        </div>
-		<div class="flex items-center justify-between mb-4">
-			<h2 class="text-lg font-bold text-gray-800 dark:text-zinc-200">لیست کاربران</h2>
-			<button onclick="openCreateModal()" class="p-2 rounded-md bg-blue-50 dark:bg-blue-900/30 border-2 border-blue-200 dark:border-blue-800/50 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition-all duration-300 text-blue-600 dark:text-blue-400 shadow-sm hover:shadow hover:scale-110">
-    			<svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 4v16m8-8H4"></path></svg>
-			</button>
-		</div>
-        <div id="users-table-container" class="hidden overflow-x-auto border border-gray-200 dark:border-amoled-border rounded-md bg-white dark:bg-amoled-card">
-            <table class="w-full text-right border-collapse">
-                <thead>
-                    <tr class="bg-gray-100 dark:bg-zinc-900/50 border-b border-gray-200 dark:border-amoled-border text-xs text-gray-500 dark:text-gray-400 text-center">
-                        <th class="p-2 w-10 text-center"><input type="checkbox" id="select-all-users" onchange="toggleSelectAllUsers(this)" class="w-5 h-5 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95"></th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">وضعیت</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">عملیات</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">لینک ساب</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">
-                            <div class="flex items-center justify-center gap-1">
-                                <span>تعداد کانفیگ‌ها</span>
-                                <button type="button" onclick="openConfigCountWarning();" class="text-amber-500 hover:text-amber-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
-                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                </button>
-                            </div>
-                        </th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">پورت</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">حجم</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">ریکوئست</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">زمان</th>
-                        <th class="p-2 border-r border-gray-200 dark:border-zinc-800">
-                            <div class="flex items-center justify-center gap-1">
-                                <span>کاربران آنلاین</span>
-                                <button type="button" onclick="openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
-                                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                </button>
-                            </div>
-                        </th>
-                    </tr>
-                </thead>
-                <tbody id="users-tbody" class="divide-y divide-gray-150 dark:divide-amoled-border text-sm"></tbody>
-            </table>
-        </div>
-        <div id="empty-state" class="hidden p-8 border-2 border-dashed border-red-500/60 dark:border-red-500/50 bg-red-50 dark:bg-red-900/10 rounded-md text-center animate-pulse shadow-sm">
-            <p class="text-red-600 dark:text-red-400 font-bold text-lg">کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه « + » کلیک کنید.</p>
-        </div>
-    </main>
-<div id="usage-warning-modal" class="fixed inset-0 z-[80] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-orange-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-orange-100 dark:bg-orange-900/30 text-orange-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">هشدار محدودیت درخواست روزانه</h3>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            درخواست‌های روزانه کلودفلر شما از ۹۰,۰۰۰ عبور کرده است. در صورت عبور از محدودیت رایگان ۱۰۰,۰۰۰ درخواست، دسترسی به پـنـل و اتصالات تا ساعت ۳:۳۰ بامداد (به وقت ایران) قطع خواهد شد.
-        </p>
-        <button onclick="closeUsageWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
-            متوجه شدم
-        </button>
-    </div>
-</div>
-<div id="free-panel-warning-modal" class="fixed inset-0 z-[85] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-rose-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-rose-100 dark:bg-rose-900/30 text-rose-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">پیام همگانی</h3>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            این پـنـل کاملاً <span class="text-rose-500 font-bold">رایگان</span> است. هرگونه فروش پـنـل یا کـانفـیگ‌های آن مصداق کلاه‌برداری و رفتاری دور از انسانیت و شرافت است. لطفاً از این ابزار فقط به صورت شخصی و رایگان استفاده کنید.
-        </p>
-        <button onclick="closeFreePanelWarning()" class="w-full py-3.5 bg-transparent border-2 border-green-800 text-green-900 hover:bg-green-800 hover:text-white dark:border-green-800 dark:text-green-700 dark:hover:bg-green-900 dark:hover:text-white font-black rounded-md text-sm transition duration-300 shadow-lg">
-            تأیید و موافقت
-        </button>
-    </div>
-</div>
-<div id="global-message-modal" class="fixed inset-0 z-[86] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-blue-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-4">پیام همگانی</h3>
-        <div id="global-message-content" class="mb-6 w-full text-center">
-        </div>
-        <button id="global-message-close-btn" class="w-full py-3.5 bg-transparent border-2 border-blue-600 text-blue-700 hover:bg-blue-900/20 hover:text-blue-800 dark:border-blue-500 dark:text-blue-500 dark:hover:bg-blue-900/40 dark:hover:text-blue-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
-            متوجه شدم
-        </button>
-    </div>
-</div>
-<div id="online-counter-warning-modal" class="fixed inset-0 z-[87] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">هشدار شمارنده آنلاین</h3>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-			به دلیل ماهیت ساختار کلودفلر، آمار شمارنده کاربران آنلاین با دقت مطلق محاسبه نمی‌شود؛ همچنین ارسال پینگ یا بررسی مداوم کانفیگ‌ها توسط کلاینت ممکن است به صورت موقت منجر به نمایش افزایش کاذب تعداد کاربران فعال گردد.        </p>
-        <button onclick="closeOnlineCounterWarning()" class="w-full py-3.5 bg-transparent border-2 border-red-600 text-red-700 hover:bg-red-900/20 hover:text-red-800 dark:border-red-500 dark:text-red-500 dark:hover:bg-red-900/40 dark:hover:text-red-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
-            متوجه شدم
-        </button>
-    </div>
-</div>
-<div id="config-count-warning-modal" class="fixed inset-0 z-[88] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-amber-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-amber-100 dark:bg-amber-900/30 text-amber-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">محاسبه تعداد کانفیگ‌ها</h3>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-4 leading-relaxed font-medium">
-            تعداد کل کانفیگ‌های ساخته شده برای هر کاربر، دقیقاً از این فرمول به دست می‌آید:
-        </p>
-        <div class="bg-gray-50 dark:bg-zinc-800/50 border border-gray-200 dark:border-zinc-700 rounded-md p-3 mb-4 text-xs font-bold text-gray-800 dark:text-zinc-200 text-center shadow-inner" dir="rtl">
-            تعداد کل = (تعداد پروکسی ها) × (تعداد آی‌پی تمیز) × (تعداد پورت)
-        </div>
-        <div class="text-[11px] text-amber-700 dark:text-amber-500 mb-6 leading-relaxed font-bold bg-amber-50 dark:bg-amber-950/20 p-3 rounded text-right border border-amber-200 dark:border-amber-900/50">
-            ⚠️ <b>توصیه مهم:</b> برای جلوگیری از طولانی شدن لیست کانفیگ‌ها و در نتیجه سنگین شدن و هنگ کردن نرم‌افزار کاربر، پیشنهاد می‌شود پورت‌های کمتری انتخاب کنید و تعداد آی‌پی‌های تمیز را در حد معقول نگه دارید.
-        </div>
-        <button onclick="closeConfigCountWarning()" class="w-full py-3.5 bg-transparent border-2 border-amber-600 text-amber-700 hover:bg-amber-900/20 hover:text-amber-800 dark:border-amber-500 dark:text-amber-500 dark:hover:bg-amber-900/40 dark:hover:text-amber-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
-            متوجه شدم
-        </button>
-    </div>
-</div>
-    <div id="user-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
-        <div id="user-modal-card" class="w-full max-w-xl lg:max-w-[1200px] bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-[opacity,transform] duration-200 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh] transform-gpu" style="will-change: transform, opacity;">
-            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50/50 dark:bg-amoled-bg">
-                <div class="flex items-center gap-2">
-                    <div class="w-2.5 h-2.5 rounded-full bg-blue-500"></div>
-                    <h3 id="modal-title" class="font-bold text-gray-900 dark:text-zinc-100 text-base">ایجاد کاربر جدید</h3>
-                </div>
-                <button onclick="toggleModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                </button>
-            </div>
-            <form id="create-user-form" class="p-4 flex flex-col overflow-y-auto flex-1 overscroll-contain" style="-webkit-overflow-scrolling: touch; transform: translate3d(0,0,0); will-change: scroll-position, transform;" onsubmit="handleFormSubmit(event)">
-				<input type="hidden" id="hidden-auto-rotate" value="0">
-				<input type="hidden" id="hidden-rotate-time" value="">
-				<input type="hidden" id="hidden-ip-operator" value="all">
-				<input type="hidden" id="hidden-ip-count" value="20">
-                <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 lg:gap-6 flex-1">
-                    <div class="flex flex-col gap-3">
-                        <div class="space-y-2.5">
-                            <div>
-                                <label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">نام کاربری</label>
-                                <div class="relative">
-                                    <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
-                                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"></path></svg>
-                                    </span>
-                                    <input type="text" id="input-name" oninput="this.value = this.value.replace(/[^a-zA-Z0-9_-]/g, '')" placeholder="Z_E_U_S" maxlength="32" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition" required>
-                                </div>
-                            </div>
-                            <div class="grid grid-cols-2 gap-2.5">
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">حجم (GB)</label>
-                                    <div class="relative">
-                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
-                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                                        </span>
-                                        <input type="number" id="input-limit" min="0" step="any" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
-                                    </div>
-                                </div>
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان (روز)</label>
-                                    <div class="relative">
-                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
-                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                        </span>
-                                        <input type="number" id="input-expiry" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
-                                    </div>
-                                </div>
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">سقف ریکوئست</label>
-                                    <div class="relative">
-                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
-                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                                        </span>
-                                        <input type="number" id="input-req-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
-                                    </div>
-                                </div>
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider flex items-center gap-1">
-                                        <span>محدودیت کاربر</span>
-                                        <button type="button" onclick="event.preventDefault(); event.stopPropagation(); openOnlineCounterWarning();" class="text-red-500 hover:text-red-400 transition-transform hover:scale-110 cursor-pointer inline-flex items-center" title="هشدار">
-                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-                                        </button>
-                                    </label>
-                                    <div class="relative">
-                                        <span class="absolute inset-y-0 right-0 flex items-center pr-3 pointer-events-none text-gray-400">
-                                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-                                        </span>
-                                        <input type="number" id="input-ip-limit" min="0" placeholder="نامحدود" class="w-full pl-3 pr-9 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-semibold text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition">
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="flex flex-col gap-3 border border-gray-100 dark:border-amoled-border p-3 rounded-md bg-gray-50 dark:bg-amoled-input">
-                            <div class="flex items-center justify-between">
-                                <div class="flex items-center gap-2">
-                                    <svg class="w-4 h-4 text-gray-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                    <span class="text-[11px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">تمدید خودکار (۳:۳۰ بامداد)</span>
-                                </div>
-                                <label class="relative inline-flex items-center cursor-pointer select-none">
-                                    <input type="checkbox" id="input-auto-reset-toggle" onchange="toggleAutoResetInputs(this.checked)" class="sr-only peer">
-                                    <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
-                                </label>
-                            </div>
-                            <div id="auto-reset-inputs-container" class="grid grid-cols-2 gap-2 transition-all duration-300 pt-2 border-t border-gray-100 dark:border-amoled-border opacity-50 pointer-events-none">
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان تمدید حجم (روز)</label>
-                                    <input type="number" id="input-auto-reset-vol" min="1" placeholder="خالی = بدون تمدید" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr" disabled>
-                                </div>
-                                <div>
-                                    <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1 uppercase tracking-wider">زمان تمدید ریکوئست (روز)</label>
-                                    <input type="number" id="input-auto-reset-req" min="1" placeholder="خالی = بدون تمدید" class="w-full px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-center text-gray-800 dark:text-zinc-100 transition" dir="ltr" disabled>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
-                                <div class="flex items-center justify-between mb-2">
-                                    <span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">Fragment</span>
-                                    <label class="relative inline-flex items-center cursor-pointer select-none">
-                                        <input type="checkbox" id="input-frag-toggle" onchange="toggleFragInputs(this.checked)" class="sr-only peer" checked>
-                                        <div class="w-9 h-5 bg-gray-200 rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
-                                    </label>
-                                </div>
-                                <div id="frag-inputs-container" class="grid grid-cols-2 gap-1.5 transition-all duration-300">
-                                    <input type="text" id="input-frag-len" placeholder="Len" value="200-3000" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
-                                    <input type="text" id="input-frag-int" placeholder="Int" value="1-2" dir="ltr" class="w-full px-1.5 py-1 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-mono text-center text-gray-800 dark:text-zinc-100">
-                                </div>
-                            </div>
-                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
-                                <label class="block text-[10px] font-bold text-gray-500 dark:text-zinc-400 mb-1.5 uppercase tracking-wider">Fingerprint</label>
-                                <div class="relative">
-                                    <select id="fingerprint-select" class="w-full px-2 py-1.5 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 text-[10px] font-semibold text-gray-700 dark:text-zinc-300 cursor-pointer appearance-none">
-                                        <option value="chrome">🌐 Chrome</option>
-                                        <option value="firefox">🦊 Firefox</option>
-                                        <option value="safari">🧭 Safari</option>
-                                        <option value="ios" selected>📱 iOS (پیشنهادی)</option>
-                                        <option value="android">🤖 Android</option>
-                                        <option value="edge">🌀 Edge</option>
-                                        <option value="360">🔒 360 Browser</option>
-                                        <option value="qq">💬 QQ Browser</option>
-                                        <option value="random">🎲 Random</option>
-                                        <option value="randomized">🎭 Dynamic</option>
-                                    </select>
-                                    <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-2 text-gray-500">
-                                        <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
-                                    </div>
-                                </div>
-                            </div>
-                        </div>
-                        <div class="grid grid-cols-2 gap-2">
-                            <div class="flex items-center justify-between bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md p-1.5 shadow-sm">
-                                <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">NSFW BLOCKER</span>
-                                <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
-                                    <input type="checkbox" id="input-block-porn" class="sr-only peer">
-                                    <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
-                                </label>
-                            </div>
-                            <div class="flex items-center justify-between bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md p-1.5 shadow-sm">
-                                <span class="text-[10px] sm:text-xs font-semibold text-gray-700 dark:text-zinc-300 whitespace-nowrap pl-1">ADS BLOCKER</span>
-                                <label class="relative inline-flex items-center cursor-pointer scale-[0.65] sm:scale-75 origin-left">
-                                    <input type="checkbox" id="input-block-ads" class="sr-only peer">
-                                    <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
-                                </label>
-                            </div>
-                        </div>
-                    </div>
-                    <div class="flex flex-col pt-4 lg:pt-0 border-t-2 lg:border-t-0 lg:border-x-2 border-gray-300 dark:border-amoled-border lg:px-4 h-full">
-                        <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 mb-3 uppercase tracking-wider">پورت‌های اتصال</label>
-                        <div class="grid grid-cols-2 gap-2 md:gap-4">
-                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm flex flex-col">
-                                <div class="flex items-center gap-1.5 mb-2">
-                                    <span class="flex h-2 w-2 rounded-full bg-blue-500 shadow-sm"></span>
-                                    <span class="text-[11px] font-bold text-blue-600 dark:text-blue-400">🔒TLS PORT</span>
-                                </div>
-                                <div class="grid grid-cols-3 gap-1.5 flex-1 content-start" id="tls-ports-list"></div>
-                            </div>
-                            <div class="p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm flex flex-col">
-                                <div class="flex items-center gap-1.5 mb-2">
-                                    <span class="flex h-2 w-2 rounded-full bg-amber-500 shadow-sm"></span>
-                                    <span class="text-[11px] font-bold text-amber-600 dark:text-amber-400">🔓Non-TLS PORT</span>
-                                </div>
-                                <div class="grid grid-cols-3 gap-1.5 flex-1 content-start" id="nontls-ports-list"></div>
-                            </div>
-                        </div>
-                        <div class="mt-4 p-3 bg-gray-50 dark:bg-amoled-input border border-gray-200/60 dark:border-amoled-border rounded-md shadow-sm">
-                            <div class="flex items-center gap-1.5 mb-2">
-                                <span class="flex h-2 w-2 rounded-full bg-green-600 shadow-sm"></span>
-                                <span class="text-[11px] font-bold text-green-700 dark:text-green-500">⚙️ پورت‌های دلخواه (با فاصله جدا کنید)</span>
-                            </div>
-                            <input type="text" id="input-custom-ports" placeholder="8080 2096 5000" dir="ltr" class="w-full px-2 py-2 bg-white dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-left text-gray-800 dark:text-zinc-100 transition">
-                        </div>
-                        <div class="flex flex-col flex-1 mt-4 pt-4 border-t-2 border-gray-300 dark:border-amoled-border">
-                            <div class="flex items-center justify-between mb-2">
-                                <label class="block text-xs font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">آیپی تمیز (توصیه میشود)</label>
-                                <button type="button" onclick="openIpSelectorModal()" class="px-2.5 py-1 bg-amber-50 dark:bg-amber-950/60 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/70 border border-amber-400 dark:border-amber-600 rounded-md text-xs font-bold transition-all">مخزن آیپی تمیز</button>
-                            </div>
-                            <textarea id="input-ips" placeholder="104.16.0.1" class="w-full h-full min-h-[80px] flex-1 px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500/50 text-xs font-mono text-gray-800 dark:text-zinc-100 placeholder-gray-400/80 transition resize-none"></textarea>
-                        </div>
-                    </div>
-                    <div class="flex flex-col gap-2 pt-4 lg:pt-0 border-t-2 lg:border-t-0 border-gray-300 dark:border-amoled-border justify-between">
-                        <div class="flex flex-col flex-1">
-                            <div class="flex items-center gap-2 mb-3">
-                                <label class="relative inline-flex items-center cursor-pointer select-none flex-shrink-0">
-                                    <input type="checkbox" id="user-proxy-mode-toggle" onchange="toggleUserProxyMode(this.checked)" class="sr-only peer">
-                                    <div class="w-7 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-3 after:w-3 after:transition-all dark:border-gray-600 peer-checked:bg-green-700"></div>
-                                </label>
-                                <label class="block text-xs sm:text-sm font-bold text-gray-700 dark:text-zinc-300 cursor-pointer truncate" onclick="document.getElementById('user-proxy-mode-toggle').click()">تنظیم کشور و ثابت کردن آیپی</label>
-                            </div>
-                            <div class="grid grid-cols-2 gap-2 mb-2 w-full">
-                                <button type="button" onclick="toggleDonateModal(true)" class="text-[11px] bg-emerald-50 dark:bg-emerald-900/30 text-emerald-600 dark:text-emerald-400 px-2 py-2 rounded border border-emerald-200 dark:border-emerald-800 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition font-black shadow-sm text-center whitespace-nowrap">اهدای پـروکـسـی شخصی ❤️</button>
-                                <a href="https://github.com/zeus-panel/ZEUS-PANEL#%EF%B8%8F-build-your-own-socks5-proxy-zeus-relay" target="_blank" class="text-[11px] bg-blue-50 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400 px-2 py-2 rounded border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50 transition font-black shadow-sm text-center whitespace-nowrap">ساخت پـروکـسـی شخصی</a>
-                            </div>
-                            <div class="mb-3 p-2 border-2 border-dashed border-red-500 bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 rounded-md text-[11px] font-bold leading-relaxed text-center w-full shadow-[0_0_15px_rgba(239,68,68,0.6)]" style="animation: pulse 1s cubic-bezier(0.4, 0, 0.6, 1) infinite, alertShake 2s infinite;">
-                                <style>@keyframes alertShake { 0%, 100% {transform: translateX(0);} 2%, 6%, 10% {transform: translateX(-3px);} 4%, 8%, 12% {transform: translateX(3px);} 14% {transform: translateX(0);} }</style>
-                                سایت‌هایی مثل <span class="text-emerald-600 dark:text-emerald-400 font-black">ChatGPT</span>، <span class="text-amber-600 dark:text-amber-400 font-black">Claude</span> و <span class="text-purple-600 dark:text-purple-400 font-black">Speedtest</span> پشت کلودفلر هستند؛ برای باز کردن این سایت‌ها حتماً باید <span class="text-blue-600 dark:text-blue-400 font-black">پـروکـسـی</span> تنظیم کنید.
-                            </div>
-                            <div class="relative transition-opacity duration-300 opacity-50 pointer-events-none flex-1 flex flex-col justify-start gap-2" id="user-socks5-container">
-                                <div id="proxies-fields-wrapper" class="flex flex-col gap-2 w-full"></div>
-                                <button type="button" id="add-proxy-field-btn" onclick="addProxyFieldUI()" class="w-full py-1.5 bg-green-50 dark:bg-green-950/30 border border-green-500 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/50 rounded text-xs font-black transition flex items-center justify-center gap-1 shadow-sm">
-                                    <span>+ افزودن کشور</span>
-                                </button>
-                                <div class="flex items-center justify-between w-full gap-2 mt-1">
-                                    <button type="button" onclick="testUserSocksProxy()" id="test-user-proxy-btn" class="flex-1 text-center text-[11px] bg-sky-50 dark:bg-sky-900/30 text-sky-600 dark:text-sky-400 py-2 rounded border border-sky-200 dark:border-sky-800 hover:bg-sky-100 dark:hover:bg-sky-900/50 transition font-bold shadow-sm">تست پـروکـسـی</button>
-                                    <button type="button" onclick="openProxySelectorModal()" class="flex-1 text-center text-[11px] bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 py-2 rounded border border-amber-200 dark:border-amber-800 hover:bg-amber-100 dark:hover:bg-amber-900/50 transition font-bold shadow-sm">مخزن پـروکـسـی</button>
-                                </div>
-                                <div class="flex items-center justify-between border border-gray-100 dark:border-amoled-border p-3 rounded-md bg-gray-50 dark:bg-amoled-input mt-1">
-                                    <div class="flex items-center gap-1.5">
-                                        <svg class="w-3.5 h-3.5 text-gray-500 dark:text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                                        <span class="text-[10px] font-bold text-gray-500 dark:text-zinc-400 uppercase tracking-wider">تعویض خودکار پـروکـسـی (پیشنهادی)</span>
-                                    </div>
-                                    <label class="relative inline-flex items-center cursor-pointer select-none">
-                                        <input type="checkbox" id="input-auto-rotate-user-proxy" class="sr-only peer">
-                                        <div class="w-8 h-4 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-3 after:w-3 after:transition-transform peer-checked:after:-translate-x-[16px]"></div>
-                                    </label>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                <div class="pt-4 flex gap-3 mt-4 border-t border-gray-200 dark:border-amoled-border">
-                    <button type="button" onclick="toggleModal(false)" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-200 shadow-sm">انصراف</button>
-                    <button type="submit" id="submit-btn" class="flex-1 py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-md hover:shadow-lg">ایجاد کاربر</button>
-                </div>
-            </form>
-        </div>
-    </div>
-<div id="ip-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
-            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن آیپی تمیز</h3>
-            <button type="button" onclick="toggleIpSelectorModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-            </button>
-        </div>
-        <div class="p-6 space-y-4">
-            <div id="ip-loading-state" class="text-center text-sm text-gray-500 dark:text-zinc-400 hidden">
-                Loading IPs...
-            </div>
-            <div id="ip-selection-form" class="space-y-4">
-                <div>
-                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">اوپراتور</label>
-                    <select id="ip-operator-select" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
-                        <option value="all">همه (توصیه شده)</option>
-                    </select>
-                </div>
-                <div>
-                    <label class="block text-xs font-medium mb-1.5 text-gray-700 dark:text-zinc-300">تعداد</label>
-                    <input type="number" id="ip-count-input" min="1" value="20" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
-                </div>
-                <div class="flex flex-col gap-2 border-t border-gray-100 dark:border-zinc-800/60 pt-3 mt-2">
-                    <div class="flex items-center justify-between">
-                        <span class="text-xs font-bold text-gray-700 dark:text-zinc-300">تعویض خودکار آیپی(توصیه میشود)</span>
-                        <label class="relative inline-flex items-center cursor-pointer select-none">
-                            <input type="checkbox" id="input-auto-rotate-ip-toggle" onchange="toggleAutoRotateIpInputs(this.checked)" class="sr-only peer">
-                            <div class="w-9 h-5 bg-gray-200 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:bg-green-600 transition-colors after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-transform peer-checked:after:-translate-x-[18px]"></div>
-                        </label>
-                    </div>
-                    <div id="auto-rotate-ip-inputs-container" class="hidden transition-all duration-300 pt-1">
-                        <label class="block text-[11px] font-bold text-gray-500 dark:text-zinc-400 mb-1">زمان تعویض (دقیقه)</label>
-                        <input type="number" id="input-auto-rotate-ip-time" min="1" placeholder="توصیه شده 5" onblur="if(this.value === '' || parseInt(this.value) < 1) this.value = '5';" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center" dir="ltr">
-                    </div>
-                </div>
-            </div>
-            <div class="pt-4 flex gap-3">
-                <button type="button" onclick="toggleIpSelectorModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">لغو</button>
-                <button type="button" onclick="applySelectedIps()" class="flex-1 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-xs transition">دریافت</button>
-            </div>
-        </div>
-    </div>
-</div>
-<div id="proxy-selector-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
-            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">مخزن پـروکـسـی‌های آی‌پی ثابت</h3>
-            <button type="button" onclick="toggleProxySelectorModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-            </button>
-        </div>
-        <div class="p-5 space-y-4">
-            <div class="p-4 bg-emerald-50 dark:bg-emerald-900/10 border border-emerald-200 dark:border-emerald-500/30 rounded-md relative">
-                <h4 class="text-[13px] font-black text-emerald-700 dark:text-emerald-400 mb-2 flex items-center gap-1.5">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z"></path></svg>
-                    پـروکـسـی‌های اختصاصی (VIP)
-                </h4>
-                <p class="text-[10px] text-emerald-600/80 dark:text-emerald-500/70 mb-3 leading-relaxed font-medium">
-                    پـروکـسـی‌های اهدایی از طرف کاربران. کیفیت بالا و بدون نیاز به اسکن.
-                </p>
-                <div class="flex flex-col sm:flex-row gap-2">
-                    <select id="vip-country-select" class="flex-1 px-3 py-2 bg-white dark:bg-amoled-input border border-emerald-200 dark:border-emerald-800/50 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
-                        <option value="">در حال بررسی مخزن...</option>
-                    </select>
-                    <button type="button" onclick="loadVipProxy()" id="vip-fetch-btn" class="sm:w-auto w-full px-4 py-2 bg-transparent border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-900/20 hover:text-emerald-800 dark:border-emerald-500 dark:text-emerald-500 dark:hover:bg-emerald-900/40 dark:hover:text-emerald-400 font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed whitespace-nowrap" disabled>
-						دریافت
-					</button>
-                </div>
-            </div>
-            <div class="relative py-1 flex items-center justify-center">
-                <span class="absolute w-full border-t border-gray-200 dark:border-zinc-800"></span>
-                <span class="bg-white dark:bg-amoled-card px-3 text-[10px] font-bold text-gray-400 relative">یا اسکن عمومی</span>
-            </div>
-            <div class="p-4 bg-gray-50 dark:bg-zinc-900/40 border border-gray-200 dark:border-amoled-border rounded-md">
-                <h4 class="text-[13px] font-black text-gray-700 dark:text-zinc-300 mb-2 flex items-center gap-1.5">
-                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 01-9 9m9-9a9 9 0 00-9-9m9 9H3m9 9a9 9 0 01-9-9m9 9c1.657 0 3-4.03 3-9s-1.343-9-3-9m0 18c-1.657 0-3-4.03-3-9s1.343-9 3-9m-9 9a9 9 0 019-9"></path></svg>
-                    پـروکـسـی های عمومی
-                </h4>
-                <p class="text-[10px] text-gray-500 dark:text-zinc-500 mb-3 leading-relaxed font-medium">
-                    جستجو در منابع رایگان؛ به دلیل نیاز به تست کیفیت زمان‌بر است.
-                </p>
-                <div id="proxy-loading-state" class="text-center text-[11px] text-blue-500 font-bold hidden my-3 whitespace-pre-line leading-relaxed">
-                    در حال اسکن...
-                </div>
-                <div id="proxy-selection-form" class="flex flex-col gap-2">
-                    <select id="proxy-country-select" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-zinc-700 rounded-md text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-300 cursor-pointer">
-                        <option value="">در حال آماده‌سازی...</option>
-                    </select>
-                    <button type="button" onclick="fetchAndLoadProxy()" id="proxy-fetch-btn" class="w-full py-2.5 bg-transparent border-2 border-blue-600 text-blue-700 hover:bg-blue-900/20 hover:text-blue-800 dark:border-blue-500 dark:text-blue-500 dark:hover:bg-blue-900/40 dark:hover:text-blue-400 font-bold rounded-md text-xs transition shadow-sm disabled:opacity-50 disabled:cursor-not-allowed" disabled>
-						شروع اسکن و یافتن پـروکـسـی
-					</button>
-                </div>
-            </div>
-            <div class="pt-1">
-				<button type="button" onclick="toggleProxySelectorModal(false)" class="w-full py-2.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">انصراف و بستن</button>
-			</div>
-        </div>
-    </div>
-</div>
-<div id="donate-modal" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out" id="donate-modal-card">
-        <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
-            <h3 class="font-bold text-gray-900 dark:text-zinc-100 text-sm">🎁 اهدای پـروکـسـی</h3>
-            <button type="button" onclick="toggleDonateModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-            </button>
-        </div>
-        <div class="p-6 space-y-4">
-            <p class="text-[11px] text-gray-600 dark:text-zinc-400 leading-relaxed font-medium">
-                اگر سرور دارید میتونید با دکمه <span class="text-blue-600 dark:text-blue-400 font-black">«ساخت پـروکـسـی شخصی»</span> یک پـروکـسـی بسازید و اهدا کنید به پروژه
-            </p>
-            <div>
-                <input type="text" id="donate-proxy-input" placeholder="user:pass@ip:port" dir="ltr" class="w-full px-3 py-2.5 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-emerald-500 text-xs font-mono text-left text-gray-900 dark:text-zinc-100 transition">
-            </div>
-            <div class="w-full text-center">
-                <span id="donate-result" class="inline-block mt-1 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden"></span>
-            </div>
-            <div class="pt-2 flex gap-3">
-                <button type="button" onclick="toggleDonateModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-xs transition shadow-sm">لغو</button>
-                <button type="button" id="donate-submit-btn" onclick="testAndDonateProxy()" class="flex-1 py-2 bg-transparent border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-900/20 hover:text-emerald-800 dark:border-emerald-500 dark:text-emerald-500 dark:hover:bg-emerald-900/40 dark:hover:text-emerald-400 font-bold rounded-md text-xs transition shadow-sm">تست و اهدا</button>
-            </div>
-        </div>
-    </div>
-</div>
-<div id="support-modal" class="fixed inset-0 z-[105] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-red-500/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-red-100 dark:bg-red-900/30 text-red-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8 animate-pulse" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M21 8.25c0-2.485-2.099-4.5-4.688-4.5-1.935 0-3.597 1.126-4.312 2.733-.715-1.607-2.377-2.733-4.313-2.733C5.1 3.75 3 5.765 3 8.25c0 7.22 9 12 9 12s9-4.78 9-12z" />
-            </svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">حمایت از زئــوس</h3>
-        <p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            این پروژه متن باز و رایگان است. برای تضمین پایداری و ادامه مسیر توسعه، نیازمند همراهی و حمایت شما عزیزان هستم. هرگونه حمایت شما، انگیزه من را برای ارائه امکانات بهتر دوچندان می‌کند. ❤️
-        </p>
-        <div class="space-y-3">
-            <a href="https://donatonion.ir-netlify.workers.dev/" target="_blank" class="w-full py-3 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:border-orange-500/60 dark:text-orange-400 dark:hover:bg-orange-500/10 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 2a10 10 0 100 20 10 10 0 000-20zm0 18a8 8 0 110-16 8 8 0 010 16zm-.75-3.25h1.5v-1.5h-1.5v1.5zm0-3.5h1.5v-3h-1.5v3z"/></svg>
-                حمایت مالی (رمز ارز)
-            </a>
-			<a href="https://t.me/boost/PANEL_ZEUS" target="_blank" class="w-full py-3 bg-transparent border-2 border-blue-500 text-blue-600 hover:bg-blue-50 dark:border-blue-500/60 dark:text-blue-400 dark:hover:bg-blue-500/10 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-				<svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M11.944 0A12 12 0 0 0 0 12a12 12 0 0 0 12 12 12 12 0 0 0 12-12A12 12 0 0 0 12 0a12 12 0 0 0-.056 0zm4.962 7.224c.1-.002.321.023.465.14a.506.506 0 0 1 .171.325c.016.093.036.306.02.472-.18 1.898-.962 6.502-1.36 8.627-.168.9-.499 1.201-.82 1.23-.696.065-1.225-.46-1.9-.902-1.056-.693-1.653-1.124-2.678-1.8-1.185-.78-.417-1.21.258-1.91.177-.184 3.247-2.977 3.307-3.23.007-.032.014-.15-.056-.212s-.174-.041-.249-.024c-.106.024-1.793 1.14-5.061 3.345-.48.33-.913.49-1.302.48-.428-.008-1.252-.241-1.865-.44-.752-.245-1.349-.374-1.297-.789.027-.216.325-.437.893-.663 3.498-1.524 5.83-2.529 6.998-3.014 3.332-1.386 4.025-1.627 4.476-1.635z"/></svg>
-				بوست تلگرام
-			</a>
-            <a href="https://github.com/zeus-panel/ZEUS-PANEL" target="_blank" class="w-full py-3 bg-transparent border-2 border-gray-600 text-gray-700 hover:bg-gray-100 dark:border-gray-500 dark:text-gray-300 dark:hover:bg-zinc-800 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-                <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path d="M12 .297c-6.63 0-12 5.373-12 12 0 5.303 3.438 9.8 8.205 11.385.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61C4.422 18.07 3.633 17.7 3.633 17.7c-1.087-.744.084-.729.084-.729 1.205.084 1.838 1.236 1.838 1.236 1.07 1.835 2.809 1.305 3.495.998.108-.776.417-1.305.76-1.605-2.665-.3-5.466-1.332-5.466-5.93 0-1.31.465-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.606-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 22.092 24 17.592 24 12.297c0-6.627-5.373-12-12-12"/></svg>
-                ستاره در گیت‌هاب
-            </a>
-        </div>
-            <button onclick="toggleSupportModal(false)" class="mt-4 w-full py-2.5 bg-transparent text-red-500 hover:text-red-600 hover:bg-red-50 dark:text-red-400 dark:hover:text-red-300 dark:hover:bg-red-900/20 font-bold rounded-md text-sm transition duration-300">
-                بستن
-            </button>
-        </div>
-    </div>
-    <div id="settings-modal" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-        <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-xl overflow-hidden transition-all transform duration-300 opacity-0 scale-95 ease-out flex flex-col max-h-[90vh]">
-            <div class="px-6 py-4 border-b border-gray-150 dark:border-amoled-border flex justify-between items-center bg-gray-50 dark:bg-zinc-900/50">
-                <h3 class="font-bold text-gray-900 dark:text-zinc-100">تنظیمات پـنـل</h3>
-                <button onclick="toggleSettingsModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                </button>
-            </div>
-            <div class="p-6 space-y-4 overflow-y-auto flex-1 overscroll-contain">
-                <div class="pt-2">
-					<label class="block text-sm font-medium mb-1.5 text-gray-700 dark:text-zinc-300">نرخ رفرش خودکار پـنـل</label>
-                    <div class="relative">
-                        <select id="refresh-rate-select" onchange="changeRefreshRate(this.value)" class="w-full pl-8 pr-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer appearance-none">
-                            <option value="1000">۱ ثانیه</option>
-                            <option value="2000">۲ ثانیه</option>
-                            <option value="5000">۵ ثانیه</option>
-                            <option value="10000" selected>۱۰ ثانیه (پیش‌فرض)</option>
-                            <option value="30000">۳۰ ثانیه</option>
-                            <option value="60000">۱ دقیقه</option>
-                            <option value="300000">۵ دقیقه</option>
-                            <option value="600000">۱۰ دقیقه</option>
-                        </select>
-                        <div class="pointer-events-none absolute inset-y-0 left-0 flex items-center pl-3 text-gray-500 dark:text-zinc-400">
-                            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                        </div>
-                    </div>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700 flex items-center justify-between">
-                    <div class="flex items-center gap-2">
-                        <span class="text-sm font-bold text-gray-800 dark:text-zinc-200 flex items-center gap-1.5">
-                            <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-                            آپدیت خودکار پـنـل
-                        </span>
-                    </div>
-                    <label class="relative inline-flex items-center cursor-pointer select-none">
-                        <input type="checkbox" id="auto-update-toggle" onchange="handleAutoUpdateToggle(this)" class="sr-only peer">
-                        <div class="w-11 h-6 bg-gray-300 peer-focus:outline-none rounded-full peer dark:bg-zinc-700 peer-checked:after:-translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:right-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all dark:border-gray-600 peer-checked:bg-green-600"></div>
-                    </label>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🔒 تغییر رمز عبور مدیریت</h4>
-                    <div class="space-y-3">
-                        <div>
-                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور فعلی</label>
-                            <input type="password" id="change-pwd-current" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
-                        </div>
-                        <div>
-                            <label class="block text-[11px] text-gray-500 dark:text-gray-400 font-medium mb-1">رمز عبور جدید</label>
-                            <input type="password" id="change-pwd-new" class="w-full px-3 py-2 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 text-xs font-mono text-center">
-                        </div>
-                        <button type="button" onclick="changeAdminPassword()" id="change-pwd-btn" class="w-full py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-semibold rounded-md text-xs transition-all shadow-sm">تغییر رمز عبور</button>
-                    </div>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">🌐 زبان پنل / Panel language</h4>
-                    <div class="relative">
-                        <select id="panel-lang-select" onchange="setPanelLanguage(this.value)" class="w-full px-3 py-2.5 bg-white dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 text-gray-700 dark:text-zinc-200 cursor-pointer">
-                            <option value="fa">فارسی</option>
-                            <option value="en">English</option>
-                        </select>
-                    </div>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200" data-i18n="settings_tg_title">🤖 ربات تلگرام</h4>
-                    <div class="space-y-2">
-                        <input type="text" id="tg-bot-token" placeholder="Bot Token — از @BotFather" dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md text-xs font-mono text-gray-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50">
-                        <div class="flex items-center justify-between bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md p-2">
-                            <span id="tg-bot-status-text" class="text-[11px] font-semibold text-gray-600 dark:text-zinc-400" data-i18n="settings_tg_status_off">وضعیت: غیرفعال</span>
-                            <button type="button" onclick="setupTelegramBot()" id="tg-setup-btn" class="px-3 py-1.5 bg-transparent border-2 border-sky-500 text-sky-600 hover:bg-sky-50 dark:text-sky-400 dark:border-sky-500/60 dark:hover:bg-sky-500/10 rounded-md text-xs font-bold transition" data-i18n="settings_tg_setup_btn">ثبت و فعال‌سازی</button>
-                        </div>
-                        <p class="text-[10px] text-gray-500 dark:text-zinc-500 leading-relaxed" data-i18n="settings_tg_help">پس از فعال‌سازی، برای هر کاربر یک لینک اتصال (/start) از پنل کاربر بگیرید تا با ارسال آن در تلگرام، وضعیت اشتراک و لینک ساب‌اسکریپشن‌شان را از بات دریافت کنند. دستورات: /link کد — /status</p>
-                    </div>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200" data-i18n="settings_relay_title">🌍 آدرس‌های جایگزین منطقه‌ای (Fallback Relay)</h4>
-                    <p class="text-[10px] text-gray-500 dark:text-zinc-500 leading-relaxed mb-2" data-i18n="settings_relay_help">اگر اتصال مستقیم به مقصد شکست بخورد، پنل به‌صورت خودکار نزدیک‌ترین آدرس این لیست (بر اساس منطقه ادج ورکر) را امتحان می‌کند. هر خط: <code>آدرس:پورت:کدمنطقه</code> — مثال: <code>1.2.3.4:443:DE</code></p>
-                    <textarea id="fallback-relays-input" rows="3" placeholder="1.2.3.4:443:DE" dir="ltr" class="w-full px-3 py-2 bg-gray-50 dark:bg-amoled-input border border-gray-200 dark:border-amoled-border rounded-md text-xs font-mono text-gray-800 dark:text-zinc-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50 resize-none"></textarea>
-                    <div class="mt-2 grid grid-cols-2 gap-2">
-                        <button type="button" id="relay-mode-fallback_only" onclick="setRelayModeUI('fallback_only')" class="relay-mode-btn py-2 rounded-md text-[11px] font-bold border-2 border-gray-200 dark:border-amoled-border text-gray-500 dark:text-zinc-400 transition" data-i18n="settings_relay_mode_fallback">فقط در صورت شکست</button>
-                        <button type="button" id="relay-mode-prefer_region" onclick="setRelayModeUI('prefer_region')" class="relay-mode-btn py-2 rounded-md text-[11px] font-bold border-2 border-gray-200 dark:border-amoled-border text-gray-500 dark:text-zinc-400 transition" data-i18n="settings_relay_mode_prefer">همیشه رلهٔ منطقه اول</button>
-                    </div>
-                    <p class="text-[10px] text-gray-500 dark:text-zinc-500 leading-relaxed mt-1" data-i18n="settings_relay_mode_help">«فقط در صورت شکست»: اتصال مستقیم اول امتحان می‌شود، رله فقط بک‌آپ است. «همیشه رلهٔ منطقه اول»: اگر رلهٔ هم‌منطقه موجود باشد، همان ابتدا از آن استفاده می‌شود (بخشی واقعی از مسیر اتصال، نه فقط بک‌آپ).</p>
-                    <button type="button" onclick="saveFallbackRelays()" class="mt-2 w-full py-2 bg-transparent border-2 border-emerald-600 text-emerald-700 hover:bg-emerald-900/10 dark:text-emerald-400 dark:border-emerald-500/60 rounded-md text-xs font-bold transition" data-i18n="settings_relay_save_btn">ذخیره لیست</button>
-                </div>
-                <div class="pt-4 border-t-2 border-gray-300 dark:border-zinc-700">
-                    <h4 class="text-sm font-bold mb-3 text-gray-800 dark:text-zinc-200">💾 پشتیبان‌گیری و بازیابی</h4>
-                    <div class="grid grid-cols-2 gap-3">
-                        <button type="button" onclick="exportUsersBackup()" class="py-2.5 bg-transparent border-2 border-orange-500 text-orange-600 hover:bg-orange-50 dark:text-orange-400 dark:border-orange-500/60 dark:hover:bg-orange-500/10 rounded-md text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
-                            📤 پشتیبان گیری
-                        </button>
-                        <button type="button" onclick="triggerImportBackup()" class="py-2.5 bg-transparent border-2 border-blue-500 text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:border-blue-500/60 dark:hover:bg-blue-500/10 rounded-md text-xs font-bold transition flex items-center justify-center gap-1.5 shadow-sm">
-                            📥 بازیابی
-                        </button>
-                    </div>
-                    <input type="file" id="backup-file-input" onchange="importUsersBackup(event)" accept=".json" class="hidden">
-                </div>
-                <div class="pt-4 flex gap-3">
-                    <button type="button" onclick="toggleSettingsModal(false)" class="flex-1 py-2 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition shadow-sm">انصراف</button>
-                    <button type="button" onclick="saveSettings()" id="save-settings-btn" class="flex-1 py-2 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-medium rounded-md text-sm transition">ذخیره تنظیمات</button>
-                </div>
-            </div>
-        </div>
-    </div>
-<div id="update-modal" class="fixed inset-0 z-[90] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-        <div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-500 mb-4 shadow-inner">
-            <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
-        </div>
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">بروزرسانی پـنـل</h3>
-        <p id="update-modal-text" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-            نسخه جدید در دسترس است. اگر آپدیت خودکار جواب نداد، حتماً از طریق لینک زیر آپدیت دستی را انجام دهید.
-        </p>
-        <div class="space-y-3">
-            <button onclick="applyUpdate()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"></path></svg>
-                آپدیت خودکار (توصیه شده)
-            </button>
-            <div class="relative py-2">
-                <div class="absolute inset-0 flex items-center">
-                    <div class="w-full border-t border-gray-200 dark:border-zinc-800"></div>
-                </div>
-                <div class="relative flex justify-center text-xs">
-                    <span class="bg-white dark:bg-amoled-card px-2 text-gray-400">یا</span>
-                </div>
-            </div>
-            <a href="https://t.me/ZEUS_PANEL_BOT" target="_blank" class="w-full py-3.5 bg-orange-50 dark:bg-orange-950/30 hover:bg-orange-100 dark:hover:bg-orange-900/50 text-orange-600 dark:text-orange-500 border border-orange-300 dark:border-orange-500 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center gap-2">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path>
-                </svg>
-                آپدیت از طریق ربات
-            </a>
-        </div>
-        <button onclick="toggleUpdateModal(false)" class="mt-5 w-full py-3.5 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-300 shadow-sm flex items-center justify-center">
-            انصراف
-        </button>
-    </div>
-</div>
-	<div id="token-modal" class="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
-        <div id="token-modal-card" class="w-full max-w-md bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200">
-            <div class="flex justify-between items-center mb-6">
-                <div class="flex items-center gap-2">
-                    <div class="w-2.5 h-2.5 rounded-full bg-orange-500"></div>
-                    <h3 class="text-lg font-bold text-gray-900 dark:text-white">تنظیم توکن کلودفلر</h3>
-                </div>
-                <button onclick="toggleTokenModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                </button>
-            </div>
-            <div class="mb-5 p-3 bg-orange-50 dark:bg-orange-900/20 border border-orange-200 dark:border-orange-800/50 rounded-md text-xs leading-relaxed text-orange-800 dark:text-orange-300 font-medium">
-                توکن کلودفلر شما در این پـنـل ذخیره نشده است. برای فعال‌سازی آپدیت خودکار از داخل پـنـل، لطفاً توکن خود را دریافت کرده و در کادر زیر وارد کنید.
-            </div>
-            <a href="https://dash.cloudflare.com/profile/api-tokens?permissionGroupKeys=%5B%7B%22key%22%3A%22workers_scripts%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22workers_kv_storage%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22d1%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_settings%22%2C%22type%22%3A%22read%22%7D%2C%7B%22key%22%3A%22workers_subdomain%22%2C%22type%22%3A%22edit%22%7D%2C%7B%22key%22%3A%22account_analytics%22%2C%22type%22%3A%22read%22%7D%5D&accountId=*&zoneId=all&name=Zeus-Deployer-Token" target="_blank" class="flex items-center justify-center gap-2 w-full py-3 bg-[#d94800] hover:bg-[#e35802] text-white font-bold rounded-md text-sm transition duration-300 mb-4 shadow-md shadow-orange-500/20">
-                <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>
-                دریافت توکن کلودفلر
-            </a>
-            <div class="space-y-4">
-                <input type="password" id="update-token-input" placeholder="توکن را اینجا وارد کنید" class="w-full px-4 py-3 bg-gray-50 dark:bg-amoled-input border border-gray-300 dark:border-amoled-border rounded-md focus:outline-none focus:ring-2 focus:ring-orange-500 text-sm font-mono text-center text-gray-900 dark:text-zinc-100 transition" dir="auto">
-                <button id="submit-token-btn" onclick="submitTokenForUpdate()" class="w-full py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-300 shadow-lg">
-                    ثبت و آپدیت پـنـل
-                </button>
-            </div>
-        </div>
-    </div>
-<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
-    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
-        <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
-            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-            </button>
-        </div>
-        <div class="flex justify-center bg-white p-4 rounded-md mb-4">
-            <div id="qrcode-container"></div>
-        </div>
-        <button onclick="downloadQrCode()" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-sm flex items-center justify-center gap-2">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12"></path></svg>
-            دانلود تصویر QR
-        </button>
-    </div>
-</div>
-    <div id="bulk-actions-bar" class="fixed bottom-4 left-1/2 -translate-x-1/2 z-[40] bg-white dark:bg-zinc-900/90 border border-gray-200 dark:border-zinc-800/80 px-6 py-4 rounded-md shadow-2xl flex flex-wrap items-center justify-between gap-4 w-[95%] max-w-4xl transition-all duration-300 transform translate-y-28 opacity-0 pointer-events-none backdrop-blur-md">
-        <div class="flex items-center gap-2">
-            <span class="w-3 h-3 bg-blue-500 rounded-full animate-pulse shadow-sm shadow-blue-500/50"></span>
-            <span id="bulk-selected-count" class="text-sm font-bold text-gray-800 dark:text-zinc-200">۰ کاربر انتخاب شده</span>
-        </div>
-        <div class="flex flex-wrap gap-2 justify-end">
-            <button onclick="bulkToggleStatus(1)" class="px-3 py-1.5 bg-green-50 dark:bg-green-950/20 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/30 rounded-md text-xs font-bold transition border border-green-200 dark:border-green-900/50 flex items-center gap-1">
-                ✅ فعال‌سازی
-            </button>
-            <button onclick="bulkToggleStatus(0)" class="px-3 py-1.5 bg-amber-50 dark:bg-amber-950/20 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/30 rounded-md text-xs font-bold transition border border-amber-200 dark:border-amber-900/50 flex items-center gap-1">
-                ❌ غیرفعال‌سازی
-            </button>
-            <button onclick="bulkReset('volume')" class="px-3 py-1.5 bg-blue-50 dark:bg-blue-950/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/30 rounded-md text-xs font-bold transition border border-blue-200 dark:border-blue-900/50 flex items-center gap-1">
-                📊 ریست حجم
-            </button>
-            <button onclick="bulkReset('req')" class="px-3 py-1.5 bg-sky-50 dark:bg-sky-950/20 text-sky-600 dark:text-sky-400 hover:bg-sky-100 dark:hover:bg-sky-900/30 rounded-md text-xs font-bold transition border border-sky-200 dark:border-sky-900/50 flex items-center gap-1">
-                ⚡ ریست ریکوئست
-            </button>
-            <button onclick="bulkReset('time')" class="px-3 py-1.5 bg-purple-50 dark:bg-purple-950/20 text-purple-600 dark:text-purple-400 hover:bg-purple-100 dark:hover:bg-purple-900/30 rounded-md text-xs font-bold transition border border-purple-200 dark:border-purple-900/50 flex items-center gap-1">
-                ⏳ ریست زمان
-            </button>
-            <button onclick="bulkDelete()" class="px-3 py-1.5 bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-450 hover:bg-red-100 dark:hover:bg-red-900/40 rounded-md text-xs font-bold transition border border-red-200 dark:border-red-900/50 flex items-center gap-1">
-                🗑️ حذف گروهی
-            </button>
-        </div>
-    </div>
-	<div id="update-success-modal" class="fixed inset-0 z-[120] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-		<div class="w-full max-w-md bg-white dark:bg-amoled-card border border-green-600/50 rounded-md shadow-2xl overflow-hidden p-6 text-center transition-all transform duration-300 opacity-0 scale-95 ease-out">
-			<div class="inline-flex items-center justify-center w-16 h-16 rounded-full bg-green-100 dark:bg-green-900/30 text-green-600 mb-4 shadow-inner">
-				<svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>
-			</div>
-			<h3 class="font-black text-xl text-gray-900 dark:text-white mb-2">آپدیت موفقیت‌آمیز</h3>
-			<p class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium">
-				آپدیت موفق بود لطفا صفحه را 10 ثانیه دیگر رفرش کنید تا نسخه جدید لود شود
-			</p>
-			<button onclick="window.location.reload()" class="w-full py-3.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-black rounded-md text-sm transition duration-300 shadow-lg">
-				رفرش صفحه
-			</button>
-		</div>
-	</div>
-${COMMON_TOAST_HTML}
-<div id="custom-confirm-modal" class="fixed inset-0 z-[9999] flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm opacity-0 pointer-events-none transition-all duration-300 ease-out">
-    <div id="custom-confirm-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl overflow-hidden p-6 text-center transform transition-all scale-95 duration-300">
-        <h3 class="font-black text-xl text-gray-900 dark:text-white mb-3">تأیید عملیات</h3>
-        <p id="custom-confirm-message" class="text-sm text-gray-600 dark:text-gray-400 mb-6 leading-relaxed font-medium"></p>
-        <div class="flex gap-3">
-            <button id="custom-confirm-cancel" class="flex-1 py-3 bg-transparent border-2 border-rose-700 text-rose-700 hover:bg-rose-900/20 hover:text-rose-800 dark:border-rose-700 dark:text-rose-500 dark:hover:bg-rose-900/40 dark:hover:text-rose-400 font-bold rounded-md text-sm transition duration-200 shadow-sm">انصراف</button>
-            <button id="custom-confirm-ok" class="flex-1 py-3 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-lg">تأیید</button>
-        </div>
-    </div>
-</div>
-    <script>
-		async function fetchWithFallbackUI(path, options = {}) {
-			const githubUrl = 'https://raw.githubusercontent.com/zeus-panel/ZEUS-PANEL/main/' + path;
-			const staticUrl = 'https://zeus-files.surge.sh/' + path;
-			try {
-				const res = await fetch(githubUrl, options);
-				if (res.ok) return res;
-			} catch (e) {}
-			return await fetch(staticUrl, options);
-		}
-		function showToast(message, type = 'success') {
-            const container = document.getElementById('toast-container');
-            const toast = document.createElement('div');
-            const colors = type === 'error' 
-                ? 'bg-red-50 dark:bg-red-900/40 border-red-200 dark:border-red-800 text-red-600 dark:text-red-400' 
-                : 'bg-green-50 dark:bg-green-900/40 border-green-200 dark:border-green-800 text-green-700 dark:text-green-500';
-            toast.className = 'px-4 py-3 border rounded-md shadow-lg font-bold text-sm transform transition-all duration-300 -translate-y-full opacity-0 ' + colors;
-            toast.innerText = message;
-            container.appendChild(toast);
-            requestAnimationFrame(() => {
-                toast.classList.remove('-translate-y-full', 'opacity-0');
-            });
-            setTimeout(() => {
-                toast.classList.add('-translate-y-full', 'opacity-0');
-                setTimeout(() => toast.remove(), 300);
-            }, 3000);
-        }
-        function customConfirm(message) {
-            return new Promise((resolve) => {
-                const modal = document.getElementById('custom-confirm-modal');
-                const card = document.getElementById('custom-confirm-card');
-                const msgEl = document.getElementById('custom-confirm-message');
-                const btnOk = document.getElementById('custom-confirm-ok');
-                const btnCancel = document.getElementById('custom-confirm-cancel');
-                msgEl.innerText = message;
-                modal.classList.remove('opacity-0', 'pointer-events-none');
-                modal.classList.add('opacity-100', 'pointer-events-auto');
-                card.classList.remove('scale-95');
-                card.classList.add('scale-100');
-                const cleanup = () => {
-                    modal.classList.remove('opacity-100', 'pointer-events-auto');
-                    modal.classList.add('opacity-0', 'pointer-events-none');
-                    card.classList.remove('scale-100');
-                    card.classList.add('scale-95');
-                    btnOk.removeEventListener('click', onOk);
-                    btnCancel.removeEventListener('click', onCancel);
-                };
-                const onOk = () => { cleanup(); resolve(true); };
-                const onCancel = () => { cleanup(); resolve(false); };
-                btnOk.addEventListener('click', onOk);
-                btnCancel.addEventListener('click', onCancel);
-            });
-        }
-        window.alert = function(message) {
-            const msgStr = message ? message.toString() : '';
-            if (msgStr.includes('خطا') || msgStr.includes('⚠️') || msgStr.includes('❌')) {
-                showToast(msgStr, 'error');
-            } else {
-                showToast(msgStr, 'success');
-            }
-        };
-        window.selectedUsernames = new Set();
-        function toggleSelectAllUsers(el) {
-            const checkboxes = document.querySelectorAll('input[name="select-user"]');
-            checkboxes.forEach(cb => {
-                cb.checked = el.checked;
-                const username = decodeURIComponent(cb.value);
-                if (el.checked) {
-                    window.selectedUsernames.add(username);
-                } else {
-                    window.selectedUsernames.delete(username);
-                }
-            });
-            updateBulkActionsBar();
-        }
-        function onUserSelectChange(el) {
-            const username = decodeURIComponent(el.value);
-            if (el.checked) {
-                window.selectedUsernames.add(username);
-            } else {
-                window.selectedUsernames.delete(username);
-            }
-            updateBulkActionsBar();
-        }
-        function updateBulkActionsBar() {
-            const bar = document.getElementById('bulk-actions-bar');
-            const countSpan = document.getElementById('bulk-selected-count');
-            const selectAllCheckbox = document.getElementById('select-all-users');
-            const selectedCount = window.selectedUsernames.size;
-            if (countSpan) {
-                countSpan.innerText = selectedCount + ' کاربر انتخاب شده';
-            }
-            const checkboxes = document.querySelectorAll('input[name="select-user"]');
-            if (checkboxes.length > 0) {
-                const allChecked = Array.from(checkboxes).every(cb => cb.checked);
-                if (selectAllCheckbox) selectAllCheckbox.checked = allChecked;
-            } else {
-                if (selectAllCheckbox) selectAllCheckbox.checked = false;
-            }
-            if (selectedCount > 0) {
-                bar.classList.remove('opacity-0', 'pointer-events-none', 'translate-y-28');
-                bar.classList.add('opacity-100', 'pointer-events-auto', 'translate-y-0');
-            } else {
-                bar.classList.remove('opacity-100', 'pointer-events-auto', 'translate-y-0');
-                bar.classList.add('opacity-0', 'pointer-events-none', 'translate-y-28');
-            }
-        }
-        async function bulkDelete() {
-            const usernames = Array.from(window.selectedUsernames);
-            if (usernames.length === 0) return;
-            if (await customConfirm('⚠️ آیا از حذف گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟ این عمل غیرقابل بازگشت است.')) {
-                const bar = document.getElementById('bulk-actions-bar');
-                const buttons = bar.querySelectorAll('button');
-                buttons.forEach(btn => btn.disabled = true);
-                try {
-                    let successCount = 0;
-                    await Promise.all(usernames.map(async (uname) => {
-                        try {
-                            const res = await fetch('/api/users/' + encodeURIComponent(uname), { method: 'DELETE' });
-                            if (res.ok) {
-                                successCount++;
-                                window.selectedUsernames.delete(uname);
-                            }
-                        } catch(e) {}
-                    }));
-                    alert('✅ عملیات حذف گروهی انجام شد. ' + successCount + ' کاربر با موفقیت حذف شدند.');
-                } finally {
-                    buttons.forEach(btn => btn.disabled = false);
-                    updateBulkActionsBar();
-                    await loadUsers(true);
-                }
-            }
-        }
-        async function bulkToggleStatus(targetActive) {
-            const usernames = Array.from(window.selectedUsernames);
-            if (usernames.length === 0) return;
-            const actionText = targetActive === 1 ? 'فعال‌سازی' : 'غیرفعال‌سازی';
-            if (await customConfirm('آیا از ' + actionText + ' گروهی ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
-                const bar = document.getElementById('bulk-actions-bar');
-                const buttons = bar.querySelectorAll('button');
-                buttons.forEach(btn => btn.disabled = true);
-                try {
-                    let successCount = 0;
-                    await Promise.all(usernames.map(async (uname) => {
-                        const user = window.allUsers.find(u => u.username === uname);
-                        if (!user) return;
-                        const isCurrentActive = user.is_active !== 0;
-                        const shouldToggle = (targetActive === 1 && !isCurrentActive) || (targetActive === 0 && isCurrentActive);
-                        if (shouldToggle) {
-                            try {
-                                const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-                                    method: 'PUT',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ toggle_only: true })
-                                });
-                                if (res.ok) successCount++;
-                            } catch(e) {}
-                        } else {
-                            successCount++;
-                        }
-                    }));
-                    alert('✅ عملیات ' + actionText + ' با موفقیت برای تمامی کاربران واجد شرایط اعمال شد.');
-                } finally {
-                    buttons.forEach(btn => btn.disabled = false);
-                    updateBulkActionsBar();
-                    await loadUsers(true);
-                }
-            }
-        }
-        async function bulkReset(actionType) {
-            const usernames = Array.from(window.selectedUsernames);
-            if (usernames.length === 0) return;
-            let actionName = '';
-            if (actionType === 'volume') actionName = 'حجم مصرفی';
-            else if (actionType === 'req') actionName = 'تعداد ریکوئست‌ها';
-            else if (actionType === 'time') actionName = 'زمان اشتراک';
-            if (await customConfirm('آیا از ریست کردن گروهی ' + actionName + ' برای ' + usernames.length + ' کاربر انتخاب شده مطمئن هستید؟')) {
-                const bar = document.getElementById('bulk-actions-bar');
-                const buttons = bar.querySelectorAll('button');
-                buttons.forEach(btn => btn.disabled = true);
-                try {
-                    let successCount = 0;
-                    await Promise.all(usernames.map(async (uname) => {
-                        try {
-                            const res = await fetch('/api/users/' + encodeURIComponent(uname), {
-                                method: 'PUT',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ reset_action: actionType })
-                            });
-                            if (res.ok) successCount++;
-                        } catch(e) {}
-                    }));
-                    alert('✅ عملیات ریست گروهی ' + actionName + ' با موفقیت برای ' + successCount + ' کاربر اعمال شد.');
-                } finally {
-                    buttons.forEach(btn => btn.disabled = false);
-                    updateBulkActionsBar();
-                    await loadUsers(true);
-                }
-            }
-        }
-        const tlsPorts = ['443', '2053', '2083', '2087', '2096', '8443'];
-        const nonTlsPorts = ['80', '8080', '8880', '2052', '2086', '2095'];
-        let isEditMode = false;
-        let editingUsername = '';
-        function renderPortCheckboxes() {
-            const tlsContainer = document.getElementById('tls-ports-list');
-            const nonTlsContainer = document.getElementById('nontls-ports-list');
-            tlsContainer.innerHTML = tlsPorts.map(function(port) {
-                const isCheckedDefault = port === '443' ? 'checked' : '';
-                return '<label class="relative cursor-pointer">' +
-                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
-                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-blue-50 dark:peer-checked:bg-blue-950/25 peer-checked:border-blue-500 dark:peer-checked:border-blue-500/70 peer-checked:text-blue-600 dark:peer-checked:text-blue-400 shadow-sm">' +
-                        '<span>' + port + '</span>' +
-                        '<svg class="w-3 h-3 hidden peer-checked:block text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
-                    '</div>' +
-                '</label>';
-            }).join('');
-            nonTlsContainer.innerHTML = nonTlsPorts.map(function(port) {
-                const isCheckedDefault = port === '80' ? 'checked' : '';
-                return '<label class="relative cursor-pointer">' +
-                    '<input type="checkbox" name="ports" value="' + port + '" ' + isCheckedDefault + ' class="peer sr-only">' +
-                    '<div class="flex items-center justify-center gap-1 px-1.5 py-1.5 border border-gray-200 dark:border-zinc-800/80 rounded-md text-[11px] font-semibold select-none transition-all duration-200 hover:bg-gray-50 dark:hover:bg-zinc-800/40 text-gray-700 dark:text-zinc-300 peer-checked:bg-amber-50 dark:peer-checked:bg-amber-950/25 peer-checked:border-amber-500 dark:peer-checked:border-amber-500/70 peer-checked:text-amber-600 dark:peer-checked:text-amber-400 shadow-sm">' +
-                        '<span>' + port + '</span>' +
-                        '<svg class="w-3 h-3 hidden peer-checked:block text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M5 13l4 4L19 7"></path></svg>' +
-                    '</div>' +
-                '</label>';
-            }).join('');
-        }
-        setTimeout(function() {
-            const cb443 = document.querySelector('input[name="ports"][value="443"]');
-            if (cb443) cb443.checked = true;
-            const cb80 = document.querySelector('input[name="ports"][value="80"]');
-            if (cb80) cb80.checked = true;
-        }, 100);
-        function toggleSettingsModal(show) { setModalState('settings-modal', show); if (show) { loadTelegramSettingsUI(); loadFallbackRelaysUI(); initPanelLanguage(); } }
-        window.toggleAutoResetInputs = function(show) {
-			const container = document.getElementById('auto-reset-inputs-container');
-			const volInput = document.getElementById('input-auto-reset-vol');
-			const reqInput = document.getElementById('input-auto-reset-req');
-			if (container) {
-				if (show) {
-					container.classList.remove('opacity-50', 'pointer-events-none');
-					if (volInput) volInput.disabled = false;
-					if (reqInput) reqInput.disabled = false;
-				} else {
-					container.classList.add('opacity-50', 'pointer-events-none');
-					if (volInput) volInput.disabled = true;
-					if (reqInput) reqInput.disabled = true;
-				}
-			}
-		};
-        window.toggleAutoRotateIpInputs = function(show) {
-			const container = document.getElementById('auto-rotate-ip-inputs-container');
-			if (container) {
-				if (show) container.classList.remove('hidden');
-				else container.classList.add('hidden');
-			}
-		};
-        window.toggleFragInputs = function(show) {
-            const container = document.getElementById('frag-inputs-container');
-            if (container) {
-                if (show) {
-                    container.classList.remove('hidden');
-                } else {
-                    container.classList.add('hidden');
-                }
-            }
-        };
-        function toggleModal(show) {
-            setModalState('user-modal', show);
-            if (!show) {
-                isEditMode = false;
-                editingUsername = '';
-                document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
-                document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
-                document.getElementById('input-name').disabled = false;
-                document.getElementById('create-user-form').reset();
-                const cb443 = document.querySelector('input[name="ports"][value="443"]');
-                if (cb443) cb443.checked = true;
-                const cb80 = document.querySelector('input[name="ports"][value="80"]');
-                if (cb80) cb80.checked = true;
-                const fpSelect = document.getElementById('fingerprint-select');
-                if (fpSelect) fpSelect.value = 'ios';
-                const bpCheck = document.getElementById('input-block-porn');
-                if (bpCheck) bpCheck.checked = false;
-                const baCheck = document.getElementById('input-block-ads');
-				if (baCheck) baCheck.checked = false;
-				const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
-				if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = false;
-				const fragLenInput = document.getElementById('input-frag-len');
-				if (fragLenInput) fragLenInput.value = '200-3000';
-				const fragIntInput = document.getElementById('input-frag-int');
-				if (fragIntInput) fragIntInput.value = '1-2';
-                const fragToggle = document.getElementById('input-frag-toggle');
-                if (fragToggle) fragToggle.checked = true;
-                window.toggleFragInputs(true);
-				const customPortInput = document.getElementById('input-custom-ports');
-				if (customPortInput) customPortInput.value = '';
-				document.getElementById('hidden-auto-rotate').value = '0';
-				document.getElementById('hidden-rotate-time').value = '';
-				document.getElementById('hidden-ip-operator').value = 'all';
-				document.getElementById('hidden-ip-count').value = '20';
-				const autoResetToggle = document.getElementById('input-auto-reset-toggle');
-				if (autoResetToggle) autoResetToggle.checked = false;
-				document.getElementById('input-auto-reset-vol').value = '';
-				document.getElementById('input-auto-reset-req').value = '';
-				window.toggleAutoResetInputs(false);
-            }
-        }
-		function toggleUpdateModal(show, version = '') {
-            if (show && version) document.getElementById('update-modal-text').innerHTML = 'نسخه جدید (<b>v' + version + '</b>) در دسترس است.<br>اگر آپدیت خودکار عمل نکرد لطفا از ربات استفاده کنید.';
-            setModalState('update-modal', show);
-        }
-        function openCreateModal() {
-            isEditMode = false;
-            editingUsername = '';
-            document.getElementById('modal-title').innerText = 'ایجاد کاربر جدید';
-            document.getElementById('submit-btn').innerText = 'ایجاد کاربر';
-            document.getElementById('input-name').disabled = false;
-            document.getElementById('create-user-form').reset();
-            const cb443 = document.querySelector('input[name="ports"][value="443"]');
-            if (cb443) cb443.checked = true;
-            const cb80 = document.querySelector('input[name="ports"][value="80"]');
-            if (cb80) cb80.checked = true;
-            const fpSelect = document.getElementById('fingerprint-select');
-            if (fpSelect) fpSelect.value = 'ios';
-            const fragToggle = document.getElementById('input-frag-toggle');
-            if (fragToggle) fragToggle.checked = true;
-            window.toggleFragInputs(true);
-			const autoResetToggle = document.getElementById('input-auto-reset-toggle');
-			if (autoResetToggle) autoResetToggle.checked = false;
-			document.getElementById('input-auto-reset-vol').value = '';
-			document.getElementById('input-auto-reset-req').value = '';
-			window.toggleAutoResetInputs(false);
-			const blockAdsToggle = document.getElementById('input-block-ads');
-			if (blockAdsToggle) blockAdsToggle.checked = true;
-			const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
-			if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = false;
-            const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
-            if (userProxyToggle) userProxyToggle.checked = false;
-            if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(false);
-            window.proxyFieldsData = [""];
-            window.activeProxyIndex = 0;
-            if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-			document.getElementById('hidden-auto-rotate').value = '0';
-			document.getElementById('hidden-rotate-time').value = '';
-			document.getElementById('hidden-ip-operator').value = 'all';
-			document.getElementById('hidden-ip-count').value = '20';
-            toggleModal(true);
-        }
-        const themeToggleBtn = document.getElementById('theme-toggle');
-        themeToggleBtn.addEventListener('click', () => {
-            if (document.documentElement.classList.contains('dark')) {
-                document.documentElement.classList.remove('dark');
-                localStorage.setItem('color-theme', 'light');
-            } else {
-                document.documentElement.classList.add('dark');
-                localStorage.setItem('color-theme', 'dark');
-            }
-        });
-		async function handleCoreAction(actionType, token = null) {
-			window.pendingCoreAction = actionType;
-			const isUpdate = actionType === 'update';
-			if (!isUpdate && !await customConfirm('آیا از ری استارت پـنـل مطمئن هستید؟ کاربران شما لحظه ای قطع خواهند شد.')) return;
-			if (isUpdate && !token) toggleUpdateModal(false);
-			const btn = isUpdate ? document.getElementById('update-toggle') : document.querySelector('button[title="ری استارت پـنـل"]');
-			if (btn) {
-				btn.disabled = true;
-				if (!isUpdate) btn.classList.add('animate-pulse');
-			}
-			if (isUpdate && !token) alert('در حال دریافت و اعمال آپدیت... لطفاً چند ثانیه صبر کنید.');
-			try {
-				const reqBody = token ? JSON.stringify({ cf_token: token }) : "{}";
-				const res = await fetch(isUpdate ? '/api/update-panel' : '/api/restart-core', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: isUpdate ? reqBody : undefined
-				});
-				const data = await res.json();
-				if (res.status === 400 && data.error === "TOKEN_REQUIRED") {
-					toggleTokenModal(true);
-					if (btn) {
-						btn.disabled = false;
-						if (!isUpdate) btn.classList.remove('animate-pulse');
-					}
-					return;
-				}
-				if (res.ok && data.success) {
-					if (isUpdate) {
-						const successModal = document.getElementById('update-success-modal');
-						const successCard = successModal.querySelector('div');
-						successModal.classList.remove('opacity-0', 'pointer-events-none');
-						successModal.classList.add('opacity-100', 'pointer-events-auto');
-						successCard.classList.remove('opacity-0', 'scale-95');
-						successCard.classList.add('opacity-100', 'scale-100');
-						setTimeout(() => window.location.reload(), 10000);
-					} else {
-						alert('پـنـل ری استارت شد صفحه رفرش می شود.');
-						window.location.reload();
-					}
-				} else {
-					alert(isUpdate ? 'خطا در بروزرسانی. لطفاً با استفاده از " ربات" اقدام کنید.' : 'خطا در ری‌استارت پـنـل: ' + (data.error || 'ناشناخته'));
-					if (btn) {
-						btn.disabled = false;
-						if (!isUpdate) btn.classList.remove('animate-pulse');
-					}
-				}
-			} catch (err) {
-				alert(isUpdate ? 'خطا در ارتباط با سرور. لطفاً از گزینه آپدیت دستی استفاده کنید.' : 'خطا در ارتباط با سرور.');
-				if (btn) {
-					btn.disabled = false;
-					if (!isUpdate) btn.classList.remove('animate-pulse');
-				}
-			}
-		}
-		async function restartCore() {
-			await handleCoreAction('restart');
-		}
-        async function loadUsers(silent = false) {
-            const loadingState = document.getElementById('loading-state');
-            const tableContainer = document.getElementById('users-table-container');
-            const emptyState = document.getElementById('empty-state');
-            if (!silent) {
-                loadingState.classList.remove('hidden');
-                tableContainer.classList.add('hidden');
-                emptyState.classList.add('hidden');
-            }
-            try {
-                const res = await fetch('/api/users?t=' + Date.now());
-                if (!res.ok) throw new Error();
-                const data = await res.json();
-                renderUsersUI(data);
-            } catch (err) {
-                if (!silent) {
-                    loadingState.innerHTML = '<span class="text-red-500">خطا در دریافت اطلاعات از سرور</span>';
-                }
-            }
-        }
-        function renderUsersUI(data) {
-            try {
-                const users = data.users || [];
-                window.allUsers = users;
-                const serverTime = data.serverTime || Date.now();
-                window.lastServerTime = serverTime;
-                const totalUsersCount = users.length;
-                const activeUsersCount = users.reduce((sum, u) => sum + (u.online_count || 0), 0);
-                const totalGbUsage = users.reduce((sum, u) => sum + (u.lifetime_used_gb || u.used_gb || 0), 0);
-                document.getElementById('stat-total-users').innerText = totalUsersCount;
-                document.getElementById('stat-active-users').innerText = activeUsersCount;
-                document.getElementById('stat-total-usage').innerText = totalGbUsage < 1 ? (totalGbUsage * 1024).toFixed(0) + ' MB' : totalGbUsage.toFixed(2) + ' GB';
-                const cfRequests = data.cfRequestsToday || 0;
-                const reqCard = document.getElementById('card-cf-requests');
-                const warningBtn = document.getElementById('cf-warning-btn');
-                if (cfRequests >= 90000) {
-					if (reqCard) {
-						reqCard.className = "bg-red-50 dark:bg-red-950/20 border border-red-500 rounded-md p-2.5 shadow-[0_0_15px_rgba(239,68,68,0.4)] flex flex-col justify-center gap-1 hover:shadow-md transition duration-300 relative overflow-hidden group min-h-[64px] animate-pulse";
-					}
-					if (warningBtn) {
-						warningBtn.classList.remove('hidden');
-					}
-					if (!window.hasShownUsageWarning) {
-						openUsageWarning();
-						window.hasShownUsageWarning = true;
-					}
-				} else {
-                    if (reqCard) {
-                        reqCard.className = "bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md p-2.5 shadow-sm flex flex-col justify-center gap-1 hover:shadow-md hover:border-orange-400 dark:hover:border-orange-500/50 transition duration-300 relative overflow-hidden group min-h-[64px]";
-                    }
-                    if (warningBtn) {
-                        warningBtn.classList.add('hidden');
-                    }
-                }
-                const cfTotal = data.cfRequestsTotal || 0;
-                document.getElementById('stat-cf-requests').innerText = cfRequests >= 1000 ? (cfRequests / 1000).toFixed(1) + 'k' : cfRequests;
-                document.getElementById('stat-cf-total').innerText = cfTotal >= 1000000 ? (cfTotal / 1000000).toFixed(2) + 'M' : (cfTotal >= 1000 ? (cfTotal / 1000).toFixed(1) + 'k' : cfTotal);
-                const progressPercent = Math.min((cfRequests / 100000) * 100, 100);
-                document.getElementById('stat-cf-progress').style.width = progressPercent + '%';
-                filterAndRenderUsers();
-            } catch (err) {
-                document.getElementById('loading-state').innerHTML = '<span class="text-red-500">خطا در پردازش اطلاعات کاربران</span>';
-            }
-        }
-        function filterAndRenderUsers() {
-            if (!window.allUsers) return;
-            const searchQuery = (document.getElementById('search-input').value || '').toLowerCase().trim();
-            const filterStatus = document.getElementById('filter-status').value;
-            const sortVal = document.getElementById('sort-users').value;
-            const serverTime = window.lastServerTime || Date.now();
-            let filtered = [...window.allUsers];
-            if (searchQuery) {
-                filtered = filtered.filter(u => 
-                    (u.username || '').toLowerCase().includes(searchQuery) || 
-                    (u.uuid || '').toLowerCase().includes(searchQuery)
-                );
-            }
-            if (filterStatus !== 'all') {
-                filtered = filtered.filter(u => {
-                    const isOnline = u.is_online === 1;
-                    const isActive = u.is_active === 1;
-                    let isExpired = false;
-                    if (u.limit_gb && u.used_gb >= u.limit_gb) isExpired = true;
-                    if (u.expiry_days && u.created_at) {
-                        const created = new Date(u.created_at);
-                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
-                        if (new Date(serverTime) > expiryDate) isExpired = true;
-                    }
-                    if (filterStatus === 'active') return isActive && !isExpired;
-                    if (filterStatus === 'inactive') return !isActive;
-                    if (filterStatus === 'online') return isOnline;
-                    if (filterStatus === 'offline') return !isOnline;
-                    if (filterStatus === 'expired') return isExpired || !isActive;
-                    return true;
-                });
-            }
-            filtered.sort((a, b) => {
-                if (sortVal === 'newest') {
-                    return b.id - a.id;
-                }
-                if (sortVal === 'name') {
-                    return (a.username || '').localeCompare(b.username || '');
-                }
-                if (sortVal === 'usage-desc') {
-                    return (b.used_gb || 0) - (a.used_gb || 0);
-                }
-                if (sortVal === 'usage-asc') {
-                    return (a.used_gb || 0) - (b.used_gb || 0);
-                }
-                if (sortVal === 'expiry-asc') {
-                    const getRemaining = (u) => {
-                        if (!u.expiry_days) return Infinity;
-                        if (!u.created_at) return Infinity;
-                        const created = new Date(u.created_at);
-                        const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
-                        return expiryDate - new Date(serverTime);
-                    };
-                    return getRemaining(a) - getRemaining(b);
-                }
-                return 0;
-            });
-            renderFilteredUsers(filtered, serverTime);
-        }
-		function renderFilteredUsers(users, serverTime) {
-            const loadingState = document.getElementById('loading-state');
-            const tableContainer = document.getElementById('users-table-container');
-            const emptyState = document.getElementById('empty-state');
-            const tbody = document.getElementById('users-tbody');
-            if (users.length === 0) {
-                loadingState.classList.add('hidden');
-                emptyState.classList.remove('hidden');
-                tableContainer.classList.add('hidden');
-                if (window.allUsers && window.allUsers.length > 0) {
-                    emptyState.querySelector('p').innerText = 'کاربری با مشخصات جستجو شده یافت نشد.';
-                } else {
-                    emptyState.querySelector('p').innerText = 'کاربری وجود ندارد. برای ساخت اولین کاربر روی دکمه « + » کلیک کنید.';
-                }
-            } else {
-                loadingState.classList.add('hidden');
-                emptyState.classList.add('hidden');
-                tableContainer.classList.remove('hidden');
-                let proxyFlagCache = {};
-                try { proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
-                tbody.innerHTML = users.map(user => {
-                    let daysRemaining = 'نامحدود';
-                    let daysPercent = 100;
-                    if (user.expiry_days) {
-                        if (user.created_at) {
-                            const created = new Date(user.created_at);
-                            const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
-                            const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
-                            daysRemaining = diffDays > 0 ? diffDays : 0;
-                            daysPercent = Math.max(0, Math.min(100, (daysRemaining / user.expiry_days) * 100));
-                        } else {
-                            daysRemaining = user.expiry_days;
-                        }
-                    }
-                    const usedGb = user.used_gb || 0;
-                    const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
-					const usedReq = user.used_req || 0;
-					let reqHtml = '';
-					if (user.limit_req) {
-					    const reqPercent = Math.min((usedReq / user.limit_req) * 100, 100);
-					    const reqHue = 120 - (reqPercent * 1.2);
-					    reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none font-bold" dir="ltr">' + user.limit_req.toLocaleString() + '</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-					            '<div class="h-full rounded-full transition-all duration-500" style="width: ' + reqPercent + '%; background-color: hsl(' + reqHue + ', 80%, 45%)"></div>' +
-					        '</div>' +
-					    '</div>';
-					} else {
-					    reqHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + usedReq.toLocaleString() + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'req\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-					            '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
-					        '</div>' +
-					    '</div>';
-					}
-					let volumeHtml = '';
-					if (user.limit_gb) {
-					    const limitPercent = Math.min((usedGb / user.limit_gb) * 100, 100);
-					    const limitHue = 120 - (limitPercent * 1.2);
-					    const formattedLimit = user.limit_gb < 1 ? (user.limit_gb * 1024).toFixed(0) + 'MB' : user.limit_gb + 'GB';
-					    const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
-					    volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none font-bold" dir="ltr">' + formattedLimit + '</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-					            '<div class="h-full rounded-full transition-all duration-500" style="width: ' + limitPercent + '%; background-color: hsl(' + limitHue + ', 80%, 45%)"></div>' +
-					        '</div>' +
-					    '</div>';
-					} else {
-					    const formattedUsedClean = usedGb < 1 ? (usedGb * 1024).toFixed(0) + 'MB' : usedGb.toFixed(2) + 'GB';
-					    volumeHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + formattedUsedClean + '</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'volume\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-					            '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
-					        '</div>' +
-					    '</div>';
-					}
-					let expiryHtml = '';
-					if (user.expiry_days) {
-					    const expiryHue = daysPercent * 1.2;
-					    expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="rtl">' + daysRemaining + ' روز</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none font-bold" dir="rtl">' + user.expiry_days + ' روز</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden flex justify-end">' +
-					            '<div class="h-full rounded-full transition-all duration-500" style="width: ' + daysPercent + '%; background-color: hsl(' + expiryHue + ', 80%, 45%)"></div>' +
-					        '</div>' +
-					    '</div>';
-					} else {
-					    expiryHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-					        '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-					            '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold text-[12px]">∞</span>' +
-					            '<button onclick="resetUserData(\\'' + encodeURIComponent(user.username) + '\\', \\'time\\')" title="ریست" class="mx-1.5 w-3.5 h-3.5 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded border border-amber-200 dark:border-amber-800 transition shadow-sm cursor-pointer flex-shrink-0"><svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg></button>' +
-					            '<span class="leading-none text-[12px] font-bold">∞</span>' +
-					        '</div>' +
-					        '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-					            '<div class="w-full h-full bg-blue-500 rounded-full transition-all duration-500"></div>' +
-					        '</div>' +
-					    '</div>';
-					}
-                    const onlineCount = user.online_count || 0;
-                    const limit = user.ip_limit !== undefined ? user.ip_limit : user.max_connections;
-                    let onlineHtml = '';
-                    if (limit) {
-                        const onlinePercent = Math.min((onlineCount / limit) * 100, 100);
-                        const onlineHue = 120 - (onlinePercent * 1.2);
-                        onlineHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-                            '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + onlineCount + '</span>' +
-                                '<span class="leading-none font-bold" dir="ltr">' + limit + '</span>' +
-                            '</div>' +
-                            '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-                                '<div class="h-full rounded-full transition-all duration-500" style="width: ' + onlinePercent + '%; background-color: hsl(' + onlineHue + ', 80%, 45%)"></div>' +
-                            '</div>' +
-                        '</div>';
-                    } else {
-                        onlineHtml = '<div class="flex flex-col gap-1.5 w-full min-w-[65px] max-w-[90px] mx-auto select-none">' +
-                            '<div class="flex flex-row items-center justify-between text-[9px] text-gray-500 dark:text-gray-400 font-medium whitespace-nowrap">' +
-                                '<span class="text-gray-800 dark:text-zinc-200 leading-none font-bold" dir="ltr">' + onlineCount + '</span>' +
-                                '<span class="leading-none text-[12px] font-bold">∞</span>' +
-                            '</div>' +
-                            '<div class="w-full h-1.5 bg-gray-200 dark:bg-zinc-700 rounded-full overflow-hidden">' +
-                                '<div class="h-full ' + (onlineCount > 0 ? 'bg-green-600' : 'bg-gray-400') + ' rounded-full transition-all duration-500" style="width: 100%"></div>' +
-                            '</div>' +
-                        '</div>';
-                    }
-                    let isExpired = false;
-                    if (user.limit_gb && (user.used_gb || 0) >= user.limit_gb) isExpired = true;
-                    if (user.limit_req && (user.used_req || 0) >= user.limit_req) isExpired = true;
-                    if (user.expiry_days && user.created_at) {
-                        const created = new Date(user.created_at);
-                        const expiryDate = new Date(created.getTime() + (user.expiry_days * 24 * 60 * 60 * 1000));
-                        if (new Date(serverTime) > expiryDate) isExpired = true;
-                    }
-                    const isEffectivelyActive = user.is_active !== 0 && !isExpired;
-                    const statusBtnColor = user.is_active === 0 ? 'text-green-700 dark:text-green-500 hover:bg-green-50 dark:hover:bg-green-900/30' : 'text-amber-600 dark:text-amber-400 hover:bg-amber-50 dark:hover:bg-amber-900/30';
-                    const statusBtnTitle = user.is_active === 0 ? 'فعال کردن کاربر' : 'قطع کردن کاربر';
-                    const statusBtnIcon = user.is_active === 0 
-                        ? '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>'
-                        : '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 9v6m4-6v6m7-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>';
-                    const isChecked = (window.selectedUsernames && window.selectedUsernames.has(user.username)) ? 'checked' : '';
-                    let locBadge = '';
-                    if (user.user_proxy_iata) {
-                        const iata = user.user_proxy_iata.toUpperCase();
-                        const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(iata) : '🌐';
-                        locBadge = '<span title="کشور: ' + iata + '" class="text-base leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + flag + '</span>';
-                    } else if (user.user_socks5 || user.user_proxy_ip) {
-                        let proxyList = [];
-                        try {
-                            if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-                                proxyList = JSON.parse(user.user_socks5);
-                            } else {
-                                proxyList = [user.user_socks5 || user.user_proxy_ip];
-                            }
-                        } catch(e) {
-                            proxyList = [user.user_socks5 || user.user_proxy_ip];
-                        }
-                        let flagSizeClass = proxyList.length > 4 ? 'text-[10px]' : (proxyList.length > 2 ? 'text-xs' : 'text-base');
-                        locBadge = proxyList.map(item => {
-                            const targetProxy = typeof item === 'object' && item !== null ? item.proxy : item;
-                            const targetCountry = typeof item === 'object' && item !== null ? item.country : null;
-                            if (targetCountry && typeof getFlagEmoji === 'function') {
-                                return '<span title="کشور: ' + targetCountry + '" class="' + flagSizeClass + ' leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + getFlagEmoji(targetCountry) + '</span>';
-                            }
-                            const cachedFlag = proxyFlagCache[targetProxy];
-                            if (cachedFlag) {
-                                return '<span title="پـروکـسـی اختصاصی" class="' + flagSizeClass + ' leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">' + cachedFlag + '</span>';
-                            } else {
-                                return '<span data-proxy="' + targetProxy + '" title="پـروکـسـی اختصاصی" class="async-proxy-flag ' + flagSizeClass + ' leading-none px-0.5 drop-shadow-[0_0_2px_rgba(0,0,0,0.3)] dark:drop-shadow-[0_0_2px_rgba(255,255,255,0.3)]">⏳</span>';
-                            }
-                        }).join('');
-                    }
-					let numProxies = 1;
-					try {
-					    if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-					        numProxies = Math.max(1, JSON.parse(user.user_socks5).length);
-					    }
-					} catch(e) {}
-                    let numIps = user.ips ? user.ips.split('\\n').filter(function(ip) { return ip.trim().length > 0; }).length : 1;
-                    let numPorts = String(user.port || '443').split(',').filter(function(p) { return p.trim().length > 0; }).length;
-                    if (numPorts === 0) numPorts = 1;
-                    let totalConfigs = numProxies * numIps * numPorts;
-                    let configColorClass = 'text-green-800 dark:text-green-700';
-                    if (totalConfigs > 100) configColorClass = 'text-red-600 dark:text-red-500';
-                    else if (totalConfigs > 80) configColorClass = 'text-orange-500';
-                    else if (totalConfigs > 50) configColorClass = 'text-amber-500';
-                    else if (totalConfigs > 20) configColorClass = 'text-green-500';
-                    let configsCountHtml = '<span class="font-black text-base ' + configColorClass + '" dir="ltr">' + totalConfigs + '</span>';
-                    return '<tr class="hover:bg-gray-50 dark:hover:bg-zinc-900/40 border-b border-gray-100 dark:border-zinc-800 last:border-0">' +
-                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center select-none">' +
-                                '<input type="checkbox" name="select-user" value="' + encodeURIComponent(user.username) + '" onchange="onUserSelectChange(this)" ' + isChecked + ' class="w-4 h-4 rounded-md border-2 border-gray-300 dark:border-zinc-700 text-blue-600 bg-white dark:bg-zinc-800 checked:bg-blue-600 checked:border-blue-600 focus:ring-blue-500/50 focus:ring-offset-0 transition-all duration-200 cursor-pointer hover:scale-105 active:scale-95">' +
-                            '</td>' +
-                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center">' +
-                                '<div class="flex flex-col items-center justify-center gap-1.5 w-full max-w-[120px] mx-auto select-none">' +
-                                    '<span class="font-bold text-gray-900 dark:text-zinc-100 text-xs truncate max-w-full leading-none">' + user.username + '</span>' +
-                                    '<div class="flex flex-wrap items-center justify-center gap-0.5">' +
-                                        locBadge +
-                                    '</div>' +
-                                    '<div class="flex flex-row items-center justify-center gap-1">' +
-                                        (!isEffectivelyActive ? '<span class="px-1 py-px text-[9px] font-medium bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400 rounded">غیرفعال</span>' : '<span class="px-1 py-px text-[9px] font-medium bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400 rounded">فعال</span>') +
-                                        (user.is_online === 1 ? '<span class="px-1 py-px text-[9px] font-medium bg-green-600 text-white rounded animate-pulse" dir="rtl">' + user.online_count + '</span>' : '<span class="px-1 py-px text-[9px] font-medium bg-gray-200 text-gray-600 dark:bg-zinc-800 dark:text-zinc-400 rounded">آفلاین</span>') +
-                                    '</div>' +
-                                '</div>' +
-                            '</td>' +
-                            '<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800 text-center">' +
-                                '<div class="grid grid-cols-2 gap-1 w-max mx-auto">' +
-                                    '<button onclick="copyConfig(\\'' + encodeURIComponent(user.username) + '\\')" title="کپی کـانفـیگ" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-blue-50 dark:hover:bg-blue-900/30 text-blue-600 dark:text-blue-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg></button>' +
-                                    '<button onclick="editUser(\\'' + encodeURIComponent(user.username) + '\\')" title="ویرایش" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-yellow-50 dark:hover:bg-yellow-900/30 text-yellow-600 dark:text-yellow-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"></path></svg></button>' +
-                                    '<button onclick="deleteUser(\\'' + encodeURIComponent(user.username) + '\\')" title="حذف" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 hover:bg-red-50 dark:hover:bg-red-950/20 text-red-600 dark:text-red-400 rounded transition shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>' +
-                                    '<button onclick="toggleUserStatus(\\'' + encodeURIComponent(user.username) + '\\')" title="' + statusBtnTitle + '" class="p-1 flex items-center justify-center bg-white dark:bg-zinc-800 border border-gray-200 dark:border-zinc-700 ' + statusBtnColor + ' rounded transition shadow-sm">' + statusBtnIcon + '</button>' +
-                                '</div>' +
-                            '</td>' +
-                            '<td class="p-1 border-r border-gray-100 dark:border-zinc-800">' +
-							    '<div class="flex flex-col gap-0.5 w-[90px] mx-auto">' +
-							        '<button onclick="copySubLink(\\'' + encodeURIComponent(user.username) + '\\')" class="w-full flex items-center justify-center gap-1 px-1 py-0.5 bg-indigo-50 dark:bg-indigo-900/30 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-100 dark:hover:bg-indigo-900/50 rounded text-[9px] font-bold transition border border-indigo-200 dark:border-indigo-800">' +
-							            '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>' +
-							            'ساب متنی' +
-							        '</button>' +
-							        '<div class="flex flex-row gap-0.5 w-full h-[22px]">' +
-							            '<button onclick="copyStatusLink(\\'' + encodeURIComponent(user.username) + '\\')" class="flex-1 flex items-center justify-center gap-1 px-1 py-0 bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-500 hover:bg-green-100 dark:hover:bg-green-900/50 rounded text-[9px] font-bold transition border border-green-200 dark:border-green-800 whitespace-nowrap">' +
-							                '<svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14"></path></svg>' +
-							                'وضعیت' +
-							            '</button>' +
-							            '<button onclick="showSubQr(\\'' + encodeURIComponent(user.username) + '\\')" title="QR ساب" class="w-[22px] flex-shrink-0 flex items-center justify-center bg-amber-50 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400 hover:bg-amber-100 dark:hover:bg-amber-900/50 rounded transition border border-amber-200 dark:border-amber-800">' +
-							                '<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v1m6 11h2m-6 0h-2v4m0-11v3m0 0h.01M12 12h4.01M16 20h4M4 12h4m12 0h.01M5 8h2a1 1 0 001-1V5a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1zm14 0h2a1 1 0 001-1V5a1 1 0 00-1-1h-2a1 1 0 00-1 1v2a1 1 0 001 1zM5 19h2a1 1 0 001-1v-2a1 1 0 00-1-1H5a1 1 0 00-1 1v2a1 1 0 001 1z"></path></svg>' +
-							            '</button>' +
-							        '</div>' +
-							    '</div>' +
-							'</td>' +
-							'<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-center">' + configsCountHtml + '</td>' +
-							'<td class="p-1 border-r border-gray-100 dark:border-zinc-800 text-xs">' +
-							    '<div class="grid grid-flow-col grid-rows-3 gap-1 w-max mx-auto">' +
-							        String(user.port || "").split(",").map(function(p) {
-							            p = p.trim();
-							            if (!p) return "";
-							            var isTls = tlsPorts.includes(p);
-							            var isNonTls = nonTlsPorts.includes(p);
-							            var colorClass = isTls ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400' : 
-							                             isNonTls ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400' : 
-							                             'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
-							            return '<span class="inline-flex items-center justify-center px-1.5 py-0.5 text-[10px] font-semibold rounded leading-none ' + colorClass + '">' + p + '</span>';
-							        }).join("") +
-							    '</div>' +
-							'</td>' +
-							'<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + volumeHtml + '</td>' +
-							'<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + reqHtml + '</td>' +
-							'<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + expiryHtml + '</td>' +
-							'<td class="p-1.5 border-r border-gray-100 dark:border-zinc-800">' + onlineHtml + '</td>' +
-							'</tr>';
-                }).join('');
-                updateBulkActionsBar();
-                if (typeof loadProxyFlags === 'function') {
-                    setTimeout(loadProxyFlags, 50);
-                }
-            }
-        }
-		async function resetUserData(encodedUsername, actionType) {
-			const username = decodeURIComponent(encodedUsername);
-			let actionName = '';
-			if (actionType === 'volume') actionName = 'حجم';
-			else if (actionType === 'req') actionName = 'ریکوئست';
-			else if (actionType === 'time') actionName = 'زمان';
-			if (await customConfirm('آیا از ریست کردن ' + actionName + ' کاربر ' + username + ' مطمئن هستید؟')) {
-                try {
-                    const response = await fetch('/api/users/' + encodeURIComponent(username), {
-                        method: 'PUT',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ reset_action: actionType })
-                    });
-                    if (response.ok) {
-                        alert('عملیات با موفقیت انجام شد.');
-                        await loadUsers(true);
-                    } else {
-                        const errData = await response.json();
-                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-                    }
-                } catch (err) {
-                    alert('خطا در برقراری ارتباط با سرور');
-                }
-            }
-        }
-        async function toggleUserStatus(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            try {
-                const response = await fetch('/api/users/' + encodeURIComponent(username), {
-                    method: 'PUT',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ toggle_only: true })
-                });
-                if (response.ok) {
-                    await loadUsers(true);
-                } else {
-                    const errData = await response.json();
-                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-                }
-            } catch (err) {
-                alert('خطا در برقراری ارتباط با سرور');
-            }
-        }
-        async function handleFormSubmit(event) {
-            event.preventDefault();
-            const submitButton = document.getElementById('submit-btn');
-            submitButton.disabled = true;
-            submitButton.innerText = isEditMode ? 'در حال ذخیره تغییرات...' : 'در حال ایجاد...';
-            const username = document.getElementById('input-name').value;
-            const usernameRegex = /^[a-zA-Z0-9_-]+$/;
-            if (!usernameRegex.test(username)) {
-                alert('⚠️ نام کاربری فقط می‌تواند شامل حروف انگلیسی، اعداد، خط تیره (-) و آندرلاین (_) باشد!');
-                submitButton.disabled = false;
-                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
-                return;
-            }
-            const limit = document.getElementById('input-limit').value || null;
-            const expiry = document.getElementById('input-expiry').value || null;
-            const reqLimit = document.getElementById('input-req-limit').value || null;
-            const ipLimit = document.getElementById('input-ip-limit').value || null;
-			if (limit !== null && parseFloat(limit) < 0) { alert('⚠️ حجم نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
-			if (expiry !== null && parseInt(expiry) < 0) { alert('⚠️ زمان (روز) نمی‌تواند عدد منفی باشد!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
-			if ((reqLimit !== null && parseInt(reqLimit) < 0) || (ipLimit !== null && parseInt(ipLimit) < 0)) { alert('⚠️ محدودیت‌ها نمی‌توانند منفی باشند!'); submitButton.disabled = false; submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر'; return; }
-            const autoResetToggle = document.getElementById('input-auto-reset-toggle').checked;
-            const autoResetVolDays = document.getElementById('input-auto-reset-vol').value;
-            const autoResetReqDays = document.getElementById('input-auto-reset-req').value;
-            if (autoResetToggle) {
-                const volDays = parseInt(autoResetVolDays) || 0;
-                const reqDays = parseInt(autoResetReqDays) || 0;
-                if (volDays <= 0 && reqDays <= 0) {
-                    alert('⚠️ وقتی تیک تمدید خودکار روشن است، باید حداقل یکی از فیلدها (زمان تمدید حجم یا ریکوئست) را پر کنید!');
-                    submitButton.disabled = false;
-                    submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
-                    return;
-                }
-            }
-			const customPortsRaw = document.getElementById('input-custom-ports') ? document.getElementById('input-custom-ports').value : '';
-			const customPortsArray = customPortsRaw.replace(/ +/g, ',').split(',').map(p => p.trim()).filter(p => p.length > 0);
-			const checkedPorts = Array.from(document.querySelectorAll('input[name="ports"]:checked')).map(cb => cb.value).concat(customPortsArray);
-            const block_porn = document.getElementById('input-block-porn').checked ? 1 : 0;
-            const block_ads = document.getElementById('input-block-ads').checked ? 1 : 0;
-            const isFragEnabled = document.getElementById('input-frag-toggle').checked;
-            const frag_len = isFragEnabled ? (document.getElementById('input-frag-len').value || "200-3000") : "";
-            const frag_int = isFragEnabled ? (document.getElementById('input-frag-int').value || "1-2") : "";
-            const isAutoReset = document.getElementById('input-auto-reset-toggle').checked;
-            const auto_reset_vol_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-vol').value) || 0 : 0;
-            const auto_reset_req_days = isAutoReset ? parseInt(document.getElementById('input-auto-reset-req').value) || 0 : 0;
-            const auto_rotate_ip = parseInt(document.getElementById('hidden-auto-rotate').value) || 0;
-            const rotate_time = parseInt(document.getElementById('hidden-rotate-time').value) || 0;
-            const ip_operator = document.getElementById('hidden-ip-operator').value || 'all';
-            const ip_count = parseInt(document.getElementById('hidden-ip-count').value) || 20;
-            const userProxyMode = document.getElementById('user-proxy-mode-toggle') ? document.getElementById('user-proxy-mode-toggle').checked : false;
-            let userSocks5 = null;
-            if (userProxyMode && window.proxyFieldsData && window.proxyFieldsData.length > 0) {
-                const cleanProxies = window.proxyFieldsData.map(p => p ? p.trim() : "").filter(p => p !== "");
-                if (cleanProxies.length === 1) {
-                    userSocks5 = cleanProxies[0];
-                } else if (cleanProxies.length > 1) {
-                    userSocks5 = JSON.stringify(cleanProxies);
-                }
-            }
-            const auto_rotate_user_proxy = document.getElementById('input-auto-rotate-user-proxy') ? (document.getElementById('input-auto-rotate-user-proxy').checked ? 1 : 0) : 0;
-            if (checkedPorts.length === 0) {
-                alert('⚠️ لطفا حداقل یک پورت را برای اتصال انتخاب کنید!');
-                submitButton.disabled = false;
-                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
-                return;
-            }
-            const port = checkedPorts.join(',');
-            const tls = checkedPorts.some(p => tlsPorts.includes(p)) ? 'on' : 'off';
-            const ips = document.getElementById('input-ips').value;
-            const fingerprint = document.getElementById('fingerprint-select').value;
-            const url = isEditMode ? '/api/users/' + encodeURIComponent(editingUsername) : '/api/users';
-            const method = isEditMode ? 'PUT' : 'POST';
-            try {
-                const response = await fetch(url, {
-                    method: method,
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        username, limit_gb: limit, expiry_days: expiry, limit_req: reqLimit, tls, port, ips, fingerprint, ip_limit: ipLimit, block_porn: block_porn, block_ads: block_ads, frag_len: frag_len, frag_int: frag_int,
-                        user_proxy_iata: null,
-                        user_socks5: userSocks5 || null,
-                        user_proxy_ip: null,
-                        auto_reset_vol_days: auto_reset_vol_days,
-                        auto_reset_req_days: auto_reset_req_days,
-                        auto_rotate_ip: auto_rotate_ip,
-                        rotate_time: rotate_time,
-                        ip_operator: ip_operator,
-                        ip_count: ip_count,
-                        auto_rotate_user_proxy: auto_rotate_user_proxy
-                    })
-                });
-                if (response.ok) {
-                    toggleModal(false);
-                    await loadUsers(true);
-                } else {
-                    const errData = await response.json();
-                    alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-                }
-            } catch (err) {
-                alert('خطا در برقراری ارتباط با سرور');
-            } finally {
-                submitButton.disabled = false;
-                submitButton.innerText = isEditMode ? 'ذخیره تغییرات' : 'ایجاد کاربر';
-            }
-        }
-window.activeProxyIndex = 0;
-window.proxyFieldsData = [""];
-window.renderProxyFieldsUI = function() {
-	const wrapper = document.getElementById("proxies-fields-wrapper");
-	const addBtn = document.getElementById("add-proxy-field-btn");
-	if (!wrapper) return;
-	wrapper.innerHTML = "";
-	window.proxyFieldsData.forEach((val, idx) => {
-		const isFocused = idx === window.activeProxyIndex;
-		const borderClass = isFocused ? "ring-2 ring-blue-500 border-blue-500" : "border-gray-200 dark:border-amoled-border";
-		const row = document.createElement("div");
-		row.className = "flex flex-col gap-0.5 w-full";
-		const proxyStr = (val || "").trim();
-		const pingObj = proxyStr ? (window.proxyPingMap && window.proxyPingMap[proxyStr]) : null;
-		const pingClass = pingObj ? pingObj.className : "text-[10px] font-bold text-center empty:hidden transition-colors";
-		const pingText = pingObj ? pingObj.text : "";
-		let inputRow = '<div class="flex items-center gap-1 w-full">' +
-			'<input type="text" value="' + (val || "") + '" onfocus="setActiveProxyField(' + idx + ')" onclick="setActiveProxyField(' + idx + ')" oninput="updateProxyFieldData(' + idx + ', this.value)" placeholder="socks5:// یا http:// (کشور ' + (idx + 1) + ')" dir="ltr" class="flex-1 px-2 py-1.5 bg-gray-50 dark:bg-amoled-input border ' + borderClass + ' rounded text-xs font-mono focus:outline-none text-gray-800 dark:text-zinc-100 transition">';
-		if (idx > 0) {
-			inputRow += '<button type="button" onclick="removeProxyFieldUI(' + idx + ')" class="w-7 h-7 flex-shrink-0 bg-red-50 dark:bg-red-950/40 border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-100 rounded flex items-center justify-center font-bold text-xs shadow-sm" title="حذف"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button>';
-		}
-		inputRow += '</div><span id="proxy-ping-label-' + idx + '" class="' + pingClass + '">' + pingText + '</span>';
-		row.innerHTML = inputRow;
-		wrapper.appendChild(row);
-	});
-	if (addBtn) {
-		addBtn.style.display = window.proxyFieldsData.length >= 5 ? "none" : "flex";
-	}
-};
-window.setActiveProxyField = function(idx) {
-    if (window.activeProxyIndex === idx) return;
-    window.activeProxyIndex = idx;
-    const wrapper = document.getElementById("proxies-fields-wrapper");
-    if (wrapper) {
-        const inputs = wrapper.querySelectorAll("input[type='text']");
-        inputs.forEach((inp, i) => {
-            if (i === idx) {
-                inp.classList.remove("border-gray-200", "dark:border-amoled-border");
-                inp.classList.add("ring-2", "ring-blue-500", "border-blue-500");
-            } else {
-                inp.classList.remove("ring-2", "ring-blue-500", "border-blue-500");
-                inp.classList.add("border-gray-200", "dark:border-amoled-border");
-            }
-        });
-    }
-};
-window.updateProxyFieldData = function(idx, val) {
-    window.proxyFieldsData[idx] = val;
-    const span = document.getElementById('proxy-ping-label-' + idx);
-    if (span) {
-        span.innerText = '';
-        span.className = 'text-[10px] font-bold text-center empty:hidden transition-colors';
-    }
-};
-window.addProxyFieldUI = function() {
-    if (window.proxyFieldsData.length < 5) {
-        window.proxyFieldsData.push("");
-        window.activeProxyIndex = window.proxyFieldsData.length - 1;
-        window.renderProxyFieldsUI();
-        setTimeout(() => {
-            const wrapper = document.getElementById("proxies-fields-wrapper");
-            if (wrapper) {
-                const inputs = wrapper.querySelectorAll("input[type='text']");
-                if (inputs[window.activeProxyIndex]) inputs[window.activeProxyIndex].focus();
-            }
-        }, 10);
-    }
-};
-window.removeProxyFieldUI = function(idx) {
-    if (window.proxyFieldsData.length > 1) {
-        window.proxyFieldsData.splice(idx, 1);
-        if (window.activeProxyIndex >= window.proxyFieldsData.length) {
-            window.activeProxyIndex = window.proxyFieldsData.length - 1;
-        }
-        window.renderProxyFieldsUI();
-    }
-};
-function setModalState(modalId, show) {
-			const modal = document.getElementById(modalId);
-			if (!modal) return;
-			const card = modal.querySelector('div');
-			if (show) {
-				modal.classList.remove('opacity-0', 'pointer-events-none');
-				modal.classList.add('opacity-100', 'pointer-events-auto');
-				card.classList.remove('opacity-0', 'scale-95');
-				card.classList.add('opacity-100', 'scale-100');
-			} else {
-				modal.classList.remove('opacity-100', 'pointer-events-auto');
-				modal.classList.add('opacity-0', 'pointer-events-none');
-				card.classList.remove('opacity-100', 'scale-100');
-				card.classList.add('opacity-0', 'scale-95');
-			}
-		}
-		function closeUsageWarning() { setModalState('usage-warning-modal', false); }
-		function openUsageWarning() { setModalState('usage-warning-modal', true); }
-		function closeFreePanelWarning() { setModalState('free-panel-warning-modal', false); }
-		function closeOnlineCounterWarning() { setModalState('online-counter-warning-modal', false); }
-		function openOnlineCounterWarning() { setModalState('online-counter-warning-modal', true); }
-		function closeConfigCountWarning() { setModalState('config-count-warning-modal', false); }
-		function openConfigCountWarning() { setModalState('config-count-warning-modal', true); }
-	async function checkGlobalMessage() {
-        try {
-            const res = await fetchWithFallbackUI('message.txt?t=' + Date.now());
-            if (!res || !res.ok) return;
-            const text = await res.text();
-            const lines = text.split('\\n');
-            if (lines.length < 2) return;
-            const firstLine = lines[0].trim();
-            if (!firstLine.startsWith('VERSION=')) return;
-            const version = firstLine.split('=')[1].trim();
-            const content = lines.slice(1).join('\\n').trim();
-            if (window.zeus_global_msg_version !== version) {
-                document.getElementById('global-message-content').innerHTML = content;
-                setModalState('global-message-modal', true);
-                document.getElementById('global-message-close-btn').onclick = function() {
-                    setModalState('global-message-modal', false);
-                    window.zeus_global_msg_version = version;
-                };
-            }
-        } catch (err) {}
-    }
-		function getvIeesLink(username) {
-            const user = window.allUsers.find(u => u.username === username);
-            if (!user) return '';
-            const host = window.location.hostname;
-            var ips = [host];
-            if (user.ips) {
-                const parsedIps = user.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
-                if (parsedIps.length > 0) ips = parsedIps;
-            }
-            var ports = String(user.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
-            var fp = user.fingerprint || 'chrome';
-            const dynPath = encodeURIComponent("/stream/PANEL_ZEUS/" + (user.uuid ? user.uuid.split("-")[4] : "default"));
-            const links = [];
-		const m1 = decodeURIComponent('%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F');
-		const m2 = decodeURIComponent('%F0%9F%9A%80%40PANEL_ZEUS%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80');
-		links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m1));
-		links.push('vle' + 'ss://' + (user.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m2));
-            let remVol = "Unlimited";
-            if (user.limit_gb) {
-                let rem = user.limit_gb - (user.used_gb || 0);
-                remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
-            }
-            let remTime = "Unlimited";
-            if (user.expiry_days && user.created_at) {
-                const created = new Date(user.created_at);
-                const expiryDate = new Date(created.getTime() + user.expiry_days * 24 * 60 * 60 * 1000);
-                const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-                remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-            }
-            let remReq = "Unlimited";
-            if (user.limit_req) {
-                let rem = user.limit_req - (user.used_req || 0);
-                remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
-            }
-            const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
-            links.push('vle' + 'ss://' + (user.uuid || '') + '@' + host + ':80?path=' + dynPath + '&security=none&encryption=none&host=' + host + '&fp=' + fp + '&type=ws#' + encodeURIComponent(infoRemark));
-            const rawPath = "/stream/PANEL_ZEUS/" + (user.uuid ? user.uuid.split("-")[4] : "default");
-            let proxyList = [];
-            try {
-                if (user.user_socks5 && user.user_socks5.trim().startsWith("[")) {
-                    proxyList = JSON.parse(user.user_socks5);
-                } else if (user.user_socks5 || user.user_proxy_ip) {
-                    proxyList = [user.user_socks5 || user.user_proxy_ip];
-                } else {
-                    proxyList = [null];
-                }
-            } catch (e) {
-                proxyList = [user.user_socks5 || user.user_proxy_ip];
-            }
-            if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [null];
-            let proxyFlagCache = {};
-            try { proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
-            for (let locIdx = 0; locIdx < proxyList.length; locIdx++) {
-                let proxyItem = proxyList[locIdx];
-                let proxyStr = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.proxy : proxyItem;
-                let countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : (user.user_proxy_iata || "");
-                let flagEmoji = "🌐";
-                if (countryCode && typeof getFlagEmoji === 'function') {
-                    flagEmoji = getFlagEmoji(countryCode);
-                } else if (proxyStr && proxyFlagCache[proxyStr]) {
-                    flagEmoji = proxyFlagCache[proxyStr];
-                }
-                const currentDynPath = encodeURIComponent(rawPath + ((proxyList[0] !== null && proxyList[0] !== "") ? "?loc=" + locIdx : ""));
-                ips.forEach((ip) => {
-                    ports.forEach((portStr) => {
-                        const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
-                        const tlsVal = isTlsPort ? "tls" : "none";
-                        const userFrag = user.frag_len && user.frag_int ? "&fragment=" + user.frag_len + "," + user.frag_int : "";
-                        const remark = "ZEUS | " + flagEmoji + " | " + user.username;
-                        links.push('vle' + 'ss://' + (user.uuid || '') + '@' + ip + ':' + portStr + '?path=' + currentDynPath + '&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
-                    });
-                });
-            }
-            return links.join('\\n');
-        }
-        function getSubLink(username) {
-            return window.location.origin + '/feed/' + encodeURIComponent(username);
-        }
-        function getStatusLink(username) {
-            return window.location.origin + '/status/' + encodeURIComponent(username);
-        }
-        function copySubLink(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            navigator.clipboard.writeText(getSubLink(username)).then(() => {
-                alert('✅ لینک ساب متنی با موفقیت کپی شد!');
-            }).catch(() => {
-                alert('خطا در کپی کردن لینک ساب!');
-            });
-        }
-		function toggleQrModal(show, text) {
-            const container = document.getElementById('qrcode-container');
-            if (show) {
-                container.innerHTML = '';
-                new QRCode(container, { text: text, width: 200, height: 200, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M });
-            }
-            setModalState('qr-modal', show);
-        }
-        function downloadQrCode() {
-            const container = document.getElementById('qrcode-container');
-            if (!container) return;
-            const canvas = container.querySelector('canvas');
-            const img = container.querySelector('img');
-            let dataUrl = '';
-            if (canvas) {
-                dataUrl = canvas.toDataURL("image/png");
-            } else if (img && img.src) {
-                dataUrl = img.src;
-            }
-            if (!dataUrl) {
-                alert('⚠️ تصویر QR برای دانلود یافت نشد!');
-                return;
-            }
-            const downloadAnchor = document.createElement('a');
-            downloadAnchor.href = dataUrl;
-            downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
-            document.body.appendChild(downloadAnchor);
-            downloadAnchor.click();
-            downloadAnchor.remove();
-        }
-        function showSubQr(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            const link = getSubLink(username);
-            toggleQrModal(true, link);
-        }
-        function copyStatusLink(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            navigator.clipboard.writeText(getStatusLink(username)).then(() => {
-                alert('✅ لینک صفحه وضعیت با موفقیت کپی شد!');
-            }).catch(() => {
-                alert('خطا در کپی کردن لینک صفحه وضعیت!');
-            });
-        }
-        function copyConfig(encodedUsername) {
-            const username = decodeURIComponent(encodedUsername);
-            const link = getvIeesLink(username);
-            if (!link) return;
-            navigator.clipboard.writeText(link).then(() => {
-                alert('✅ کـانفـیگ vIees با موفقیت کپی شد!');
-            }).catch(() => {
-                alert('خطا در کپی کردن کـانفـیگ!');
-            });
-        }
-function editUser(encodedUsername) {
-    const username = decodeURIComponent(encodedUsername);
-    const user = window.allUsers.find(u => u.username === username);
-    if (!user) {
-        alert('کاربر یافت نشد!');
+  }
+  远程连接值409.drainUpload = () => {
+    if (!值值408 && !值队列.empty && 远程连接值409.writer) queueMicrotask(处理值值402);
+  };
+  const 值数据399 = 请求417.headers.get(atob('c2VjLXdlYnNvY2tldC1wcm90b2NvbA==')) || '';
+  const 本地值398 = 制作值流(值值410, 值数据399);
+  本地值398.pipeTo(new WritableStream({
+    async write(块397) {
+      if (传输值) return;
+      const 数据396 = 处理值值8数组(块397);
+      if (是否域名系统值) return await 处理值用户数据报(数据396, 值值410, null, 请求值407);
+      if (远程连接值409.socket && 远程连接值409.writer) {
+        if (!处理队列值(数据396)) throw new Error('upload queue overflow');
         return;
-    }
-    isEditMode = true;
-    editingUsername = username;
-    document.getElementById('modal-title').innerText = 'ویرایش کاربر: ' + username;
-    document.getElementById('submit-btn').innerText = 'ذخیره تغییرات';
-    const nameInput = document.getElementById('input-name');
-    nameInput.value = username;
-    nameInput.disabled = false;
-    document.getElementById('input-limit').value = user.limit_gb || '';
-    document.getElementById('input-expiry').value = user.expiry_days || '';
-    document.getElementById('input-req-limit').value = user.limit_req || '';
-    document.getElementById('input-ip-limit').value = (user.ip_limit !== undefined && user.ip_limit !== null) ? user.ip_limit : (user.max_connections || '');
-    document.getElementById('input-ips').value = user.ips || '';
-    document.getElementById('fingerprint-select').value = user.fingerprint || 'chrome';
-	document.getElementById('hidden-auto-rotate').value = user.auto_rotate_ip || '0';
-	document.getElementById('hidden-rotate-time').value = user.rotate_time || '';
-	document.getElementById('hidden-ip-operator').value = user.ip_operator || 'all';
-	document.getElementById('hidden-ip-count').value = user.ip_count || '20';
-    document.getElementById('input-block-porn').checked = (user.block_porn === 1);
-    document.getElementById('input-block-ads').checked = (user.block_ads === 1);
-    const autoRotateUserProxyCheck = document.getElementById('input-auto-rotate-user-proxy');
-    if (autoRotateUserProxyCheck) autoRotateUserProxyCheck.checked = (user.auto_rotate_user_proxy === 1);
-    const hasAutoReset = Boolean((user.auto_reset_vol_days && user.auto_reset_vol_days > 0) || (user.auto_reset_req_days && user.auto_reset_req_days > 0));
-    const autoResetToggle = document.getElementById('input-auto-reset-toggle');
-    if (autoResetToggle) autoResetToggle.checked = hasAutoReset;
-    document.getElementById('input-auto-reset-vol').value = hasAutoReset && user.auto_reset_vol_days > 0 ? user.auto_reset_vol_days : '';
-    document.getElementById('input-auto-reset-req').value = hasAutoReset && user.auto_reset_req_days > 0 ? user.auto_reset_req_days : '';
-    window.toggleAutoResetInputs(hasAutoReset);
-    const hasFrag = Boolean(user.frag_len && user.frag_len !== "" && user.frag_int && user.frag_int !== "");
-    const fragToggle = document.getElementById('input-frag-toggle');
-    if (fragToggle) fragToggle.checked = hasFrag;
-    document.getElementById('input-frag-len').value = hasFrag ? user.frag_len : '200-3000';
-    document.getElementById('input-frag-int').value = hasFrag ? user.frag_int : '1-2';
-    window.toggleFragInputs(hasFrag);
-    const userPorts = String(user.port || '').split(',').map(p => p.trim());
-    const predefinedPorts = [...tlsPorts, ...nonTlsPorts];
-    const customPorts = userPorts.filter(p => !predefinedPorts.includes(p) && p !== '');
-    document.querySelectorAll('input[name="ports"]').forEach(cb => {
-        cb.checked = userPorts.includes(cb.value);
-    });
-    const customPortInput = document.getElementById('input-custom-ports');
-    if (customPortInput) customPortInput.value = customPorts.join(' ');
-    const userProxyToggle = document.getElementById('user-proxy-mode-toggle');
-    const userSocksInput = document.getElementById('user-socks5-input');
-	const targetProxy = user.user_socks5 || user.user_proxy_ip;
-	const userProxyResult = document.getElementById('test-user-proxy-result');
-	if (userProxyResult) userProxyResult.innerText = '';
-	window.proxyFieldsData = [""];
-	window.activeProxyIndex = 0;
-	if (user.user_socks5) {
-		if (userProxyToggle) userProxyToggle.checked = true;
-		if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(true);
-		try {
-			if (user.user_socks5.trim().startsWith("[")) {
-				const arr = JSON.parse(user.user_socks5);
-				window.proxyFieldsData = arr.map(x => typeof x === "object" && x !== null ? x.proxy : x);
-			} else {
-				window.proxyFieldsData = [user.user_socks5];
-			}
-		} catch(e) {
-			window.proxyFieldsData = [user.user_socks5];
-		}
-	} else {
-		if (userProxyToggle) userProxyToggle.checked = false;
-		if (typeof window.toggleUserProxyMode === 'function') window.toggleUserProxyMode(false);
-	}
-	if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-	toggleModal(true);
-}
-        async function deleteUser(encodedUsername) {
-			const username = decodeURIComponent(encodedUsername);
-			if (await customConfirm('آیا از حذف کاربر ' + username + ' مطمئن هستید؟')) {
-                try {
-                    const response = await fetch('/api/users/' + encodeURIComponent(username), { method: 'DELETE' });
-                    if (response.ok) {
-                        alert('✅ کاربر با موفقیت حذف شد.');
-                        window.selectedUsernames.delete(username);
-                        await loadUsers(true);
-                    } else {
-                        const errData = await response.json();
-                        alert('خطا: ' + (errData.error || 'عملیات ناموفق بود'));
-                    }
-                } catch (err) {
-                    alert('خطا در برقراری ارتباط با سرور');
-                }
+      }
+      if (协议类型) {
+        if (!处理队列值(数据396)) throw new Error('upload queue overflow');
+        return;
+      }
+      if (!协议类型) {
+        if (启用明文 && 数据396.byteLength >= 24) {
+          const 轻量协议结果 = 解析网页套接字值头部(数据396, 认证令牌);
+          if (!轻量协议结果.hasError) {
+            协议类型 = 解码64('dmxlc3M=');
+            const {
+              addressType: 地址类型395,
+              port: 端口394,
+              hostname: 主机名393,
+              rawIndex: 原始索引,
+              version: 本地值392,
+              isUDP: 是否用户数据报391
+            } = 轻量协议结果;
+            if (是否用户数据报391) {
+              if (端口394 === 53) 是否域名系统值 = true;else throw new Error(错误_仅支持域名系统用户数据报);
             }
+            const 值头部390 = new Uint8Array([本地值392[0], 0]);
+            const 原始数据389 = 数据396.subarray(原始索引);
+            if (是否域名系统值) return 处理值用户数据报(原始数据389, 值值410, 值头部390, 请求值407);
+            await 处理值值384(地址类型395, 主机名393, 端口394, 原始数据389, 值值410, 值头部390, 远程连接值409, 请求回退416, 实际地区411, 请求值414, 请求代理配置413, 请求值407);
+            return;
+          }
         }
-        function getFlagEmoji(countryCode) {
-            if (!countryCode) return '🌐';
-            const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
-            try {
-                return String.fromCodePoint(...codePoints);
-            } catch (e) {
-                return '🌐';
-            }
+        if (启用木马 && 数据396.byteLength >= 56) {
+          const 值结果 = await 解析木马头部(数据396, 认证令牌);
+          if (!值结果.hasError) {
+            协议类型 = atob('dHJvamFu');
+            const {
+              addressType: 地址类型388,
+              port: 端口387,
+              hostname: 主机名386,
+              rawClientData: 原始客户端数据
+            } = 值结果;
+            await 处理值值384(地址类型388, 主机名386, 端口387, 原始客户端数据, 值值410, null, 远程连接值409, 请求回退416, 实际地区411, 请求值414, 请求代理配置413, 请求值407);
+            return;
+          }
         }
-function saveSettings() {
-    toggleSettingsModal(false);
-    showToast('✅ تنظیمات با موفقیت ذخیره شد.');
-}
-/* ---- Telegram bot settings ---- */
-async function loadTelegramSettingsUI() {
-    try {
-        const res = await fetch('/api/tg/status');
-        const data = await res.json();
-        const statusEl = document.getElementById('tg-bot-status-text');
-        if (statusEl) {
-            statusEl.textContent = data.enabled
-                ? ('وضعیت: فعال' + (data.botUsername ? ' (@' + data.botUsername + ')' : ''))
-                : (data.hasToken ? 'وضعیت: توکن ثبت شده، هنوز فعال نشده' : 'وضعیت: غیرفعال');
-        }
-    } catch (e) {}
-}
-async function setupTelegramBot() {
-    const tokenInput = document.getElementById('tg-bot-token');
-    const btn = document.getElementById('tg-setup-btn');
-    const token = tokenInput ? tokenInput.value.trim() : '';
-    if (!token) { alert('توکن بات را وارد کنید.'); return; }
-    if (btn) { btn.disabled = true; btn.textContent = '...'; }
-    try {
-        const res = await fetch('/api/tg/setup', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ token: token })
-        });
-        const data = await res.json();
-        if (data.success) {
-            showToast('✅ بات تلگرام فعال شد.');
-            if (tokenInput) tokenInput.value = '';
-        } else {
-            alert('خطا: ' + (data.message || 'ثبت وبهوک ناموفق بود'));
-        }
-    } catch (e) {
-        alert('خطا در ارتباط با سرور');
-    } finally {
-        if (btn) { btn.disabled = false; btn.textContent = 'ثبت و فعال‌سازی'; }
-        loadTelegramSettingsUI();
+        throw new Error('Invalid protocol or authentication failed');
+      }
     }
+  })).catch(错误385 => {
+    关闭传输();
+  });
+  return new Response(null, {
+    status: 101,
+    webSocket: 客户端值
+  });
 }
-/* ---- Fallback relay settings ---- */
-var currentRelayMode = 'fallback_only';
-function paintRelayModeButtons() {
-    ['fallback_only', 'prefer_region'].forEach(function(m) {
-        var btn = document.getElementById('relay-mode-' + m);
-        if (!btn) return;
-        if (m === currentRelayMode) {
-            btn.classList.add('border-blue-500', 'bg-blue-50', 'text-blue-700', 'dark:bg-blue-500/10', 'dark:text-blue-400');
-            btn.classList.remove('border-gray-200', 'dark:border-amoled-border', 'text-gray-500', 'dark:text-zinc-400');
-        } else {
-            btn.classList.remove('border-blue-500', 'bg-blue-50', 'text-blue-700', 'dark:bg-blue-500/10', 'dark:text-blue-400');
-            btn.classList.add('border-gray-200', 'dark:border-amoled-border', 'text-gray-500', 'dark:text-zinc-400');
-        }
+async function 处理值值384(地址类型383, 主机, 端口数字, 原始数据, 网页套接字382, 值头部381, 远程连接值, 请求回退 = '', 请求地区 = '', 请求值380 = null, 请求代理配置 = null, 请求值379 = null) {
+  // 优先使用客户端path参数，其次回退到全局配置
+  const 实际回退 = 请求回退 || 回退地址;
+  const 实际地区 = 请求地区 || 当前工作器地区;
+  const 实际地区匹配 = 请求值380 !== null ? 请求值380 : 启用地区匹配;
+  const 实际代理配置 = 请求代理配置 || 已解析代理5配置;
+  const 实际代理已启用 = 请求代理配置 ? true : 是否代理已启用;
+  const 值数据378 = 处理值值8数组(原始数据);
+  async function 连接值发送(地址377, 端口376, 值代理 = false) {
+    const 远程值375 = 值代理 ? await 处理值代理连接(地址类型383, 地址377, 端口376, 实际代理配置) : await 连接值套接字(地址377, 端口376, 请求值379, 传输连接竞速数);
+    const 写入器374 = 远程值375.writable.getWriter();
+    if (值数据378.byteLength) await 写入器374.write(值数据378);
+    return {
+      remoteSock: 远程值375,
+      writer: 写入器374
+    };
+  }
+  function 处理值值当前(远程值373, 写入器372) {
+    if (远程连接值.socket !== 远程值373) return;
+    try {
+      写入器372?.releaseLock();
+    } catch (忽略值371) {}
+    远程连接值.socket = null;
+    远程连接值.writer = null;
+  }
+  function 处理值远程(远程值370, 写入器369, 重试值368) {
+    try {
+      if (远程连接值.writer && 远程连接值.writer !== 写入器369) {
+        远程连接值.writer.releaseLock();
+      }
+    } catch (忽略值367) {}
+    远程连接值.socket = 远程值370;
+    远程连接值.writer = 写入器369;
+    远程连接值.drainUpload?.();
+    远程值370.closed.catch(() => {}).finally(() => {
+      if (远程连接值.socket === 远程值370) 关闭套接字值(网页套接字382);
     });
-}
-function setRelayModeUI(mode) {
-    currentRelayMode = mode;
-    paintRelayModeButtons();
-}
-async function loadFallbackRelaysUI() {
-    try {
-        const res = await fetch('/api/fallback-relays');
-        const data = await res.json();
-        const box = document.getElementById('fallback-relays-input');
-        if (box && Array.isArray(data.relays)) {
-            box.value = data.relays.map(function(r) { return [r.address, r.port || 443, r.region || ''].join(':'); }).join('\n');
+    连接值279(远程值370, 网页套接字382, 值头部381, 重试值368).finally(() => {
+      if (远程连接值.socket === 远程值370) {
+        try {
+          写入器369.releaseLock();
+        } catch (忽略值366) {}
+        远程连接值.writer = null;
+      }
+    });
+  }
+  async function 处理重试连接() {
+    if (启用代理降级 && 实际代理已启用) {
+      try {
+        const {
+          remoteSock: 代理套接字,
+          writer: 代理写入器
+        } = await 连接值发送(主机, 端口数字, true);
+        处理值远程(代理套接字, 代理写入器, null);
+        return;
+      } catch (代理错误) {
+        let 备用主机365, 备用端口364;
+        if (实际回退 && 实际回退.trim()) {
+          const 已解析363 = 解析地址值端口(实际回退);
+          备用主机365 = 已解析363.address;
+          备用端口364 = 已解析363.port || 端口数字;
+        } else {
+          const 值备用地址362 = await 获取值备用地址(实际地区, 实际地区匹配);
+          备用主机365 = 值备用地址362 ? 值备用地址362.domain : 主机;
+          备用端口364 = 值备用地址362 ? 值备用地址362.port : 端口数字;
         }
-        currentRelayMode = data.mode === 'prefer_region' ? 'prefer_region' : 'fallback_only';
-        paintRelayModeButtons();
-    } catch (e) {}
-}
-async function saveFallbackRelays() {
-    const box = document.getElementById('fallback-relays-input');
-    if (!box) return;
-    const lines = box.value.split('\n').map(function(l) { return l.trim(); }).filter(Boolean);
-    const relays = lines.map(function(line) {
-        const parts = line.split(':');
-        return { address: (parts[0] || '').trim(), port: parseInt(parts[1], 10) || 443, region: (parts[2] || '').trim().toUpperCase() };
-    }).filter(function(r) { return r.address; });
-    try {
-        const res = await fetch('/api/fallback-relays', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ relays: relays, mode: currentRelayMode })
-        });
-        const data = await res.json();
-        if (data.success) showToast('✅ لیست آدرس‌های جایگزین و حالت اتصال ذخیره شد.');
-        else alert('ذخیره ناموفق بود');
-    } catch (e) {
-        alert('خطا در ارتباط با سرور');
+        try {
+          const {
+            remoteSock: 回退套接字361,
+            writer: 回退写入器360
+          } = await 连接值发送(备用主机365, 备用端口364, false);
+          处理值远程(回退套接字361, 回退写入器360, null);
+        } catch (回退错误359) {
+          关闭套接字值(网页套接字382);
+        }
+      }
+    } else {
+      let 备用主机, 备用端口;
+      if (实际回退 && 实际回退.trim()) {
+        const 已解析 = 解析地址值端口(实际回退);
+        备用主机 = 已解析.address;
+        备用端口 = 已解析.port || 端口数字;
+      } else {
+        const 值备用地址 = await 获取值备用地址(实际地区, 实际地区匹配);
+        备用主机 = 值备用地址 ? 值备用地址.domain : 主机;
+        备用端口 = 值备用地址 ? 值备用地址.port : 端口数字;
+      }
+      try {
+        const {
+          remoteSock: 回退套接字,
+          writer: 回退写入器
+        } = await 连接值发送(备用主机, 备用端口, 实际代理已启用);
+        处理值远程(回退套接字, 回退写入器, null);
+      } catch (回退错误) {
+        关闭套接字值(网页套接字382);
+      }
     }
+  }
+  try {
+    const {
+      remoteSock: 值套接字358,
+      writer: 值写入器
+    } = await 连接值发送(主机, 端口数字, 启用代理降级 ? false : 实际代理已启用);
+    处理值远程(值套接字358, 值写入器, () => {
+      处理值值当前(值套接字358, 值写入器);
+      处理重试连接();
+    });
+  } catch (错误357) {
+    await 处理重试连接();
+  }
 }
-/* ---- Language (FA/EN) ---- */
-const PANEL_I18N = {
-    en: {
-        settings_tg_title: '🤖 Telegram bot',
-        settings_tg_status_off: 'Status: disabled',
-        settings_tg_setup_btn: 'Register &amp; enable',
-        settings_tg_help: 'Once enabled, send each user a one-time /start link from their user card so they can link their account in Telegram and get their subscription link and usage status on demand. Commands: /link code — /status',
-        settings_relay_title: '🌍 Regional fallback relays',
-        settings_relay_help: 'If the direct connection to a destination fails, the panel automatically retries through the nearest address in this list, matched to the worker\u2019s edge region. One per line: <code>address:port:REGIONCODE</code> — e.g. <code>1.2.3.4:443:DE</code>',
-        settings_relay_save_btn: 'Save list',
-        settings_relay_mode_fallback: 'Only on failure',
-        settings_relay_mode_prefer: 'Always try regional relay first',
-        settings_relay_mode_help: '“Only on failure”: the direct connection is tried first, the relay is just a backup. “Always regional relay first”: if a same-region relay exists, it is used from the start — a real part of the connection path, not just a backup.'
+function 处理值值8数组(块356) {
+  if (块356 instanceof Uint8Array) return 块356;
+  if (块356 instanceof ArrayBuffer) return new Uint8Array(块356);
+  if (ArrayBuffer.isView(块356)) return new Uint8Array(块356.buffer, 块356.byteOffset, 块356.byteLength);
+  return new Uint8Array(块356);
+}
+function 拼接值8数组(头部355, 主体354) {
+  const 头值353 = 处理值值8数组(头部355);
+  const 乙值352 = 处理值值8数组(主体354);
+  const 输出351 = new Uint8Array(头值353.byteLength + 乙值352.byteLength);
+  输出351.set(头值353);
+  输出351.set(乙值352, 头值353.byteLength);
+  return 输出351;
+}
+function 创建块队列(本地值350, 值值349 = 本地值350, 项目列表上限 = Math.max(1, 值值349 >> 8)) {
+  let 队列 = [];
+  let 头部348 = 0;
+  let 值字节347 = 0;
+  let 值缓冲346 = null;
+  function 处理本地值345() {
+    if (头部348 > 32 && 头部348 * 2 >= 队列.length) {
+      队列 = 队列.slice(头部348);
+      头部348 = 0;
+    }
+  }
+  function 处理本地值344() {
+    if (头部348 >= 队列.length) return null;
+    const 数据343 = 队列[头部348];
+    队列[头部348++] = undefined;
+    值字节347 -= 数据343.byteLength;
+    处理本地值345();
+    return 数据343;
+  }
+  return {
+    get empty() {
+      return 头部348 >= 队列.length;
+    },
+    clear() {
+      队列 = [];
+      头部348 = 0;
+      值字节347 = 0;
+    },
+    sow(数据342) {
+      const 数量值 = 数据342?.byteLength || 0;
+      if (!数量值) return true;
+      if (值字节347 + 数量值 > 值值349 || 队列.length - 头部348 >= 项目列表上限) return false;
+      队列.push(数据342);
+      值字节347 += 数量值;
+      return true;
+    },
+    bundle(数据341 = null) {
+      数据341 ||= 处理本地值344();
+      if (!数据341 || 头部348 >= 队列.length || 数据341.byteLength >= 本地值350) return [数据341, false];
+      let 本地值340 = 数据341.byteLength;
+      let 结束 = 头部348;
+      while (结束 < 队列.length) {
+        const 本地值339 = 队列[结束];
+        const 值值338 = 本地值340 + 本地值339.byteLength;
+        if (值值338 > 本地值350) break;
+        本地值340 = 值值338;
+        结束++;
+      }
+      if (结束 === 头部348) return [数据341, false];
+      const 输出 = 值缓冲346 ||= new Uint8Array(本地值350);
+      输出.set(数据341);
+      let 偏移337 = 数据341.byteLength;
+      while (头部348 < 结束) {
+        const 本地值336 = 队列[头部348];
+        队列[头部348++] = undefined;
+        值字节347 -= 本地值336.byteLength;
+        输出.set(本地值336, 偏移337);
+        偏移337 += 本地值336.byteLength;
+      }
+      处理本地值345();
+      return [输出.subarray(0, 本地值340), true];
+    }
+  };
+}
+function 创建值值(网页套接字335) {
+  const 本地值334 = 传输下载包大小;
+  const 尾部 = 传输下载尾部;
+  const 值值333 = Math.max(4096, 尾部 << 3);
+  let 本地值332 = new Uint8Array(本地值334);
+  let 值字节 = 0;
+  let 计时器 = 0;
+  let 值值331 = false;
+  let 本地值330 = 0;
+  let 值键 = 0;
+  let 值值329 = 0;
+  function 刷新() {
+    if (计时器) clearTimeout(计时器);
+    计时器 = 0;
+    值值331 = false;
+    if (!值字节) return;
+    if (网页套接字335.readyState === 1) 网页套接字335.send(本地值332.subarray(0, 值字节).slice());
+    本地值332 = new Uint8Array(本地值334);
+    值字节 = 0;
+    值值329 = 0;
+  }
+  function 处理本地值() {
+    if (计时器 || 值值331) return;
+    值值331 = true;
+    值键 = 本地值330;
+    queueMicrotask(() => {
+      值值331 = false;
+      if (!值字节 || 计时器) return;
+      if (本地值334 - 值字节 < 尾部) return 刷新();
+      计时器 = setTimeout(() => {
+        计时器 = 0;
+        if (!值字节) return;
+        if (本地值334 - 值字节 < 尾部) return 刷新();
+        if (值值329 < 2 && (本地值330 !== 值键 || 值字节 < 值值333)) {
+          值值329++;
+          值键 = 本地值330;
+          return 处理本地值();
+        }
+        刷新();
+      }, Math.max(传输下载延迟, 1));
+    });
+  }
+  return {
+    send(块328) {
+      const 数据327 = 处理值值8数组(块328);
+      let 偏移326 = 0;
+      const 本地值325 = 数据327.byteLength;
+      if (!本地值325) return;
+      while (偏移326 < 本地值325) {
+        if (!值字节 && 本地值325 - 偏移326 >= 本地值334) {
+          const 大小324 = Math.min(本地值334, 本地值325 - 偏移326);
+          if (网页套接字335.readyState === 1) 网页套接字335.send(偏移326 || 大小324 !== 本地值325 ? 数据327.subarray(偏移326, 偏移326 + 大小324) : 数据327);
+          偏移326 += 大小324;
+          continue;
+        }
+        const 大小323 = Math.min(本地值334 - 值字节, 本地值325 - 偏移326);
+        本地值332.set(数据327.subarray(偏移326, 偏移326 + 大小323), 值字节);
+        值字节 += 大小323;
+        偏移326 += 大小323;
+        本地值330++;
+        if (值字节 === 本地值334 || 本地值334 - 值字节 < 尾部) 刷新();else 处理本地值();
+      }
+    },
+    flush: 刷新
+  };
+}
+function 处理打开值套接字(地址322, 端口321, 请求值320 = null) {
+  const 目标 = {
+    hostname: 地址322,
+    port: 端口321
+  };
+  if (请求值320 && typeof 请求值320.connect === 'function') return 请求值320.connect(目标);
+  return 连接(目标);
+}
+async function 处理打开值套接字值(地址319, 端口318, 请求值317 = null) {
+  try {
+    const 套接字316 = 处理打开值套接字(地址319, 端口318, 请求值317);
+    if (套接字316?.opened) await 套接字316.opened;
+    return 套接字316;
+  } catch (错误315) {
+    if (!请求值317) throw 错误315;
+    const 套接字314 = 连接({
+      hostname: 地址319,
+      port: 端口318
+    });
+    if (套接字314?.opened) await 套接字314.opened;
+    return 套接字314;
+  }
+}
+async function 连接值套接字(地址313, 端口312, 请求值311 = null, 竞速数量 = 1) {
+  const 数量 = Math.max(1, 竞速数量 | 0);
+  if (数量 <= 1) return 处理打开值套接字值(地址313, 端口312, 请求值311);
+  const 本地值310 = Array.from({
+    length: 数量
+  }, () => 处理打开值套接字值(地址313, 端口312, 请求值311));
+  const 本地值309 = await Promise.any(本地值310);
+  本地值310.forEach(本地值308 => {
+    本地值308.then(套接字307 => {
+      if (套接字307 !== 本地值309) {
+        try {
+          套接字307.close();
+        } catch (忽略值306) {}
+      }
+    }, () => {});
+  });
+  return 本地值309;
+}
+function 获取唯一标识字节(令牌305) {
+  if (唯一标识字节缓存.has(令牌305)) return 唯一标识字节缓存.get(令牌305);
+  const 十六进制 = String(令牌305 || '').replace(/-/g, '');
+  if (十六进制.length !== 32) return null;
+  const 字节304 = new Uint8Array(16);
+  for (let 索引值303 = 0; 索引值303 < 16; 索引值303++) {
+    const 值302 = Number.parseInt(十六进制.slice(索引值303 * 2, 索引值303 * 2 + 2), 16);
+    if (Number.isNaN(值302)) return null;
+    字节304[索引值303] = 值302;
+  }
+  if (唯一标识字节缓存.size > 16) 唯一标识字节缓存.clear();
+  唯一标识字节缓存.set(令牌305, 字节304);
+  return 字节304;
+}
+function 处理值唯一标识(字节301, 偏移300, 令牌299) {
+  const 标识298 = 获取唯一标识字节(令牌299);
+  return !!标识298 && 字节301[偏移300] === 标识298[0] && 字节301[偏移300 + 1] === 标识298[1] && 字节301[偏移300 + 2] === 标识298[2] && 字节301[偏移300 + 3] === 标识298[3] && 字节301[偏移300 + 4] === 标识298[4] && 字节301[偏移300 + 5] === 标识298[5] && 字节301[偏移300 + 6] === 标识298[6] && 字节301[偏移300 + 7] === 标识298[7] && 字节301[偏移300 + 8] === 标识298[8] && 字节301[偏移300 + 9] === 标识298[9] && 字节301[偏移300 + 10] === 标识298[10] && 字节301[偏移300 + 11] === 标识298[11] && 字节301[偏移300 + 12] === 标识298[12] && 字节301[偏移300 + 13] === 标识298[13] && 字节301[偏移300 + 14] === 标识298[14] && 字节301[偏移300 + 15] === 标识298[15];
+}
+function 解析网页套接字值头部(块297, 令牌) {
+  const 字节296 = 处理值值8数组(块297);
+  if (字节296.byteLength < 24) return {
+    hasError: true,
+    message: 错误_无效数据
+  };
+  const 本地值295 = 字节296.subarray(0, 1);
+  if (!处理值唯一标识(字节296, 1, 令牌)) return {
+    hasError: true,
+    message: 错误_无效用户
+  };
+  const 值长度294 = 字节296[17];
+  const 命令索引 = 18 + 值长度294;
+  if (字节296.byteLength < 命令索引 + 5) return {
+    hasError: true,
+    message: 错误_无效数据
+  };
+  const 命令293 = 字节296[命令索引];
+  let 是否用户数据报 = false;
+  if (命令293 === 1) {} else if (命令293 === 2) {
+    是否用户数据报 = true;
+  } else {
+    return {
+      hasError: true,
+      message: 错误_不支持命令
+    };
+  }
+  const 端口索引292 = 19 + 值长度294;
+  const 端口291 = 字节296[端口索引292] << 8 | 字节296[端口索引292 + 1];
+  let 地址索引290 = 端口索引292 + 2,
+    地址长度289 = 0,
+    地址值索引 = 地址索引290 + 1,
+    主机名288 = '';
+  const 地址类型287 = 字节296[地址索引290];
+  switch (地址类型287) {
+    case 地址类型_四版:
+      地址长度289 = 4;
+      if (字节296.byteLength < 地址值索引 + 地址长度289) return {
+        hasError: true,
+        message: 错误_无效数据
+      };
+      主机名288 = `${字节296[地址值索引]}.${字节296[地址值索引 + 1]}.${字节296[地址值索引 + 2]}.${字节296[地址值索引 + 3]}`;
+      break;
+    case 地址类型_网址:
+      if (字节296.byteLength < 地址值索引 + 1) return {
+        hasError: true,
+        message: 错误_无效数据
+      };
+      地址长度289 = 字节296[地址值索引++];
+      if (字节296.byteLength < 地址值索引 + 地址长度289) return {
+        hasError: true,
+        message: 错误_无效数据
+      };
+      主机名288 = 共享解码器.decode(字节296.subarray(地址值索引, 地址值索引 + 地址长度289));
+      break;
+    case 地址类型_六版:
+      地址长度289 = 16;
+      if (字节296.byteLength < 地址值索引 + 地址长度289) return {
+        hasError: true,
+        message: 错误_无效数据
+      };
+      const 值6286 = [];
+      const 值6视图 = new DataView(字节296.buffer, 字节296.byteOffset + 地址值索引, 地址长度289);
+      for (let 索引值285 = 0; 索引值285 < 8; 索引值285++) 值6286.push(值6视图.getUint16(索引值285 * 2).toString(16));
+      主机名288 = 值6286.join(':');
+      break;
+    default:
+      return {
+        hasError: true,
+        message: `${错误_无效地址类型}: ${地址类型287}`
+      };
+  }
+  if (!主机名288) return {
+    hasError: true,
+    message: `${错误_空地址}: ${地址类型287}`
+  };
+  return {
+    hasError: false,
+    addressType: 地址类型287,
+    port: 端口291,
+    hostname: 主机名288,
+    isUDP: 是否用户数据报,
+    rawIndex: 地址值索引 + 地址长度289,
+    version: 本地值295
+  };
+}
+function 制作值流(套接字284, 值数据头部) {
+  let 本地值283 = false;
+  return new ReadableStream({
+    start(控制器282) {
+      套接字284.addEventListener('message', 事件 => {
+        if (!本地值283) 控制器282.enqueue(处理值值8数组(事件.data));
+      });
+      套接字284.addEventListener('close', () => {
+        if (!本地值283) {
+          关闭套接字值(套接字284);
+          控制器282.close();
+        }
+      });
+      套接字284.addEventListener('error', 错误281 => 控制器282.error(错误281));
+      const {
+        earlyData: 值数据,
+        error: 错误280
+      } = 处理基础64值数组(值数据头部);
+      if (错误280) 控制器282.error(错误280);else if (值数据) 控制器282.enqueue(处理值值8数组(值数据));
+    },
+    cancel() {
+      本地值283 = true;
+      关闭套接字值(套接字284);
+    }
+  });
+}
+async function 连接值279(远程套接字, 网页套接字278, 头部数据, 重试值) {
+  let 头部277 = 头部数据,
+    是否有数据 = false,
+    本地值276 = false;
+
+  // 关键：直连有时握手成功但远端长时间无数据，需要超时触发降级
+  let 首次字节计时器 = null;
+  if (重试值) {
+    首次字节计时器 = setTimeout(() => {
+      if (!是否有数据 && !本地值276) {
+        本地值276 = true;
+        try {
+          远程套接字.close && 远程套接字.close();
+        } catch (忽略值275) {}
+        重试值();
+      }
+    }, 首字节超时);
+  }
+  const 本地值274 = 创建值值(网页套接字278);
+  let 读取器273 = null;
+  let 本地值272 = true;
+  let 缓冲271 = new ArrayBuffer(传输块大小);
+  try {
+    try {
+      读取器273 = 远程套接字.readable.getReader({
+        mode: 'byob'
+      });
+    } catch (忽略值270) {
+      本地值272 = false;
+      读取器273 = 远程套接字.readable.getReader();
+    }
+    for (;;) {
+      const 结果269 = 本地值272 ? await 读取器273.read(new Uint8Array(缓冲271, 0, 传输块大小)) : await 读取器273.read();
+      if (结果269.done) break;
+      const 读取值 = 结果269.value;
+      let 块268 = 处理值值8数组(读取值);
+      const 值缓冲 = 本地值272 && 读取值?.buffer instanceof ArrayBuffer && 读取值.buffer.byteLength >= 传输块大小 ? 读取值.buffer : new ArrayBuffer(传输块大小);
+      if (!块268.byteLength) continue;
+      if (!是否有数据) {
+        是否有数据 = true;
+        if (首次字节计时器) {
+          clearTimeout(首次字节计时器);
+          首次字节计时器 = null;
+        }
+      }
+      if (网页套接字278.readyState !== 1) throw new Error(错误_网页套接字未打开);
+      if (头部277) {
+        块268 = 拼接值8数组(头部277, 块268);
+        头部277 = null;
+      }
+      if (块268.byteLength >= 传输块大小 >> 1) {
+        本地值274.flush();
+        网页套接字278.send(块268);
+        if (本地值272) 缓冲271 = new ArrayBuffer(传输块大小);
+      } else {
+        本地值274.send(块268.slice());
+        if (本地值272) 缓冲271 = 值缓冲;
+      }
+    }
+    本地值274.flush();
+  } catch (错误267) {
+    // 已经触发 retry 时不要关闭 WS（retry 会重新挂载新 socket）
+    if (!本地值276) 关闭套接字值(网页套接字278);
+  } finally {
+    try {
+      本地值274.flush();
+    } catch (忽略值266) {}
+    try {
+      读取器273?.releaseLock();
+    } catch (忽略值265) {}
+  }
+  if (首次字节计时器) {
+    clearTimeout(首次字节计时器);
+    首次字节计时器 = null;
+  }
+  if (!是否有数据 && !本地值276 && 重试值) 重试值();
+}
+async function 处理值用户数据报(用户数据报块, 网页套接字, 值头部, 请求值 = null) {
+  try {
+    const 值套接字 = await 连接值套接字('8.8.4.4', 53, 请求值, 1);
+    let 头部 = 值头部;
+    const 写入器264 = 值套接字.writable.getWriter();
+    await 写入器264.write(用户数据报块);
+    写入器264.releaseLock();
+    await 连接值279(值套接字, 网页套接字, 头部, null);
+  } catch (错误263) {}
+}
+async function 处理值代理连接(地址类型, 地址262, 端口261, 代理配置 = 已解析代理5配置) {
+  const {
+    username: 本地值260,
+    password: 密码259,
+    hostname: 主机名258,
+    socksPort: 代理端口257
+  } = 代理配置;
+  const 套接字256 = 连接({
+    hostname: 主机名258,
+    port: 代理端口257
+  });
+  const 写入器255 = 套接字256.writable.getWriter();
+  await 写入器255.write(new Uint8Array(本地值260 ? [5, 2, 0, 2] : [5, 1, 0]));
+  const 读取器254 = 套接字256.readable.getReader();
+  let 本地值253 = (await 读取器254.read()).value;
+  if (本地值253[0] !== 5 || 本地值253[1] === 255) throw new Error(错误_代理无可用方法);
+  if (本地值253[1] === 2) {
+    if (!本地值260 || !密码259) throw new Error(错误_代理需要认证);
+    const 编码器252 = new TextEncoder();
+    const 认证请求 = new Uint8Array([1, 本地值260.length, ...编码器252.encode(本地值260), 密码259.length, ...编码器252.encode(密码259)]);
+    await 写入器255.write(认证请求);
+    本地值253 = (await 读取器254.read()).value;
+    if (本地值253[0] !== 1 || 本地值253[1] !== 0) throw new Error(错误_代理认证失败);
+  }
+  const 编码器251 = new TextEncoder();
+  let 本地值250;
+  switch (地址类型) {
+    case 地址类型_四版:
+      本地值250 = new Uint8Array([1, ...地址262.split('.').map(Number)]);
+      break;
+    case 地址类型_网址:
+      本地值250 = new Uint8Array([3, 地址262.length, ...编码器251.encode(地址262)]);
+      break;
+    case 地址类型_六版:
+      本地值250 = new Uint8Array([4, ...地址262.split(':').flatMap(横值 => [parseInt(横值.slice(0, 2), 16), parseInt(横值.slice(2), 16)])]);
+      break;
+    default:
+      throw new Error(错误_无效地址类型);
+  }
+  await 写入器255.write(new Uint8Array([5, 1, 0, ...本地值250, 端口261 >> 8, 端口261 & 255]));
+  本地值253 = (await 读取器254.read()).value;
+  if (本地值253[1] !== 0) throw new Error(错误_代理连接失败);
+  写入器255.releaseLock();
+  读取器254.releaseLock();
+  return 套接字256;
+}
+function 解析代理配置(地址249) {
+  let [本地值248, 本地值247] = 地址249.split("@").reverse();
+  let 本地值246, 密码245, 主机名244, 代理端口;
+  if (本地值247) {
+    const 本地值243 = 本地值247.split(":");
+    if (本地值243.length !== 2) throw new Error(错误_无效代理地址);
+    [本地值246, 密码245] = 本地值243;
+  }
+  const 本地值242 = 本地值248.split(":");
+  代理端口 = Number(本地值242.pop());
+  if (isNaN(代理端口)) throw new Error(错误_无效代理地址);
+  主机名244 = 本地值242.join(":");
+  if (主机名244.includes(":") && !/^\[.*\]$/.test(主机名244)) throw new Error(错误_无效代理地址);
+  return {
+    username: 本地值246,
+    password: 密码245,
+    hostname: 主机名244,
+    socksPort: 代理端口
+  };
+}
+async function 处理订阅值(请求241, 用户240 = null) {
+  if (!用户240) 用户240 = 认证令牌;
+  const 网址239 = new URL(请求241.url);
+  // 优先检查Cookie中的语言设置
+  const 凭据头部 = 请求241.headers.get('Cookie') || '';
+  let 语言来源凭据 = null;
+  if (凭据头部) {
+    const 本地值238 = 凭据头部.split(';').map(丙值237 => 丙值237.trim());
+    for (const 凭据 of 本地值238) {
+      if (凭据.startsWith('preferredLanguage=')) {
+        语言来源凭据 = 凭据.split('=')[1];
+        break;
+      }
+    }
+  }
+  let 是否值236 = false;
+  if (语言来源凭据 === 'fa' || 语言来源凭据 === 'fa-IR') {
+    是否值236 = true;
+  } else if (语言来源凭据 === 'zh' || 语言来源凭据 === 'zh-CN') {
+    是否值236 = false;
+  } else {
+    // 如果没有Cookie，使用浏览器语言检测
+    const 接受语言 = 请求241.headers.get('Accept-Language') || '';
+    const 浏览器语言 = 接受语言.split(',')[0].split('-')[0].toLowerCase();
+    是否值236 = 浏览器语言 === 'fa' || 接受语言.includes('fa-IR') || 接受语言.includes('fa');
+  }
+  const 语言值 = 是否值236 ? 'fa-IR' : 'zh-CN';
+  const 本地值235 = {
+    zh: {
+      title: 解码64('6K6i6ZiF5Lit5b+D'),
+      subtitle: '多客户端支持 • 智能优选 • 一键生成',
+      selectClient: '[ 选择客户端 ]',
+      systemStatus: '[ 系统状态 ]',
+      configManagement: '[ 配置管理 ]',
+      relatedLinks: '[ 相关链接 ]',
+      checking: '检测中...',
+      workerRegion: 'Worker地区: ',
+      detectionMethod: '检测方式: ',
+      proxyIPStatus: 解码64('UHJveHlJUOeKtuaAgTog'),
+      currentIP: '当前使用IP: ',
+      regionMatch: '地区匹配: ',
+      selectionLogic: '选择逻辑: ',
+      kvStatusChecking: '检测KV状态中...',
+      kvEnabled: '✅ KV存储已启用，可以使用配置管理功能',
+      kvDisabled: '⚠️ KV存储未启用或未配置',
+      specifyRegion: '指定地区 (wk):',
+      autoDetect: '自动检测',
+      saveRegion: '保存地区配置',
+      protocolSelection: 解码64('5Y2P6K6u6YCJ5oupOg=='),
+      enableVLESS: 解码64('5ZCv55SoIFZMRVNTIOWNj+iurg=='),
+      enableTrojan: 解码64('5ZCv55SoIFRyb2phbiDljY/orq4='),
+      enableXhttp: 解码64('5ZCv55SoIHhodHRwIOWNj+iurg=='),
+      trojanPassword: 解码64('VHJvamFuIOWvhueggSAo5Y+v6YCJKTo='),
+      customPath: '自定义路径 (d):',
+      customIP: 解码64('6Ieq5a6a5LmJUHJveHlJUCAocCk6'),
+      preferredIPs: '优选IP列表 (yx):',
+      preferredIPsURL: '优选IP来源URL (yxURL):',
+      latencyTest: '延迟测试',
+      latencyTestIP: '测试IP/域名:',
+      latencyTestIPPlaceholder: '输入IP或域名，多个用逗号分隔',
+      latencyTestPort: '端口:',
+      startTest: '开始测试',
+      stopTest: '停止测试',
+      testResult: '测试结果:',
+      addToYx: '添加到优选列表',
+      addSelectedToYx: '添加选中项到优选列表',
+      selectAll: '全选',
+      deselectAll: '取消全选',
+      testingInProgress: '测试中...',
+      testComplete: '测试完成',
+      latencyMs: '延迟',
+      timeout: '超时',
+      ipSource: 'IP来源:',
+      manualInput: '手动输入',
+      cfRandomIP: 'CF随机IP',
+      urlFetch: 'URL获取',
+      randomCount: '生成数量:',
+      fetchURL: '获取URL:',
+      fetchURLPlaceholder: '输入优选IP的URL地址',
+      generateIP: '生成IP',
+      fetchIP: '获取IP',
+      socks5Config: 解码64('U09DS1M16YWN572uIChzKTo='),
+      customHomepage: '自定义首页URL (homepage):',
+      customHomepagePlaceholder: '例如: https://example.com',
+      customHomepageHint: '设置自定义URL作为首页伪装。访问根路径 / 时将显示该URL的内容。留空则显示默认终端页面。',
+      saveConfig: '保存配置',
+      advancedControl: '高级控制',
+      subscriptionConverter: 解码64('6K6i6ZiF6L2s5o2i5Zyw5Z2AOg=='),
+      builtinPreferred: '内置优选类型:',
+      enablePreferredDomain: '启用优选域名',
+      enablePreferredIP: '启用优选 IP',
+      enableNativeAddress: '启用原生地址',
+      enableGitHubPreferred: '启用自定义优选',
+      allowAPIManagement: '允许API管理 (ae):',
+      regionMatching: '地区匹配 (rm):',
+      downgradeControl: '降级控制 (qj):',
+      tlsControl: 'TLS控制 (dkby):',
+      preferredControl: '优选控制 (yxby):',
+      saveAdvanced: '保存高级配置',
+      loading: '加载中...',
+      currentConfig: '📍 当前路径配置',
+      refreshConfig: '刷新配置',
+      resetConfig: '重置配置',
+      subscriptionCopied: 解码64('6K6i6ZiF6ZO+5o6l5bey5aSN5Yi2'),
+      autoSubscriptionCopied: 解码64('6Ieq5Yqo6K+G5Yir6K6i6ZiF6ZO+5o6l5bey5aSN5Yi277yM5a6i5oi356uv6K6/6Zeu5pe25Lya5qC55o2uVXNlci1BZ2VudOiHquWKqOivhuWIq+W5tui/lOWbnuWvueW6lOagvOW8jw=='),
+      trojanPasswordPlaceholder: '留空则自动使用 UUID',
+      trojanPasswordHint: 解码64('6K6+572u6Ieq5a6a5LmJIFRyb2phbiDlr4bnoIHjgILnlZnnqbrliJnkvb/nlKggVVVJROOAguWuouaIt+err+S8muiHquWKqOWvueWvhueggei/m+ihjCBTSEEyMjQg5ZOI5biM44CC'),
+      protocolHint: 解码64('5Y+v5Lul5ZCM5pe25ZCv55So5aSa5Liq5Y2P6K6u44CC6K6i6ZiF5bCG55Sf5oiQ6YCJ5Lit5Y2P6K6u55qE6IqC54K544CCPGJyPuKAoiBWTEVTUyBXUzog5Z+65LqOIFdlYlNvY2tldCDnmoTmoIflh4bljY/orq48YnI+4oCiIFRyb2phbjog5L2/55SoIFNIQTIyNCDlr4bnoIHorqTor4E8YnI+4oCiIHhodHRwOiDln7rkuo4gSFRUUCBQT1NUIOeahOS8quijheWNj+iuru+8iOmcgOimgee7keWumuiHquWumuS5ieWfn+WQjeW5tuW8gOWQryBnUlBD77yJ'),
+      enableECH: '启用 ECH (Encrypted Client Hello)',
+      enableECHHint: 解码64('5ZCv55So5ZCO77yM5q+P5qyh5Yi35paw6K6i6ZiF5pe25Lya6Ieq5Yqo5LuOIERvSCDojrflj5bmnIDmlrDnmoQgRUNIIOmFjee9ruW5tua3u+WKoOWIsOmTvuaOpeS4rQ=='),
+      customDNS: '自定义 DNS 服务器',
+      customDNSPlaceholder: '例如: https://223.5.5.5/dns-query',
+      customDNSHint: '用于ECH配置查询的DNS服务器地址（DoH格式）',
+      customECHDomain: '自定义 ECH 域名',
+      customECHDomainPlaceholder: '例如: cloudflare-ech.com',
+      customECHDomainHint: 'ECH配置中使用的域名，留空则使用默认值',
+      alpn: 'TLS ALPN',
+      alpnDefault: '默认（留空，由客户端协商）',
+      alpnHint: '仅添加到 TLS 节点链接参数；留空则不写 alpn。',
+      saveProtocol: 解码64('5L+d5a2Y5Y2P6K6u6YWN572u'),
+      subscriptionConverterPlaceholder: '默认: https://url.v1.mk/sub',
+      subscriptionConverterHint: 解码64('6K6i6ZiF6L2s5o2i5bey5YaF6YOo5a6e546w77yM5peg6ZyA5aSW6YOoIEFQSeOAguatpOmhueS7heS9nOWFvOWuueS/neeVme+8jOWPr+eVmeepuuOAgg=='),
+      builtinPreferredHint: 解码64('5o6n5Yi26K6i6ZiF5Lit5YyF5ZCr5ZOq5Lqb5YaF572u5LyY6YCJ6IqC54K544CC6buY6K6k5YWo6YOo5ZCv55So44CC'),
+      apiEnabledDefault: '默认（关闭API）',
+      apiEnabledYes: '开启API管理',
+      apiEnabledHint: '⚠️ 安全提醒：开启后允许通过API动态添加优选IP。建议仅在需要时开启。',
+      regionMatchingDefault: '默认（启用地区匹配）',
+      regionMatchingNo: '关闭地区匹配',
+      regionMatchingHint: '设置为"关闭"时不进行地区智能匹配',
+      downgradeControlDefault: '默认（不启用降级）',
+      downgradeControlNo: '启用降级模式',
+      downgradeControlHint: 解码64('6K6+572u5Li6IuWQr+eUqCLml7bvvJpDRuebtOi/nuWksei0peKGklNPQ0tTNei/nuaOpeKGkmZhbGxiYWNr5Zyw5Z2A'),
+      tlsControlDefault: '默认（保留所有节点）',
+      tlsControlYes: '仅TLS节点',
+      tlsControlHint: '设置为"仅TLS节点"时只生成带TLS的节点，不生成非TLS节点（如80端口）',
+      preferredControlDefault: '默认（启用优选）',
+      preferredControlYes: '关闭优选',
+      preferredControlHint: '设置为"关闭优选"时只使用原生地址，不生成优选IP和域名节点',
+      regionNames: {
+        HK: '🇭🇰 香港',
+        US: '🇺🇸 美国',
+        SG: '🇸🇬 新加坡',
+        JP: '🇯🇵 日本',
+        KR: '🇰🇷 韩国',
+        DE: '🇩🇪 德国',
+        SE: '🇸🇪 瑞典',
+        NL: '🇳🇱 荷兰',
+        FI: '🇫🇮 芬兰',
+        GB: '🇬🇧 英国'
+      },
+      terminal: '终端 v2.9.8c',
+      githubProject: 'GitHub 项目',
+      优选工具: '优选工具',
+      autoDetectClient: '自动识别',
+      selectionLogicText: '同地区 → 邻近地区 → 其他地区',
+      customIPDisabledHint: 解码64('5L2/55So6Ieq5a6a5LmJUHJveHlJUOaXtu+8jOWcsOWMuumAieaLqeW3suemgeeUqA=='),
+      customIPMode: 解码64('6Ieq5a6a5LmJUHJveHlJUOaooeW8jyAocOWPmOmHj+WQr+eUqCk='),
+      customIPModeDesc: '自定义IP模式 (已禁用地区匹配)',
+      usingCustomProxyIP: 解码64('5L2/55So6Ieq5a6a5LmJUHJveHlJUDog'),
+      customIPConfig: ' (p变量配置)',
+      customIPModeDisabled: '自定义IP模式，地区选择已禁用',
+      manualRegion: '手动指定地区',
+      manualRegionDesc: ' (手动指定)',
+      proxyIPAvailable: 解码64('MTAvMTAg5Y+v55SoIChQcm94eUlQ5Z+f5ZCN6aKE6K6+5Y+v55SoKQ=='),
+      smartSelection: '智能就近选择中',
+      sameRegionIP: '同地区IP可用 (1个)',
+      cloudflareDetection: 'Cloudflare内置检测',
+      detectionFailed: '检测失败',
+      apiTestResult: 'API检测结果: ',
+      apiTestTime: '检测时间: ',
+      apiTestFailed: 'API检测失败: ',
+      unknownError: '未知错误',
+      apiTestError: 'API测试失败: ',
+      kvNotConfigured: 'KV存储未配置，无法使用配置管理功能。\\n\\n请在Cloudflare Workers中:\\n1. 创建KV命名空间\\n2. 绑定环境变量 C\\n3. 重新部署代码',
+      kvNotEnabled: 'KV存储未配置',
+      kvCheckFailed: 'KV存储检测失败: 响应格式错误',
+      kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
+      kvCheckFailedError: 'KV存储检测失败 - 错误: '
     },
     fa: {
-        settings_tg_title: '🤖 ربات تلگرام',
-        settings_tg_status_off: 'وضعیت: غیرفعال',
-        settings_tg_setup_btn: 'ثبت و فعال‌سازی',
-        settings_tg_help: 'پس از فعال‌سازی، برای هر کاربر یک لینک اتصال (/start) از پنل کاربر بگیرید تا با ارسال آن در تلگرام، وضعیت اشتراک و لینک ساب‌اسکریپشن‌شان را از بات دریافت کنند. دستورات: /link کد — /status',
-        settings_relay_title: '🌍 آدرس‌های جایگزین منطقه‌ای',
-        settings_relay_help: 'اگر اتصال مستقیم به مقصد شکست بخورد، پنل به‌صورت خودکار نزدیک‌ترین آدرس این لیست (بر اساس منطقه ادج ورکر) را امتحان می‌کند. هر خط: <code>آدرس:پورت:کدمنطقه</code> — مثال: <code>1.2.3.4:443:DE</code>',
-        settings_relay_save_btn: 'ذخیره لیست',
-        settings_relay_mode_fallback: 'فقط در صورت شکست',
-        settings_relay_mode_prefer: 'همیشه رلهٔ منطقه اول',
-        settings_relay_mode_help: '«فقط در صورت شکست»: اتصال مستقیم اول امتحان می‌شود، رله فقط بک‌آپ است. «همیشه رلهٔ منطقه اول»: اگر رلهٔ هم‌منطقه موجود باشد، همان ابتدا از آن استفاده می‌شود (بخشی واقعی از مسیر اتصال، نه فقط بک‌آپ).'
+      title: 'مرکز اشتراک',
+      subtitle: 'پشتیبانی چند کلاینت • انتخاب هوشمند • تولید یک کلیکی',
+      selectClient: '[ انتخاب کلاینت ]',
+      systemStatus: '[ وضعیت سیستم ]',
+      configManagement: '[ مدیریت تنظیمات ]',
+      relatedLinks: '[ لینک‌های مرتبط ]',
+      checking: 'در حال بررسی...',
+      workerRegion: 'منطقه Worker: ',
+      detectionMethod: 'روش تشخیص: ',
+      proxyIPStatus: 解码64('2YjYtti524zYqiBQcm94eUlQOiA='),
+      currentIP: 'IP فعلی: ',
+      regionMatch: 'تطبیق منطقه: ',
+      selectionLogic: 'منطق انتخاب: ',
+      kvStatusChecking: 'در حال بررسی وضعیت KV...',
+      kvEnabled: '✅ ذخیره‌سازی KV فعال است، می‌توانید از مدیریت تنظیمات استفاده کنید',
+      kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
+      specifyRegion: 'تعیین منطقه (wk):',
+      autoDetect: 'تشخیص خودکار',
+      saveRegion: 'ذخیره تنظیمات منطقه',
+      protocolSelection: 'انتخاب پروتکل:',
+      enableVLESS: 解码64('2YHYudin2YTigIzYs9in2LLbjCDZvtix2YjYqtqp2YQgVkxFU1M='),
+      enableTrojan: 解码64('2YHYudin2YTigIzYs9in2LLbjCDZvtix2YjYqtqp2YQgVHJvamFu'),
+      enableXhttp: 'فعال‌سازی پروتکل xhttp',
+      enableECH: 'فعال‌سازی ECH (Encrypted Client Hello)',
+      enableECHHint: 'پس از فعال‌سازی، در هر بار تازه‌سازی اشتراک، پیکربندی ECH به‌روز به‌طور خودکار از DoH دریافت شده و به لینک‌ها اضافه می‌شود',
+      customDNS: 'سرور DNS سفارشی',
+      customDNSPlaceholder: 'مثال: https://223.5.5.5/dns-query',
+      customDNSHint: 'آدرس سرور DNS برای جستجوی پیکربندی ECH (فرمت DoH)',
+      customECHDomain: 'دامنه ECH سفارشی',
+      customECHDomainPlaceholder: 'مثال: cloudflare-ech.com',
+      customECHDomainHint: 'دامنه استفاده شده در پیکربندی ECH، خالی بگذارید تا از مقدار پیش‌فرض استفاده شود',
+      trojanPassword: 解码64('2LHZhdiyINi52KjZiNixIFRyb2phbiAo2KfYrtiq24zYp9ix24wpOg=='),
+      customPath: 'مسیر سفارشی (d):',
+      customIP: 解码64('UHJveHlJUCDYs9mB2KfYsdi024wgKHApOg=='),
+      preferredIPs: 'لیست IP ترجیحی (yx):',
+      preferredIPsURL: 'URL منبع IP ترجیحی (yxURL):',
+      latencyTest: 'تست تاخیر',
+      latencyTestIP: 'IP/دامنه تست:',
+      latencyTestIPPlaceholder: 'IP یا دامنه وارد کنید، چند مورد با کاما جدا شوند',
+      latencyTestPort: 'پورت:',
+      startTest: 'شروع تست',
+      stopTest: 'توقف تست',
+      testResult: 'نتیجه تست:',
+      addToYx: 'افزودن به لیست ترجیحی',
+      addSelectedToYx: 'افزودن موارد انتخاب شده',
+      selectAll: 'انتخاب همه',
+      deselectAll: 'لغو انتخاب',
+      testingInProgress: 'در حال تست...',
+      testComplete: 'تست کامل شد',
+      latencyMs: 'تاخیر',
+      timeout: 'زمان تمام شد',
+      ipSource: 'منبع IP:',
+      manualInput: 'ورودی دستی',
+      cfRandomIP: 'IP تصادفی CF',
+      urlFetch: 'دریافت از URL',
+      randomCount: 'تعداد تولید:',
+      fetchURL: 'URL دریافت:',
+      fetchURLPlaceholder: 'آدرس URL لیست IP را وارد کنید',
+      generateIP: 'تولید IP',
+      fetchIP: 'دریافت IP',
+      socks5Config: 解码64('2KrZhti424zZhdin2KogU09DS1M1IChzKTo='),
+      customHomepage: 'URL صفحه اصلی سفارشی (homepage):',
+      customHomepagePlaceholder: 'مثال: https://example.com',
+      customHomepageHint: 'تنظیم URL سفارشی به عنوان استتار صفحه اصلی. هنگام دسترسی به مسیر اصلی / محتوای این URL نمایش داده می‌شود. اگر خالی بگذارید صفحه ترمینال پیش‌فرض نمایش داده می‌شود.',
+      saveConfig: 'ذخیره تنظیمات',
+      advancedControl: 'کنترل پیشرفته',
+      subscriptionConverter: 'آدرس تبدیل اشتراک:',
+      builtinPreferred: 'نوع ترجیحی داخلی:',
+      enablePreferredDomain: 'فعال‌سازی دامنه ترجیحی',
+      enablePreferredIP: 'فعال‌سازی IP ترجیحی',
+      enableNativeAddress: 'فعال‌سازی آدرس اصلی',
+      enableGitHubPreferred: 'فعال‌سازی ترجیح سفارشی',
+      allowAPIManagement: 'اجازه مدیریت API (ae):',
+      regionMatching: 'تطبیق منطقه (rm):',
+      downgradeControl: 'کنترل کاهش سطح (qj):',
+      tlsControl: 'کنترل TLS (dkby):',
+      preferredControl: 'کنترل ترجیحی (yxby):',
+      saveAdvanced: 'ذخیره تنظیمات پیشرفته',
+      loading: 'در حال بارگذاری...',
+      currentConfig: '📍 پیکربندی مسیر فعلی',
+      refreshConfig: 'تازه‌سازی تنظیمات',
+      resetConfig: 'بازنشانی تنظیمات',
+      subscriptionCopied: 'لینک اشتراک کپی شد',
+      autoSubscriptionCopied: 'لینک اشتراک تشخیص خودکار کپی شد، کلاینت هنگام دسترسی بر اساس User-Agent به طور خودکار تشخیص داده و قالب مربوطه را برمی‌گرداند',
+      trojanPasswordPlaceholder: 'خالی بگذارید تا از UUID استفاده شود',
+      trojanPasswordHint: 解码64('2LHZhdiyINi52KjZiNixIFRyb2phbiDYs9mB2KfYsdi024wg2LHYpyDYqtmG2LjbjNmFINqp2YbbjNivLiDYp9qv2LEg2K7Yp9mE24wg2Kjar9iw2KfYsduM2K8g2KfYsiBVVUlEINin2LPYqtmB2KfYr9mHINmF24zigIzYtNmI2K8uINqp2YTYp9uM2YbYqiDYqNmHINi32YjYsSDYrtmI2K/aqdin2LEg2LHZhdiyINi52KjZiNixINix2Kcg2KjYpyBTSEEyMjQg2YfYtCDZhduM4oCM2qnZhtivLg=='),
+      protocolHint: 解码64('2YXbjOKAjNiq2YjYp9mG24zYryDahtmG2K/bjNmGINm+2LHZiNiq2qnZhCDYsdinINmH2YXYstmF2KfZhiDZgdi52KfZhCDaqdmG24zYry4g2KfYtNiq2LHYp9qpINqv2LHZh+KAjNmH2KfbjCDZvtix2YjYqtqp2YTigIzZh9in24wg2KfZhtiq2K7Yp9ioINi02K/ZhyDYsdinINiq2YjZhNuM2K8g2YXbjOKAjNqp2YbYry48YnI+4oCiIFZMRVNTIFdTOiDZvtix2YjYqtqp2YQg2KfYs9iq2KfZhtiv2KfYsdivINmF2KjYqtmG24wg2KjYsSBXZWJTb2NrZXQ8YnI+4oCiIFRyb2phbjog2KfYrdix2KfYsiDZh9mI24zYqiDYqNinINix2YXYsiDYudio2YjYsSBTSEEyMjQ8YnI+4oCiIHhodHRwOiDZvtix2YjYqtqp2YQg2KfYs9iq2KrYp9ixINmF2KjYqtmG24wg2KjYsSBIVFRQIFBPU1QgKNmG24zYp9iyINio2Ycg2KfYqti12KfZhCDYr9in2YXZhtmHINiz2YHYp9ix2LTbjCDZiCDZgdi52KfZhOKAjNiz2KfYstuMIGdSUEMg2K/Yp9ix2K8p'),
+      alpn: 'TLS ALPN',
+      alpnDefault: 'پیش‌فرض (خالی، مذاکره توسط کلاینت)',
+      alpnHint: 'فقط به لینک‌های TLS اضافه می‌شود؛ اگر خالی باشد alpn نوشته نمی‌شود.',
+      saveProtocol: 'ذخیره تنظیمات پروتکل',
+      subscriptionConverterPlaceholder: 'پیش‌فرض: https://url.v1.mk/sub',
+      subscriptionConverterHint: 'تبدیل اشتراک به صورت داخلی پیاده‌سازی شده است و نیازی به API خارجی ندارد. این فیلد فقط برای سازگاری حفظ شده و می‌توان آن را خالی گذاشت.',
+      builtinPreferredHint: 'کنترل اینکه کدام گره‌های ترجیحی داخلی در اشتراک گنجانده شوند. به طور پیش‌فرض همه فعال هستند.',
+      apiEnabledDefault: 'پیش‌فرض (بستن API)',
+      apiEnabledYes: 'فعال‌سازی مدیریت API',
+      apiEnabledHint: '⚠️ هشدار امنیتی: فعال‌سازی این گزینه اجازه می‌دهد IP های ترجیحی از طریق API به طور پویا اضافه شوند. توصیه می‌شود فقط در صورت نیاز فعال کنید.',
+      regionMatchingDefault: 'پیش‌فرض (فعال‌سازی تطبیق منطقه)',
+      regionMatchingNo: 'بستن تطبیق منطقه',
+      regionMatchingHint: 'وقتی "بستن" تنظیم شود، تطبیق هوشمند منطقه انجام نمی‌شود',
+      downgradeControlDefault: 'پیش‌فرض (عدم فعال‌سازی کاهش سطح)',
+      downgradeControlNo: 'فعال‌سازی حالت کاهش سطح',
+      downgradeControlHint: 解码64('2YjZgtiq24wgItmB2LnYp9mEIiDYqtmG2LjbjNmFINi02YjYrzog2KfYqti12KfZhCDZhdiz2KrZgtuM2YUgQ0Yg2YbYp9mF2YjZgdmCIOKGkiDYp9iq2LXYp9mEIFNPQ0tTNSDihpIg2KLYr9ix2LMgZmFsbGJhY2s='),
+      tlsControlDefault: 'پیش‌فرض (حفظ همه گره‌ها)',
+      tlsControlYes: 'فقط گره‌های TLS',
+      tlsControlHint: 'وقتی "فقط گره‌های TLS" تنظیم شود، فقط گره‌های با TLS تولید می‌شوند، گره‌های غیر TLS (مانند پورت 80) تولید نمی‌شوند',
+      preferredControlDefault: 'پیش‌فرض (فعال‌سازی ترجیح)',
+      preferredControlYes: 'بستن ترجیح',
+      preferredControlHint: 'وقتی "بستن ترجیح" تنظیم شود، فقط از آدرس اصلی استفاده می‌شود، گره‌های IP و دامنه ترجیحی تولید نمی‌شوند',
+      regionNames: {
+        HK: '🇭🇰 هنگ کنگ',
+        US: '🇺🇸 آمریکا',
+        SG: '🇸🇬 سنگاپور',
+        JP: '🇯🇵 ژاپن',
+        KR: '🇰🇷 کره جنوبی',
+        DE: '🇩🇪 آلمان',
+        SE: '🇸🇪 سوئد',
+        NL: '🇳🇱 هلند',
+        FI: '🇫🇮 فنلاند',
+        GB: '🇬🇧 بریتانیا'
+      },
+      terminal: 'ترمینال v2.9.8c',
+      githubProject: 'پروژه GitHub',
+      优选工具: 'ابزار ترجیح IP',
+      autoDetectClient: 'تشخیص خودکار',
+      selectionLogicText: 'هم‌منطقه → منطقه مجاور → سایر مناطق',
+      customIPDisabledHint: 解码64('2YfZhtqv2KfZhSDYp9iz2KrZgdin2K/ZhyDYp9iyIFByb3h5SVAg2LPZgdin2LHYtNuM2Iwg2KfZhtiq2K7Yp9ioINmF2YbYt9mC2Ycg2LrbjNix2YHYudin2YQg2KfYs9iq'),
+      customIPMode: 解码64('2K3Yp9mE2KogUHJveHlJUCDYs9mB2KfYsdi024wgKNmF2KrYutuM2LEgcCDZgdi52KfZhCDYp9iz2Kop'),
+      customIPModeDesc: 'حالت IP سفارشی (تطبیق منطقه غیرفعال است)',
+      usingCustomProxyIP: 解码64('2KfYs9iq2YHYp9iv2Ycg2KfYsiBQcm94eUlQINiz2YHYp9ix2LTbjDog'),
+      customIPConfig: ' (پیکربندی متغیر p)',
+      customIPModeDisabled: 'حالت IP سفارشی، انتخاب منطقه غیرفعال است',
+      manualRegion: 'تعیین منطقه دستی',
+      manualRegionDesc: ' (تعیین دستی)',
+      proxyIPAvailable: 解码64('MTAvMTAg2K/YsSDYr9iz2KrYsdizICjYr9in2YXZhtmHINm+24zYtOKAjNmB2LHYtiBQcm94eUlQINiv2LEg2K/Ys9iq2LHYsyDYp9iz2Kop'),
+      smartSelection: 'انتخاب هوشمند نزدیک در حال انجام است',
+      sameRegionIP: 'IP هم‌منطقه در دسترس است (1)',
+      cloudflareDetection: 'تشخیص داخلی Cloudflare',
+      detectionFailed: 'تشخیص ناموفق',
+      apiTestResult: 'نتیجه تشخیص API: ',
+      apiTestTime: 'زمان تشخیص: ',
+      apiTestFailed: 'تشخیص API ناموفق: ',
+      unknownError: 'خطای ناشناخته',
+      apiTestError: 'تست API ناموفق: ',
+      kvNotConfigured: 'ذخیره‌سازی KV پیکربندی نشده است، نمی‌توانید از عملکرد مدیریت تنظیمات استفاده کنید.\\n\\nلطفا در Cloudflare Workers:\\n1. فضای نام KV ایجاد کنید\\n2. متغیر محیطی C را پیوند دهید\\n3. کد را دوباره مستقر کنید',
+      kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
+      kvCheckFailed: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
+      kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
+      kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
     }
-};
-function initPanelLanguage() {
-    const sel = document.getElementById('panel-lang-select');
-    const lang = localStorage.getItem('panel_lang') || 'fa';
-    if (sel) sel.value = lang;
-    applyPanelI18n(lang);
-}
-function setPanelLanguage(lang) {
-    localStorage.setItem('panel_lang', lang);
-    applyPanelI18n(lang);
-}
-function applyPanelI18n(lang) {
-    const dict = PANEL_I18N[lang] || PANEL_I18N.fa;
-    document.querySelectorAll('[data-i18n]').forEach(function(el) {
-        const key = el.getAttribute('data-i18n');
-        if (dict[key]) el.innerHTML = dict[key];
-    });
-}
+  };
+  const 翻译值 = 本地值235[是否值236 ? 'fa' : 'zh'];
+  const 值页面 = `<!DOCTYPE html>
+    <html lang="${语言值}" dir="${是否值236 ? 'rtl' : 'ltr'}">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <title>${翻译值.title}</title>
+        <style>
+            @import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,700;12..96,800&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&family=Vazirmatn:wght@400;500;600;700&display=swap');
+            :root {
+                --md-bg: #080a0e;
+                --md-bg-2: #0b0e14;
+                --md-surface: #10141c;
+                --md-surface-2: #141a24;
+                --md-surface-3: #1b2230;
+                --md-primary: #c8f135;
+                --md-primary-d: #a6cf1d;
+                --md-on-primary: #0a0f05;
+                --md-secondary: #5b8cff;
+                --md-secondary-d: #3f5fb0;
+                --md-tertiary: #ffb454;
+                --md-yellow: #ffb454;
+                --md-success: #3ddc84;
+                --md-error: #ff5d73;
+                --md-warning: #ffb454;
+                --md-text: #eef2f7;
+                --md-text-dim: #9aa6b8;
+                --md-outline: rgba(238,242,247,0.14);
+                --md-outline-strong: rgba(238,242,247,0.28);
+                --md-r-sm: 12px;
+                --md-r-md: 16px;
+                --md-r-lg: 24px;
+                --md-r-xl: 28px;
+                --md-elev-1: 0 1px 3px rgba(0,0,0,0.35), 0 1px 2px rgba(0,0,0,0.3);
+                --md-elev-2: 0 3px 8px rgba(0,0,0,0.4), 0 1px 3px rgba(0,0,0,0.3);
+                --md-elev-3: 0 8px 22px rgba(0,0,0,0.45), 0 2px 6px rgba(0,0,0,0.3);
+                --md-font: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                --cp-bg: var(--md-bg);
+                --cp-bg-2: var(--md-bg-2);
+                --cp-bg-3: var(--md-surface);
+                --cp-cyan: var(--md-primary);
+                --cp-cyan-d: var(--md-primary-d);
+                --cp-pink: var(--md-secondary);
+                --cp-pink-d: var(--md-secondary-d);
+                --cp-purple: var(--md-tertiary);
+                --cp-yellow: var(--md-yellow);
+                --cp-mint: var(--md-success);
+                --cp-amber: var(--md-warning);
+                --cp-red: var(--md-error);
+                --cp-text: var(--md-text);
+                --cp-text-dim: var(--md-text-dim);
+                --cp-border: var(--md-outline);
+                --cp-border-pink: var(--md-outline);
+                --cp-grid: transparent;
+            }
+            * { margin: 0; padding: 0; box-sizing: border-box; }
+            html, body { min-height: 100%; }
+            body {
+                font-family: var(--md-font);
+                background:
+                    radial-gradient(circle at 12% 8%, rgba(200,241,53,0.14) 0%, transparent 38%),
+                    radial-gradient(circle at 88% 92%, rgba(91,140,255,0.12) 0%, transparent 40%),
+                    radial-gradient(circle at 90% 5%, rgba(255,180,84,0.10) 0%, transparent 35%),
+                    var(--md-bg);
+                color: var(--md-text);
+                min-height: 100vh;
+                overflow-x: hidden;
+                position: relative;
+            }
+            body::before, body::after { content: none; }
+            .matrix-bg, .matrix-code-rain, .matrix-column, .matrix-rain { display: none !important; }
 
-window.toggleUserProxyMode = function(isSocksMode) {
-    const socksContainer = document.getElementById('user-socks5-container');
-    const socksInput = document.getElementById('user-socks5-input');
-    if (isSocksMode) {
-        if (socksContainer) socksContainer.classList.remove('opacity-50', 'pointer-events-none');
-        if (socksInput) socksInput.disabled = false;
-    } else {
-        if (socksContainer) socksContainer.classList.add('opacity-50', 'pointer-events-none');
-        if (socksInput) socksInput.disabled = true;
-    }
-};
-async function loadProxyFlags() {
-    const badges = document.querySelectorAll('.async-proxy-flag');
-    if (badges.length === 0) return;
-    let cache = {};
-    try { cache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
-    for (let badge of badges) {
-        const proxyStr = badge.getAttribute('data-proxy');
-        if (!proxyStr) continue;
-        if (cache[proxyStr]) {
-            badge.innerHTML = cache[proxyStr];
-            badge.classList.remove('async-proxy-flag');
-            continue;
-        }
-        badge.classList.remove('async-proxy-flag');
-        try {
-            const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 4000);
-            const res = await fetch('/api/test-proxy', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ proxy: proxyStr }),
-                signal: controller.signal
-            });
-            clearTimeout(timeoutId);
-            const data = await res.json();
-            let flag = '🌐';
-            if (res.ok && data.success && data.country) {
-                flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : '🌐';
-            }
-            cache[proxyStr] = flag;
-            localStorage.setItem('proxy_flag_cache', JSON.stringify(cache));
-            badge.innerHTML = flag;
-        } catch (e) {
-            badge.innerHTML = '🌐';
-        }
-    }
-}
-async function testUserSocksProxy() {
-	const btn = document.getElementById('test-user-proxy-btn');
-	if (btn) {
-		btn.disabled = true;
-		btn.innerText = 'صبر کنید...';
-	}
-	window.proxyPingMap = {};
-	const promises = window.proxyFieldsData.map(async (val, idx) => {
-		const resultSpan = document.getElementById('proxy-ping-label-' + idx);
-		const proxyStr = (val || "").trim();
-		if (!proxyStr) {
-			if (resultSpan) {
-				resultSpan.innerText = 'وارد نشده!';
-				resultSpan.className = 'text-[10px] font-bold text-red-500 block mt-0.5 text-center';
-			}
-			return;
-		}
-		if (resultSpan) {
-			resultSpan.innerText = 'در حال تست...';
-			resultSpan.className = 'text-[10px] font-bold text-amber-500 block mt-0.5 text-center';
-		}
-		const controller = new AbortController();
-		const timeoutId = setTimeout(() => controller.abort(), 5000);
-		try {
-			const res = await fetch('/api/test-proxy', {
-				method: 'POST',
-				headers: { 'Content-Type': 'application/json' },
-				body: JSON.stringify({ proxy: proxyStr }),
-				signal: controller.signal
-			});
-			clearTimeout(timeoutId);
-			const data = await res.json();
-			if (res.ok && data.success) {
-				const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(data.country) : '🌐';
-				if (resultSpan) {
-					resultSpan.innerText = flag + ' پینگ: ' + data.ping + 'ms';
-					resultSpan.className = 'text-[10px] font-bold text-green-600 block mt-0.5 text-center';
-					window.proxyPingMap[proxyStr] = { text: resultSpan.innerText, className: resultSpan.className };
-				}
-			} else {
-				if (resultSpan) {
-					resultSpan.innerText = 'خطا: ' + (data.error || 'ناموفق');
-					resultSpan.className = 'text-[10px] font-bold text-red-500 block mt-0.5 break-words text-center';
-					window.proxyPingMap[proxyStr] = { text: resultSpan.innerText, className: resultSpan.className };
-				}
-			}
-		} catch (e) {
-			clearTimeout(timeoutId);
-			if (resultSpan) {
-				if (e.name === 'AbortError') resultSpan.innerText = 'تایم‌اوت (خراب)';
-				else resultSpan.innerText = 'خطا در ارتباط';
-				resultSpan.className = 'text-[10px] font-bold text-red-500 block mt-0.5 text-center';
-				window.proxyPingMap[proxyStr] = { text: resultSpan.innerText, className: resultSpan.className };
-			}
-		}
-	});
-	await Promise.all(promises);
-	if (btn) {
-		btn.disabled = false;
-		btn.innerText = 'تست پـروکـسـی';
-	}
-}
-        async function exportUsersBackup() {
-            if (!window.allUsers || window.allUsers.length === 0) {
-                alert('⚠️ کاربری برای پشتیبان‌گیری وجود ندارد!');
-                return;
-            }
-            try {
-                const settingsRes = await fetch('/api/settings/bulk');
-                const settingsData = await settingsRes.json();
-                const backupData = {
-                    users: window.allUsers,
-                    settings: settingsData
-                };
-                const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(backupData, null, 2));
-                const downloadAnchor = document.createElement('a');
-                const host = window.location.hostname;
-                const now = new Date();
-                const dateTimeStr = now.getFullYear() + '-' + 
-                    String(now.getMonth() + 1).padStart(2, '0') + '-' + 
-                    String(now.getDate()).padStart(2, '0') + '_' + 
-                    String(now.getHours()).padStart(2, '0') + '-' + 
-                    String(now.getMinutes()).padStart(2, '0') + '-' + 
-                    String(now.getSeconds()).padStart(2, '0');
-                downloadAnchor.setAttribute("href", dataStr);
-                downloadAnchor.setAttribute("download", "zeus_backup_" + host + "_" + dateTimeStr + ".json");
-                document.body.appendChild(downloadAnchor);
-                downloadAnchor.click();
-                downloadAnchor.remove();
-            } catch (err) {
-                alert('❌ خطا در دریافت تنظیمات برای بک‌آپ.');
-            }
-        }
-        function triggerImportBackup() {
-            document.getElementById('backup-file-input').click();
-        }
-        async function importUsersBackup(event) {
-            const file = event.target.files[0];
-            if (!file) return;
-            const reader = new FileReader();
-            reader.onload = async function(e) {
-                const importBtn = document.querySelector('button[onclick="triggerImportBackup()"]');
-                const exportBtn = document.querySelector('button[onclick="exportUsersBackup()"]');
-                const closeBtn = document.querySelector('#settings-modal button[onclick="toggleSettingsModal(false)"]');
-                try {
-                    const parsedData = JSON.parse(e.target.result);
-                    let backupUsers = [];
-                    let backupSettings = null;
-                    if (Array.isArray(parsedData)) {
-                        backupUsers = parsedData;
-                    } else if (parsedData && parsedData.users && Array.isArray(parsedData.users)) {
-                        backupUsers = parsedData.users;
-                        backupSettings = parsedData.settings;
-                    } else {
-                        alert('❌ فایل پشتیبان نامعتبر است!');
-                        return;
-                    }
-                    const validBackupUsers = backupUsers.filter(u => u && typeof u === 'object' && u.username);
-                    if (validBackupUsers.length === 0 && !backupSettings) {
-                        alert('❌ هیچ داده معتبری در فایل یافت نشد!');
-                        return;
-                    }
-                    if (backupSettings && Object.keys(backupSettings).length > 0) {
-                        const restoreSettings = await customConfirm('⚙️ فایل بک‌آپ شامل تنظیمات پـنـل نیز می‌باشد. آیا می‌خواهید تنظیمات هم بازگردانی شوند؟');
-                        if (restoreSettings) {
-                            try {
-                                await fetch('/api/settings/bulk', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({ settings: backupSettings })
-                                });
-                            } catch (err) {}
-                        }
-                    }
-                    const existingUsernames = new Set((window.allUsers || []).map(u => u.username));
-                    const duplicates = validBackupUsers.filter(u => existingUsernames.has(u.username));
-                    let overwrite = false;
-                    if (duplicates.length > 0) {
-                        overwrite = await customConfirm('⚠️ تعداد ' + duplicates.length + ' کاربر تکراری شناسایی شد. آیا می‌خواهید اطلاعات آن‌ها بازنویسی شود؟');
-                    }
-                    if (importBtn) importBtn.disabled = true;
-                    if (exportBtn) exportBtn.disabled = true;
-                    if (closeBtn) closeBtn.disabled = true;
-                    let successCount = 0;
-                    let currentStep = 0;
-                    for (const u of validBackupUsers) {
-                        currentStep++;
-                        if (importBtn) {
-                            importBtn.innerText = '⏳ بازیابی (' + currentStep + '/' + validBackupUsers.length + ')';
-                        }
-                        const exists = existingUsernames.has(u.username);
-                        if (exists) {
-                            if (overwrite) {
-                                try {
-                                    await fetch('/api/users/' + encodeURIComponent(u.username), { method: 'DELETE' });
-                                    const res = await fetch('/api/users', {
-                                        method: 'POST',
-                                        headers: { 'Content-Type': 'application/json' },
-                                        body: JSON.stringify({
-                                            username: u.username,
-                                            uuid: u.uuid,
-                                            limit_gb: u.limit_gb,
-                                            expiry_days: u.expiry_days,
-                                            limit_req: u.limit_req,
-                                            ips: u.ips,
-                                            tls: u.tls,
-                                            port: u.port,
-                                            fingerprint: u.fingerprint,
-                                            ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
-                                            used_gb: u.used_gb,
-                                            used_req: u.used_req,
-                                            created_at: u.created_at,
-                                            is_active: u.is_active,
-                                            block_porn: u.block_porn,
-                                            block_ads: u.block_ads,
-                                            frag_len: u.frag_len,
-                                            frag_int: u.frag_int,
-                                            user_proxy_iata: u.user_proxy_iata,
-                                            user_socks5: u.user_socks5,
-                                            user_proxy_ip: u.user_proxy_ip,
-                                            auto_reset_vol_days: u.auto_reset_vol_days,
-                                            auto_reset_req_days: u.auto_reset_req_days,
-                                            auto_rotate_ip: u.auto_rotate_ip,
-                                            rotate_time: u.rotate_time,
-                                            ip_operator: u.ip_operator,
-                                            ip_count: u.ip_count,
-                                            auto_rotate_user_proxy: u.auto_rotate_user_proxy
-                                        })
-                                    });
-                                    if (res.ok) successCount++;
-                                } catch(err) {}
-                            }
-                        } else {
-                            try {
-                                const res = await fetch('/api/users', {
-                                    method: 'POST',
-                                    headers: { 'Content-Type': 'application/json' },
-                                    body: JSON.stringify({
-                                        username: u.username,
-                                        uuid: u.uuid,
-                                        limit_gb: u.limit_gb,
-                                        expiry_days: u.expiry_days,
-                                        limit_req: u.limit_req,
-                                        ips: u.ips,
-                                        tls: u.tls,
-                                        port: u.port,
-                                        fingerprint: u.fingerprint,
-                                        ip_limit: u.ip_limit !== undefined ? u.ip_limit : u.max_connections,
-                                        used_gb: u.used_gb,
-                                        used_req: u.used_req,
-                                        created_at: u.created_at,
-                                        is_active: u.is_active,
-                                        block_porn: u.block_porn,
-                                        block_ads: u.block_ads,
-                                        frag_len: u.frag_len,
-                                        frag_int: u.frag_int,
-                                        user_proxy_iata: u.user_proxy_iata,
-                                        user_socks5: u.user_socks5,
-                                        user_proxy_ip: u.user_proxy_ip,
-                                        auto_reset_vol_days: u.auto_reset_vol_days,
-                                        auto_reset_req_days: u.auto_reset_req_days,
-                                        auto_rotate_ip: u.auto_rotate_ip,
-                                        rotate_time: u.rotate_time,
-                                        ip_operator: u.ip_operator,
-                                        ip_count: u.ip_count,
-                                        auto_rotate_user_proxy: u.auto_rotate_user_proxy
-                                    })
-                                });
-                                if (res.ok) successCount++;
-                            } catch(err) {}
-                        }
-                    }
-                    alert('✅ عملیات بازیابی با موفقیت انجام شد. صفحه رفرش می‌شود...');
-                    setTimeout(() => { window.location.reload(); }, 1500);
-                } catch(err) {
-                    alert('❌ خطا در خواندن یا پردازش فایل پشتیبان!');
-                } finally {
-                    if (importBtn) {
-                        importBtn.disabled = false;
-                        importBtn.innerText = '📥 بازیابی';
-                    }
-                    if (exportBtn) exportBtn.disabled = false;
-                    if (closeBtn) closeBtn.disabled = false;
-                    event.target.value = '';
-                }
-            };
-            reader.readAsText(file);
-        }
-        async function changeAdminPassword() {
-            const currentPwd = document.getElementById('change-pwd-current').value;
-            const newPwd = document.getElementById('change-pwd-new').value;
-            const btn = document.getElementById('change-pwd-btn');
-            if (!currentPwd || !newPwd) {
-                alert('⚠️ وارد کردن رمز عبور فعلی و جدید الزامی است!');
-                return;
-            }
-            if (newPwd.length < 4) {
-                alert('⚠️ رمز عبور جدید باید حداقل ۴ کاراکتر باشد!');
-                return;
-            }
-            btn.disabled = true;
-            btn.innerText = 'در حال تغییر...';
-            try {
-                const response = await fetch('/api/change-password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ current_password: currentPwd, new_password: newPwd })
-                });
-                const data = await response.json();
-                if (response.ok && data.success) {
-                    alert('✅ رمز عبور با موفقیت تغییر کرد.');
-                    document.getElementById('change-pwd-current').value = '';
-                    document.getElementById('change-pwd-new').value = '';
-                    toggleSettingsModal(false);
-                } else {
-                    alert('❌ خطا: ' + (data.error || 'عملیات ناموفق بود'));
-                }
-            } catch (err) {
-                alert('خطا در برقراری ارتباط با سرور');
-            } finally {
-                btn.disabled = false;
-                btn.innerText = 'تغییر رمز عبور';
-            }
-        }
-        async function logoutAdmin() {
-			if (await customConfirm('آیا می‌خواهید از پـنـل خارج شوید؟ ⚠️ ')) {
-                try {
-                    await fetch('/api/logout', { method: 'POST' });
-                } catch (err) {}
-                window.location.reload();
-            }
-        }
-const CURRENT_VERSION = '1.10.3';
-const UPDATE_FIX = "constsCURRENT_VERSION='d.d.d'";
-		window.autoUpdateStatusCache = false;
-		async function checkAutoUpdateSetup() {
-			try {
-				const res = await fetch('/api/auto-update-setup', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ action: 'check' })
-				});
-				const data = await res.json();
-				window.autoUpdateStatusCache = data.auto_update;
-				const toggle = document.getElementById('auto-update-toggle');
-				if (toggle) toggle.checked = data.auto_update;
-				return data;
-			} catch(e) { return null; }
-		}
+            ::selection { background: var(--md-primary); color: var(--md-on-primary); }
 
-		async function handleAutoUpdateToggle(el) {
-			const isChecked = el.checked;
-			el.disabled = true;
-			try {
-				if (isChecked) {
-					const status = await checkAutoUpdateSetup();
-					if (status && !status.has_token) {
-						el.checked = false;
-						window.pendingCoreAction = 'enable_auto_update';
-						toggleTokenModal(true);
-					} else {
-						const res = await fetch('/api/auto-update-setup', {
-							method: 'POST',
-							headers: { 'Content-Type': 'application/json' },
-							body: JSON.stringify({ action: 'enable' })
-						});
-						const data = await res.json();
-						if (res.ok && data.success) {
-							showToast('✅ آپدیت خودکار فعال شد.');
-							window.autoUpdateStatusCache = true;
-							el.checked = true;
-						} else {
-							el.checked = false;
-							alert('❌ ' + (data.error || 'خطا در فعال‌سازی'));
-						}
-					}
-				} else {
-					const res = await fetch('/api/auto-update-setup', {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ action: 'disable' })
-					});
-					if (res.ok) {
-						showToast('✅ آپدیت خودکار غیرفعال شد.');
-						window.autoUpdateStatusCache = false;
-					} else {
-						el.checked = true;
-					}
-				}
-			} finally {
-				el.disabled = false;
-			}
-		}
+            .container {
+                max-width: 900px;
+                margin: 0 auto;
+                padding: 96px 20px 60px;
+                position: relative;
+                z-index: 1;
+            }
+            .header {
+                text-align: center;
+                margin-bottom: 24px;
+                padding: 32px 24px;
+                position: relative;
+                border: none;
+                background: linear-gradient(135deg, var(--md-surface), var(--md-surface-2));
+                border-radius: var(--md-r-xl);
+                box-shadow: var(--md-elev-2);
+            }
+            .header::before, .header::after { content: none; }
+            .title {
+                font-size: clamp(1.7rem, 4.2vw, 2.4rem);
+                font-weight: 700;
+                margin: 0 0 8px;
+                color: var(--md-text);
+                letter-spacing: 0;
+                text-transform: none;
+                position: relative;
+                animation: none;
+            }
+            .subtitle {
+                color: var(--md-text-dim);
+                margin-bottom: 0;
+                font-size: 0.95rem;
+                letter-spacing: 0;
+                text-transform: none;
+            }
+            .subtitle::before { content: none; }
 
-		async function checkForUpdates(isManual = false) {
-            try {
-                if (isManual) {
-                    document.getElementById('update-toggle').classList.add('animate-pulse');
+            .card {
+                background: var(--md-surface);
+                border: 1px solid var(--md-outline);
+                border-radius: var(--md-r-lg);
+                padding: 24px 24px 26px;
+                margin-bottom: 18px;
+                position: relative;
+                width: 100%;
+                box-shadow: var(--md-elev-1);
+            }
+            .card::after { content: none; }
+            .card-title {
+                font-size: 1.02rem;
+                margin: 0 0 18px;
+                color: var(--md-text);
+                letter-spacing: 0;
+                text-transform: none;
+                display: flex; align-items: center; gap: 10px;
+                font-weight: 700;
+            }
+            .card-title::before {
+                content: ""; display: inline-block;
+                width: 8px; height: 8px; border-radius: 50%;
+                background: var(--md-primary);
+                box-shadow: none; transform: none;
+            }
+            .card-title::after { content: none; }
+            h3, h4 {
+                color: var(--md-text);
+                letter-spacing: 0;
+                text-transform: none;
+                font-weight: 700;
+            }
+
+            .client-grid {
+                display: grid;
+                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+                gap: 10px;
+                margin: 4px 0 16px;
+            }
+            .client-btn {
+                background: var(--md-surface-2);
+                border: 1px solid var(--md-outline);
+                border-radius: var(--md-r-md);
+                padding: 14px 16px;
+                color: var(--md-text);
+                font-family: inherit;
+                font-weight: 500;
+                font-size: 0.86rem;
+                letter-spacing: 0;
+                text-transform: none;
+                cursor: pointer;
+                transition: all 0.18s ease;
+                text-align: center;
+                position: relative;
+                overflow: hidden;
+            }
+            .client-btn::before { content: none; }
+            .client-btn:hover {
+                color: var(--md-on-primary);
+                border-color: var(--md-primary);
+                background: var(--md-primary);
+                box-shadow: var(--md-elev-1);
+                transform: translateY(-1px);
+            }
+
+            #clientSubscriptionUrl,
+            .subscription-url,
+            [class*='subscription-url'],
+            [class*='c3Vic2NyaXB0aW9u'] {
+                background: var(--md-surface-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: var(--md-r-md) !important;
+                padding: 14px 16px !important;
+                word-break: break-all;
+                font-family: 'JetBrains Mono', monospace;
+                color: var(--md-primary) !important;
+                margin-top: 14px;
+                box-shadow: none !important;
+                position: relative;
+                overflow-wrap: break-word;
+                overflow-x: auto;
+                max-width: 100%;
+                font-size: 0.85rem;
+                line-height: 1.6;
+            }
+            #clientSubscriptionUrl:empty { display: none !important; }
+
+            .cp-hud { display: none; }
+            .cp-lang-wrapper {
+                position: fixed; top: 18px; left: 18px; z-index: 1000;
+                display: flex; align-items: center; gap: 8px;
+            }
+            .cp-lang-tag { display: none; }
+            #languageSelector {
+                background: var(--md-surface-2);
+                border: 1px solid var(--md-outline);
+                border-radius: 20px;
+                color: var(--md-text);
+                padding: 8px 16px;
+                font-family: inherit;
+                font-size: 12.5px;
+                cursor: pointer;
+                box-shadow: var(--md-elev-1);
+            }
+            #languageSelector option { background: var(--md-surface-2); color: var(--md-text); }
+
+            /* FX toggle */
+            .cp-fx-toggle {
+                position: fixed; top: 18px; right: 18px; z-index: 1001;
+                background: var(--md-surface-2);
+                border: 1px solid var(--md-outline);
+                border-radius: 20px;
+                color: var(--md-text-dim);
+                padding: 8px 16px;
+                font-family: inherit;
+                font-size: 11.5px;
+                letter-spacing: 0;
+                text-transform: none;
+                cursor: pointer;
+                box-shadow: var(--md-elev-1);
+                transition: all 0.2s ease;
+                display: inline-flex; align-items: center; gap: 8px;
+            }
+            .cp-fx-toggle:hover { color: var(--md-primary); border-color: var(--md-primary); }
+            .cp-fx-toggle .cp-fx-dot { width: 8px; height: 8px; background: var(--md-success); border-radius: 50%; box-shadow: none; transition: all 0.2s; }
+            body.fx-off .cp-fx-toggle { color: var(--md-text-dim); border-color: var(--md-outline); box-shadow: none; }
+            body.fx-off .cp-fx-toggle .cp-fx-dot { background: transparent; border: 1px solid var(--md-text-dim); box-shadow: none; }
+            body.fx-off .matrix-bg,
+            body.fx-off .matrix-code-rain,
+            body.fx-off .matrix-column { display: none !important; }
+            body.fx-off::before, body.fx-off::after { display: none !important; content: none !important; }
+            body.fx-off { background: var(--md-bg) !important; }
+            body.fx-off * {
+                animation: none !important;
+                transition: color 0.15s, background-color 0.15s, border-color 0.15s, box-shadow 0.15s !important;
+            }
+            body.fx-off .cp-glitch::before,
+            body.fx-off .cp-glitch::after { display: none !important; }
+            body.fx-off .terminal-cursor::after,
+            body.fx-off .cp-fab-save .cp-fab-dot { animation: none !important; }
+            body.fx-off .cp-fab-save:hover { transform: none !important; }
+            body.fx-off .cp-action-bar.cp-dirty::before { animation: none !important; }
+            body.fx-off .header::before { display: none !important; }
+            body.fx-off .card { backdrop-filter: none !important; }
+            body.fx-off select, body.fx-off input, body.fx-off textarea { backdrop-filter: none !important; }
+
+            /* Status panel inside card */
+            #systemStatus {
+                background: var(--md-surface-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: var(--md-r-md) !important;
+                padding: 16px 18px !important;
+                margin: 12px 0 0 !important;
+                box-shadow: none !important;
+                position: relative;
+            }
+            #systemStatus > div {
+                color: var(--md-text) !important;
+                font-family: inherit !important;
+                margin: 6px 0 !important;
+                font-size: 0.85rem !important;
+                letter-spacing: 0;
+            }
+            #systemStatus > div:first-child {
+                color: var(--md-primary) !important;
+                font-weight: 700 !important;
+                letter-spacing: 0 !important;
+                margin-bottom: 12px !important;
+                text-transform: none;
+            }
+
+            /* Force inputs / selects — Material outlined fields */
+            input[type="text"], input[type="number"], input[type="password"],
+            select, textarea {
+                background: var(--md-surface-2) !important;
+                border: 1.5px solid var(--md-outline) !important;
+                border-radius: var(--md-r-sm) !important;
+                color: var(--md-text) !important;
+                font-family: inherit !important;
+                font-size: 13.5px !important;
+                padding: 12px 14px !important;
+                outline: none;
+                transition: border-color 0.2s, box-shadow 0.2s;
+                box-shadow: none !important;
+                letter-spacing: 0;
+            }
+            input::placeholder { color: var(--md-text-dim) !important; opacity: 0.7; }
+            input:focus, select:focus, textarea:focus {
+                border-color: var(--md-primary) !important;
+                box-shadow: 0 0 0 3px rgba(200,241,53,0.18) !important;
+            }
+            select option { background: var(--md-surface-2); color: var(--md-text); }
+            input[type="checkbox"], input[type="radio"] {
+                accent-color: var(--md-primary);
+                width: 18px; height: 18px;
+            }
+
+            label {
+                color: var(--md-text) !important;
+                letter-spacing: 0;
+            }
+            label[style*="font-weight"], label[style*="bold"] {
+                font-weight: 700 !important;
+                color: var(--md-text) !important;
+                letter-spacing: 0 !important;
+                text-transform: none;
+                font-size: 0.85rem !important;
+            }
+            small {
+                color: var(--md-text-dim) !important;
+                font-size: 0.78rem !important;
+                letter-spacing: 0;
+                line-height: 1.5;
+            }
+
+            /* Buttons — Material filled/tonal pill buttons */
+            button, input[type="submit"] {
+                background: var(--md-surface-3) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: 20px !important;
+                color: var(--md-text) !important;
+                font-family: inherit !important;
+                font-weight: 500 !important;
+                cursor: pointer;
+                padding: 10px 20px !important;
+                letter-spacing: 0 !important;
+                text-transform: none;
+                font-size: 0.82rem !important;
+                transition: all 0.2s ease;
+                box-shadow: none;
+            }
+            button:hover, input[type="submit"]:hover {
+                color: var(--md-on-primary) !important;
+                border-color: var(--md-primary) !important;
+                background: var(--md-primary) !important;
+                box-shadow: var(--md-elev-1) !important;
+                transform: translateY(-1px);
+            }
+            button[id*="Reset"], button[onclick*="reset"], button[style*="ff0000"] {
+                color: var(--md-error) !important;
+                border-color: var(--md-error) !important;
+                background: var(--md-surface-3) !important;
+            }
+            button[id*="Reset"]:hover, button[onclick*="reset"]:hover, button[style*="ff0000"]:hover {
+                background: var(--md-error) !important;
+                color: var(--md-on-primary) !important;
+                box-shadow: var(--md-elev-1) !important;
+            }
+            button[id="stopLatencyTest"] {
+                color: var(--md-error) !important;
+                border-color: var(--md-error) !important;
+            }
+
+            /* Form sub-cards */
+            .card form > div[style*="background: rgba(15, 3, 40"],
+            .card form > div[style*="background: rgba(20, 5, 50"],
+            div[style*="background: rgba(15, 3, 40"],
+            div[style*="background: rgba(20, 5, 50"] {
+                background: var(--md-bg-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                box-shadow: none !important;
+                border-radius: var(--md-r-md) !important;
+            }
+
+            /* kvStatus / statusMessage / currentConfig / pathTypeInfo */
+            #kvStatus, #statusMessage, #currentConfig, #pathTypeInfo {
+                background: var(--md-surface-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: var(--md-r-md) !important;
+                color: var(--md-text) !important;
+                font-family: inherit !important;
+                box-shadow: none !important;
+                padding: 12px 16px !important;
+                font-size: 0.85rem !important;
+                letter-spacing: 0;
+            }
+            #pathTypeInfo div:first-child {
+                color: var(--md-primary) !important;
+                letter-spacing: 0 !important;
+            }
+
+            /* Latency Result list */
+            #latencyResultsList {
+                background: var(--md-surface-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: var(--md-r-md) !important;
+            }
+            #latencyResultsList > div {
+                border-bottom: 1px solid var(--md-outline) !important;
+            }
+            #cityFilterContainer {
+                background: var(--md-surface-2) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: var(--md-r-md) !important;
+            }
+
+            /* Related links area */
+            .card a {
+                color: var(--md-primary) !important;
+                text-decoration: none;
+                letter-spacing: 0;
+                text-transform: none;
+                font-size: 0.9rem;
+                padding: 4px 0;
+                border-bottom: 1px solid transparent;
+                transition: all 0.2s;
+            }
+            .card a:hover {
+                border-bottom-color: var(--md-primary);
+            }
+
+            /* Scrollbars */
+            ::-webkit-scrollbar { width: 8px; height: 8px; }
+            ::-webkit-scrollbar-track { background: transparent; }
+            ::-webkit-scrollbar-thumb {
+                background: var(--md-outline-strong);
+                border-radius: 4px;
+            }
+
+            .cp-glitch { position: relative; display: inline-block; }
+
+            /* Floating action dock - bottom-right anchored FAB cluster */
+            .cp-action-bar {
+                position: fixed;
+                right: 20px;
+                bottom: 20px;
+                z-index: 99999;
+                isolation: isolate;
+                display: flex;
+                flex-direction: row-reverse;
+                align-items: center;
+                gap: 10px;
+                padding: 0;
+                background: transparent;
+                border: 0;
+                box-shadow: none;
+                max-width: calc(100vw - 32px);
+                pointer-events: auto;
+            }
+            /* Primary SAVE FAB — Material extended FAB */
+            .cp-fab-save {
+                position: relative;
+                min-width: 170px;
+                padding: 16px 24px !important;
+                font-size: 0.88rem !important;
+                font-weight: 700 !important;
+                letter-spacing: 0 !important;
+                text-transform: none;
+                color: var(--md-on-primary) !important;
+                background: var(--md-primary) !important;
+                border: none !important;
+                border-radius: 28px !important;
+                box-shadow: var(--md-elev-3) !important;
+                cursor: pointer;
+                transition: transform 0.18s ease, box-shadow 0.25s ease;
+                display: inline-flex; align-items: center; gap: 10px;
+                white-space: nowrap;
+                font-family: inherit !important;
+                animation: none;
+            }
+            .cp-fab-save:hover {
+                transform: translateY(-2px);
+                box-shadow: var(--md-elev-3), 0 0 0 4px rgba(200,241,53,0.15) !important;
+                color: var(--md-on-primary) !important;
+            }
+            .cp-fab-save .cp-fab-icon {
+                font-size: 1.1em;
+                line-height: 1;
+                color: var(--md-on-primary);
+            }
+            .cp-fab-save .cp-fab-dot {
+                width: 8px; height: 8px; border-radius: 50%;
+                background: var(--md-on-primary);
+                transform: none;
+                margin-left: 2px;
+                opacity: 0.4;
+                transition: all 0.2s;
+            }
+            .cp-action-bar.cp-dirty .cp-fab-save {
+                animation: cp-fab-dirty-pulse 1.6s ease-in-out infinite;
+                color: var(--md-on-primary) !important;
+            }
+            .cp-action-bar.cp-dirty .cp-fab-save .cp-fab-dot { opacity: 1; }
+            @keyframes cp-fab-dirty-pulse {
+                0%, 100% { box-shadow: var(--md-elev-3); }
+                50%      { box-shadow: var(--md-elev-3), 0 0 0 6px rgba(200,241,53,0.22); }
+            }
+            /* Secondary mini buttons — Material tonal icon buttons */
+            .cp-action-btn {
+                background: var(--md-surface-3) !important;
+                border: 1px solid var(--md-outline) !important;
+                border-radius: 50% !important;
+                color: var(--md-text) !important;
+                font-family: inherit !important;
+                font-weight: 500 !important;
+                cursor: pointer;
+                width: 46px; height: 46px;
+                padding: 0 !important;
+                letter-spacing: 0 !important;
+                font-size: 1.05rem !important;
+                transition: all 0.2s ease;
+                box-shadow: var(--md-elev-1);
+                display: inline-flex; align-items: center; justify-content: center;
+                white-space: nowrap;
+                position: relative;
+            }
+            .cp-action-btn .cp-btn-label { display: none; }
+            .cp-action-btn::after {
+                content: attr(data-tip);
+                position: absolute;
+                bottom: 100%; right: 50%;
+                transform: translate(50%, -8px);
+                background: var(--md-surface-3);
+                color: var(--md-text);
+                font-size: 10.5px;
+                letter-spacing: 0;
+                text-transform: none;
+                padding: 5px 10px;
+                border: 1px solid var(--md-outline);
+                border-radius: 8px;
+                opacity: 0; pointer-events: none;
+                transition: opacity 0.2s;
+                white-space: nowrap;
+                box-shadow: var(--md-elev-1);
+            }
+            .cp-action-btn:hover::after { opacity: 1; }
+            .cp-action-btn:hover {
+                color: var(--md-on-primary) !important;
+                border-color: var(--md-primary) !important;
+                background: var(--md-primary) !important;
+                box-shadow: var(--md-elev-2) !important;
+                transform: translateY(-2px);
+            }
+            .cp-action-btn-danger {
+                color: var(--md-error) !important;
+                border-color: var(--md-error) !important;
+                box-shadow: var(--md-elev-1) !important;
+            }
+            .cp-action-btn-danger:hover {
+                background: var(--md-error) !important;
+                color: var(--md-on-primary) !important;
+                box-shadow: var(--md-elev-2) !important;
+            }
+            .cp-action-btn-saving,
+            .cp-fab-save.cp-action-btn-saving {
+                opacity: 0.7;
+                pointer-events: none;
+                animation: cp-pulse-soft 0.9s ease-in-out infinite !important;
+            }
+            @keyframes cp-pulse-soft {
+                0%, 100% { box-shadow: var(--md-elev-1); }
+                50%      { box-shadow: var(--md-elev-3); }
+            }
+            .container { padding-bottom: 120px; }
+            .cp-action-status {
+                position: fixed;
+                right: 20px;
+                bottom: 84px;
+                z-index: 99998;
+                padding: 10px 16px;
+                background: var(--md-surface-3);
+                border: 1px solid var(--md-outline);
+                border-radius: 20px;
+                color: var(--md-success);
+                font-size: 0.78rem;
+                letter-spacing: 0;
+                text-transform: none;
+                box-shadow: var(--md-elev-2);
+                opacity: 0;
+                transform: translateY(8px);
+                transition: opacity 0.25s, transform 0.25s;
+                pointer-events: none;
+                white-space: nowrap;
+                max-width: calc(100vw - 44px);
+                overflow: hidden; text-overflow: ellipsis;
+            }
+            .cp-action-status.cp-show { opacity: 1; transform: translateY(0); }
+            .cp-action-status.cp-err {
+                border-color: var(--md-error);
+                color: var(--md-error);
+                box-shadow: var(--md-elev-2);
+            }
+            /* Toast notification stack (top-right) — Material snackbars */
+            .cp-toast-stack {
+                position: fixed;
+                top: 84px;
+                right: 20px;
+                z-index: 100000;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                max-width: min(400px, calc(100vw - 32px));
+                pointer-events: none;
+            }
+            .cp-toast {
+                position: relative;
+                display: flex;
+                align-items: flex-start;
+                gap: 12px;
+                padding: 14px 16px;
+                background: var(--md-surface-3);
+                border: 1px solid var(--md-outline);
+                border-radius: var(--md-r-md);
+                color: var(--md-text);
+                font-size: 0.85rem;
+                line-height: 1.45;
+                letter-spacing: 0;
+                box-shadow: var(--md-elev-3);
+                transform: translateX(120%);
+                opacity: 0;
+                transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1), opacity 0.25s;
+                pointer-events: auto;
+                overflow: hidden;
+                word-break: break-all;
+            }
+            .cp-toast.cp-show { transform: translateX(0); opacity: 1; }
+            .cp-toast.cp-hide { transform: translateX(120%); opacity: 0; }
+            .cp-toast::before {
+                content: "";
+                position: absolute;
+                left: 0; top: 0; bottom: 0;
+                width: 4px;
+                background: var(--md-text-dim);
+                border-radius: 4px 0 0 4px;
+            }
+            .cp-toast-icon {
+                font-size: 1.1rem;
+                line-height: 1;
+                margin-top: 1px;
+                flex-shrink: 0;
+                color: var(--md-text);
+            }
+            .cp-toast-body { flex: 1; min-width: 0; }
+            .cp-toast-title {
+                font-size: 0.7rem;
+                font-weight: 700;
+                letter-spacing: 0.04em;
+                text-transform: uppercase;
+                opacity: 0.7;
+                margin-bottom: 2px;
+            }
+            .cp-toast-msg { white-space: pre-wrap; }
+            .cp-toast-close {
+                position: absolute;
+                top: 8px; right: 10px;
+                background: transparent;
+                border: 0;
+                color: inherit;
+                font-size: 14px;
+                cursor: pointer;
+                opacity: 0.55;
+                padding: 2px 4px;
+                line-height: 1;
+                transition: opacity 0.2s;
+            }
+            .cp-toast-close:hover { opacity: 1; }
+            .cp-toast::after { content: none; }
+            .cp-toast.cp-toast-success { border-color: var(--md-success); color: var(--md-success); }
+            .cp-toast.cp-toast-success::before { background: var(--md-success); }
+            .cp-toast.cp-toast-success .cp-toast-icon { color: var(--md-success); }
+            .cp-toast.cp-toast-info { border-color: var(--md-primary); color: var(--md-primary); }
+            .cp-toast.cp-toast-info::before { background: var(--md-primary); }
+            .cp-toast.cp-toast-info .cp-toast-icon { color: var(--md-primary); }
+            .cp-toast.cp-toast-warn { border-color: var(--md-warning); color: var(--md-warning); }
+            .cp-toast.cp-toast-warn::before { background: var(--md-warning); }
+            .cp-toast.cp-toast-warn .cp-toast-icon { color: var(--md-warning); }
+            .cp-toast.cp-toast-error { border-color: var(--md-error); color: var(--md-error); }
+            .cp-toast.cp-toast-error::before { background: var(--md-error); }
+            .cp-toast.cp-toast-error .cp-toast-icon { color: var(--md-error); }
+
+            /* Tiny floating "unsaved" badge on the FAB */
+            .cp-action-bar.cp-dirty::before {
+                content: "● UNSAVED";
+                position: absolute;
+                top: -24px; right: 6px;
+                font-size: 9px;
+                letter-spacing: 0.15em;
+                color: var(--md-text-dim);
+                background: var(--md-surface-3);
+                padding: 3px 10px;
+                border-radius: 10px;
+                border: 1px solid var(--md-outline);
+                box-shadow: var(--md-elev-1);
+                animation: none;
+            }
+
+            @media (max-width: 720px) {
+                .container { padding: 88px 14px 140px; }
+                .card { padding: 20px 16px; border-radius: var(--md-r-md); }
+                .header { padding: 22px 18px; border-radius: var(--md-r-md); }
+                .title { font-size: 1.5rem; }
+                .cp-hud { font-size: 9px; }
+                .cp-action-bar {
+                    right: 50%;
+                    bottom: 14px;
+                    transform: translateX(50%);
+                    gap: 8px;
                 }
-                const res = await fetchWithFallbackUI('zeus.obfuscated.js?t=' + Date.now());
-                if (!res.ok) throw new Error('Network response was not ok');
-                const text = await res.text();
-                const match = text.match(/const\\s+CURRENT_VERSION\\s*=\\s*['"](\\d+\\.\\d+\\.\\d+)['"]/i);
-                const latestVersion = match ? match[1] : null;
-                if (isManual) {
-                    document.getElementById('update-toggle').classList.remove('animate-pulse');
+                .cp-fab-save {
+                    min-width: 0;
+                    padding: 13px 18px !important;
+                    font-size: 0.8rem !important;
+                    letter-spacing: 0 !important;
                 }
-                if (latestVersion && latestVersion !== CURRENT_VERSION) {
-                    document.getElementById('update-toggle').className = "p-2 rounded-md bg-red-100 dark:bg-red-900/60 border border-red-500 hover:bg-red-200 dark:hover:bg-red-900/80 transition text-red-700 dark:text-red-400 shadow-[0_0_15px_rgba(239,68,68,0.6)] animate-pulse relative";
-                    const badge = document.getElementById('update-badge');
-                    if (badge) badge.remove();
-                    if (window.autoUpdateStatusCache && !isManual) {
-                        showToast('نسخه جدید یافت شد. در حال آپدیت خودکار...');
-                        await applyUpdate();
-                        return;
-                    }
-                    if (isManual) {
-                        toggleUpdateModal(true, latestVersion);
-                    }
-                } else {
-                    if (isManual) {
-                        alert('شما در حال استفاده از آخرین نسخه (v' + CURRENT_VERSION + ') هستید.');
-                    }
-                }
-            } catch (err) {
-                if (isManual) {
-                    document.getElementById('update-toggle').classList.remove('animate-pulse');
-                    alert('خطا در بررسی آپدیت از گیت هاب.');
-                }
+                .cp-action-btn { width: 42px; height: 42px; }
+                .cp-action-status { right: 50%; transform: translate(50%, 8px); }
+                .cp-action-status.cp-show { transform: translate(50%, 0); }
             }
-        }
-        function toggleTokenModal(show) {
-            setModalState('token-modal', show);
-            if (!show) document.getElementById('update-token-input').value = '';
-        }
-        async function submitTokenForUpdate() {
-            const token = document.getElementById('update-token-input').value.trim();
-            if (!token) {
-                alert('لطفاً توکن را وارد کنید.');
-                return;
-            }
-            toggleTokenModal(false);
-            if (window.pendingCoreAction === 'enable_auto_update') {
-				try {
-					const res = await fetch('/api/auto-update-setup', {
-						method: 'POST',
-						headers: { 'Content-Type': 'application/json' },
-						body: JSON.stringify({ action: 'enable', token: token })
-					});
-					const data = await res.json();
-					if (res.ok && data.success) {
-						showToast('✅ آپدیت خودکار با موفقیت فعال شد.');
-						window.autoUpdateStatusCache = true;
-						const toggle = document.getElementById('auto-update-toggle');
-						if (toggle) toggle.checked = true;
-					} else {
-						alert('❌ خطا در بررسی توکن: ' + (data.error || 'ناشناخته'));
-					}
-				} catch(e) {
-					alert('❌ خطا در ارتباط با سرور');
-				}
-				window.pendingCoreAction = null;
-				return;
-            }
-            handleCoreAction(window.pendingCoreAction || 'update', token);
-        }
-        async function applyUpdate(token = null) {
-            await handleCoreAction('update', token);
-        }
-let cachedIpsData = {};
-async function fetchIpsList() {
-    try {
-        const response = await fetchWithFallbackUI('ips.txt');
-        if (!response.ok) throw new Error('Fetch failed');
-        const text = await response.text();
-        const blocks = text.split('----------');
-        cachedIpsData = {};
-        blocks.forEach(block => {
-            const lines = block.trim().split('\\n').map(l => l.trim()).filter(l => l.length > 0);
-            if (lines.length === 0) return;
-            let opName = "Unknown";
-            const ips = [];
-            lines.forEach(line => {
-                if (line.includes('#')) {
-                    opName = line.split('#')[1].trim();
-                } else if (!line.startsWith('[source')) {
-                    ips.push(line);
-                }
-            });
-            if (ips.length > 0) {
-                cachedIpsData[opName] = ips;
-            }
-        });
-        populateIpSelect();
-    } catch (err) {
-        alert('Failed to load IP list from GitHub.');
-        toggleIpSelectorModal(false);
-    }
-}
-function populateIpSelect() {
-    const select = document.getElementById('ip-operator-select');
-    select.innerHTML = '<option value="all">همه (توصیه شده)</option>';
-    Object.keys(cachedIpsData).forEach(op => {
-        const option = document.createElement('option');
-        option.value = op;
-        option.textContent = op;
-        select.appendChild(option);
-    });
-}
-function toggleIpSelectorModal(show) {
-    setModalState('ip-selector-modal', show);
-    if (!show) {
-		const rotateToggle = document.getElementById('input-auto-rotate-ip-toggle');
-		if (rotateToggle) rotateToggle.checked = false;
-		const rotateTime = document.getElementById('input-auto-rotate-ip-time');
-		if (rotateTime) rotateTime.value = '';
-		if (typeof window.toggleAutoRotateIpInputs === 'function') window.toggleAutoRotateIpInputs(false);
-    }
-}
-async function openIpSelectorModal() {
-    toggleIpSelectorModal(true);
-    document.getElementById('ip-loading-state').classList.remove('hidden');
-    document.getElementById('ip-selection-form').classList.add('hidden');
-    await fetchIpsList();
-	const op = document.getElementById('hidden-ip-operator').value;
-	const selectOp = document.getElementById('ip-operator-select');
-	if (selectOp.querySelector('option[value="' + op + '"]')) {
-		selectOp.value = op;
-	} else {
-		selectOp.value = 'all';
-	}
-	document.getElementById('ip-count-input').value = document.getElementById('hidden-ip-count').value || 20;
-	const isAuto = document.getElementById('hidden-auto-rotate').value === '1';
-	document.getElementById('input-auto-rotate-ip-toggle').checked = isAuto;
-	document.getElementById('input-auto-rotate-ip-time').value = document.getElementById('hidden-rotate-time').value;
-	if (typeof window.toggleAutoRotateIpInputs === 'function') window.toggleAutoRotateIpInputs(isAuto);
-    document.getElementById('ip-loading-state').classList.add('hidden');
-    document.getElementById('ip-selection-form').classList.remove('hidden');
-}
-function applySelectedIps() {
-    const operator = document.getElementById('ip-operator-select').value;
-    let count = parseInt(document.getElementById('ip-count-input').value, 10);
-    if (isNaN(count) || count < 1) count = 10;
-    let availableIps = [];
-    if (operator === 'all') {
-        Object.values(cachedIpsData).forEach(ips => {
-            availableIps = availableIps.concat(ips);
-        });
-    } else {
-        availableIps = cachedIpsData[operator] || [];
-    }
-    availableIps = [...new Set(availableIps)];
-    let selectedIps = [];
-    if (count >= availableIps.length) {
-        selectedIps = availableIps;
-    } else {
-        const shuffled = availableIps.slice();
-        for (let i = shuffled.length - 1; i > 0; i--) {
-            const j = Math.floor(Math.random() * (i + 1));
-            [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-        }
-        selectedIps = shuffled.slice(0, count);
-    }
-    document.getElementById('input-ips').value = selectedIps.join('\\n');
-	document.getElementById('hidden-auto-rotate').value = document.getElementById('input-auto-rotate-ip-toggle').checked ? '1' : '0';
-	document.getElementById('hidden-rotate-time').value = document.getElementById('input-auto-rotate-ip-time').value || '';
-	document.getElementById('hidden-ip-operator').value = operator;
-	document.getElementById('hidden-ip-count').value = count;
-    toggleIpSelectorModal(false);
-}
-document.addEventListener('DOMContentLoaded', () => {
-			setTimeout(() => {
-   			 const freeModal = document.getElementById('free-panel-warning-modal');
-    			const freeCard = freeModal.querySelector('div');
-    			freeModal.classList.remove('opacity-0', 'pointer-events-none');
-    			freeModal.classList.add('opacity-100', 'pointer-events-auto');
-    			freeCard.classList.remove('opacity-0', 'scale-95');
-    			freeCard.classList.add('opacity-100', 'scale-100');
-			}, 3000);
-            const versionBadge = document.getElementById('panel-version');
-            if (versionBadge) versionBadge.innerText = 'v' + CURRENT_VERSION;
-            renderPortCheckboxes();
-            loadUsers();
-            window.usersRefreshIntervalId = null;
-            window.startRefreshInterval = function(intervalMs) {
-                if (window.usersRefreshIntervalId) {
-                    clearInterval(window.usersRefreshIntervalId);
-                }
-                window.usersRefreshIntervalId = setInterval(() => {
-                    if (!document.hidden) loadUsers(true);
-                }, intervalMs);
-            };
-            window.changeRefreshRate = function(val) {
-                const ms = parseInt(val, 10);
-                localStorage.setItem('zeus_refresh_rate', ms);
-                window.startRefreshInterval(ms);
-                showToast('نرخ رفرش پـنـل تغییر کرد');
-            };
-            const savedRate = localStorage.getItem('zeus_refresh_rate');
-            const initialRate = savedRate ? parseInt(savedRate, 10) : 10000;
-            const selectEl = document.getElementById('refresh-rate-select');
-            if (selectEl) {
-                selectEl.value = String(initialRate);
-            }
-            window.startRefreshInterval(initialRate);
-			checkAutoUpdateSetup().then(() => {
-				setTimeout(() => checkForUpdates(false), 1000);
-			});
-            setInterval(() => {
-                if (!document.hidden) checkForUpdates(false);
-            }, 300000);
-            setTimeout(() => checkGlobalMessage(), 50);
-            setInterval(() => {
-                if (!document.hidden) checkGlobalMessage();
-            }, 300000);
-            window.addEventListener('mousedown', (e) => {
-                window._modalMouseDownTarget = e.target;
-            });
-            window.addEventListener('click', (e) => {
-                if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
-                if (e.target.id === 'user-modal') toggleModal(false);
-                if (e.target.id === 'ip-selector-modal') toggleIpSelectorModal(false);
-                if (e.target.id === 'settings-modal') toggleSettingsModal(false);
-                if (e.target.id === 'update-modal') toggleUpdateModal(false);
-                if (e.target.id === 'token-modal') toggleTokenModal(false);
-                if (e.target.id === 'qr-modal') toggleQrModal(false);
-                if (e.target.id === 'usage-warning-modal') closeUsageWarning();
-                if (e.target.id === 'free-panel-warning-modal') closeFreePanelWarning();
-                if (e.target.id === 'online-counter-warning-modal') closeOnlineCounterWarning();
-				if (e.target.id === 'config-count-warning-modal') closeConfigCountWarning();
-                if (e.target.id === 'global-message-modal') {
-                    const closeBtn = document.getElementById('global-message-close-btn');
-                    if (closeBtn) closeBtn.click();
-                }
-                if (e.target.id === 'custom-confirm-modal') {
-                    const cancelBtn = document.getElementById('custom-confirm-cancel');
-                    if (cancelBtn) cancelBtn.click();
-                }
-            });
-        });
-function toggleProxySelectorModal(show) { setModalState('proxy-selector-modal', show); }
-		async function loadVipCountries() {
-			const select = document.getElementById('vip-country-select');
-			const btn = document.getElementById('vip-fetch-btn');
-			select.innerHTML = '<option value="">در حال بررسی مخزن...</option>';
-			try {
-				const res = await fetchWithFallbackUI('vip-list');
-				if (!res.ok) throw new Error('API Error');
-				const data = await res.json();
-				const validCountries = data
-					.filter(function(file) { return file.name.endsWith('.txt'); })
-					.map(function(file) { return file.name.replace('.txt', '').toUpperCase(); });
-				if (validCountries.length === 0) throw new Error('Empty');
-				select.innerHTML = '<option value="">یک کشور VIP انتخاب کنید...</option>';
-				validCountries.forEach(function(country) {
-					const option = document.createElement('option');
-					option.value = country;
-					const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(country) : '🌐';
-					option.textContent = flag + ' ' + country;
-					select.appendChild(option);
-				});
-				btn.disabled = false;
-			} catch (err) {
-				select.innerHTML = '<option value="">پـروکـسـی اختصاصی موجود نیست</option>';
-				btn.disabled = true;
-			}
-		}
-		async function loadVipProxy() {
-			const select = document.getElementById('vip-country-select');
-			const country = select.value;
-			const btn = document.getElementById('vip-fetch-btn');
-			if (!country) return;
-			btn.disabled = true;
-			btn.innerText = '...';
-			try {
-				const res = await fetchWithFallbackUI('proxy_vip/' + country + '.txt?t=' + Date.now());
-				if (!res.ok) throw new Error('فایل یافت نشد');
-				const text = await res.text();
-				const lines = text.split('\\n').map(function(l) { return l.trim(); }).filter(function(l) { return l.length > 5; });
-				if (lines.length > 0) {
-					const randomProxy = lines[Math.floor(Math.random() * lines.length)];
-					window.proxyFieldsData[window.activeProxyIndex || 0] = randomProxy;
-					if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-					const userProxyResult = document.getElementById('test-user-proxy-result');
-					if (userProxyResult) {
-					    userProxyResult.innerText = '';
-					}
-					toggleProxySelectorModal(false);
-					showToast('✅ پـروکـسـی اختصاصی با موفقیت اعمال شد.');
-                    testUserSocksProxy();
-				} else {
-					alert('فایل پـروکـسـی این کشور خالی است.');
-				}
-			} catch (e) {
-				alert('خطا در دریافت پـروکـسـی اختصاصی.');
-			} finally {
-				btn.disabled = false;
-				btn.innerText = 'دریافت';
-			}
-		}
-		async function openProxySelectorModal() {
-			toggleProxySelectorModal(true);
-			const select = document.getElementById('proxy-country-select');
-			const fetchBtn = document.getElementById('proxy-fetch-btn');
-			const countriesList = [
-		  "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR",
-		  "AS", "AT", "AU", "AW", "AX", "AZ", "BA", "BB", "BD", "BE",
-		  "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ",
-		  "BR", "BS", "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD",
-		  "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN", "CO", "CR",
-		  "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM",
-		  "DO", "DZ", "EC", "EE", "EG", "EH", "ER", "ES", "ET", "FI",
-		  "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF",
-		  "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS",
-		  "GT", "GU", "GW", "GY", "HK", "HM", "HN", "HR", "HT", "HU",
-		  "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT",
-		  "JE", "JM", "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN",
-		  "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC", "LI", "LK",
-		  "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME",
-		  "MF", "MG", "MH", "MK", "ML", "MM", "MN", "MO", "MP", "MQ",
-		  "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA",
-		  "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU",
-		  "NZ", "OM", "PA", "PE", "PF", "PG", "PH", "PK", "PL", "PM",
-		  "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS",
-		  "RU", "RW", "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI",
-		  "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS", "ST", "SV",
-		  "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK",
-		  "TL", "TM", "TN", "TO", "TR", "TT", "TV", "TW", "TZ", "UA",
-		  "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
-		  "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW"
-			];
-			select.innerHTML = '';
-			countriesList.forEach(function(country) {
-				const option = document.createElement('option');
-				option.value = country;
-				const flag = typeof getFlagEmoji === 'function' ? getFlagEmoji(country) : '🌐';
-				option.textContent = flag + ' ' + country;
-				select.appendChild(option);
-			});
-			fetchBtn.disabled = false;
-			loadVipCountries();
-		}
-async function fetchAndLoadProxy() {
-    const select = document.getElementById("proxy-country-select");
-    const country = select.value;
-    if (!country) return;
-    const loadingState = document.getElementById("proxy-loading-state");
-    const formState = document.getElementById("proxy-selection-form");
-    const fetchBtn = document.getElementById("proxy-fetch-btn");
-    loadingState.classList.remove("hidden");
-    loadingState.innerText = "در حال دریافت لیست پـروکـسـی‌ها...";
-    formState.classList.add("hidden");
-    fetchBtn.disabled = true;
-    try {
-        const sources = [
-            { url: "proxy/" + country.toUpperCase() + ".txt", prefix: "" }
-        ];
-        const responses = await Promise.allSettled(sources.map(src => 
-            fetchWithFallbackUI(src.url).then(async res => {
-                if (!res.ok) throw new Error();
-                const text = await res.text();
-                return { text: text, prefix: src.prefix };
-            })
-        ));
-        let combinedProxies = [];
-        for (const res of responses) {
-            if (res.status === "fulfilled" && res.value && res.value.text) {
-                const rawLines = res.value.text.split("\\n");
-                for (let line of rawLines) {
-                    line = line.trim();
-                    if (line.length > 5) {
-                        combinedProxies.push(line);
-                    }
-                }
-            }
-        }
-        // 🛠 اصلاح هوشمند: اگر پروکسی پروتکل ندارد، به صورت خودکار socks5 اضافه می‌شود
-        let lines = [...new Set(combinedProxies.map(l => {
-            if (l.match(/^(socks4|socks5|socks|http|https|tg):\\/\\//i) || l.includes("t.me/socks")) {
-                return l;
-            }
-            return "socks5://" + l;
-        }))];
-        if (lines.length > 0) {
-            for (let i = lines.length - 1; i > 0; i--) {
-                const j = Math.floor(Math.random() * (i + 1));
-                [lines[i], lines[j]] = [lines[j], lines[i]];
-            }
-            let bestProxy = null;
-            let fallbackProxy = null;
-            const BATCH_SIZE = 5;
-            for (let i = 0; i < lines.length; i += BATCH_SIZE) {
-                const batch = lines.slice(i, i + BATCH_SIZE);
-                loadingState.innerText = "تعداد " + lines.length + " پـروکـسـی پیدا شد درحال اسکن\\nاسکن گروه " + (Math.floor(i / BATCH_SIZE) + 1) + " (۵ تست برای هر کدام)...";
-                const testResults = await Promise.allSettled(batch.map(async (candidate) => {
-                    let successCount = 0;
-                    let totalPing = 0;
-                    let failCount = 0;
-                    for(let t = 0; t < 5; t++) {
-                        const controller = new AbortController();
-                        const timeoutId = setTimeout(() => controller.abort(), 3500);
-                        try {
-                            const testRes = await fetch("/api/test-proxy", {
-                                method: "POST",
-                                headers: { "Content-Type": "application/json" },
-                                body: JSON.stringify({ proxy: candidate }),
-                                signal: controller.signal
-                            });
-                            clearTimeout(timeoutId);
-                            const testData = await testRes.json();
-                            if (testRes.ok && testData.success) {
-                                successCount++;
-                                totalPing += testData.ping;
-                            } else {
-                                failCount++;
-                            }
-                        } catch (err) {
-                            clearTimeout(timeoutId);
-                            failCount++;
-                        }
-                        if (failCount > 2) break;
-                    }
-                    if (successCount > 0) {
-                        return { proxy: candidate, successCount: successCount, avgPing: totalPing / successCount };
-                    }
-                    throw new Error();
-                }));
-                const successfulProxies = testResults
-                    .filter(r => r.status === "fulfilled")
-                    .map(r => r.value)
-                    .sort((a, b) => {
-                        if (b.successCount !== a.successCount) {
-                            return b.successCount - a.successCount;
-                        }
-                        return a.avgPing - b.avgPing;
-                    });
-                if (successfulProxies.length > 0) {
-                    const topCandidate = successfulProxies[0];
-                    if (topCandidate.successCount >= 3) {
-                        bestProxy = topCandidate.proxy;
-                        break;
-                    } else if (!fallbackProxy || topCandidate.successCount > fallbackProxy.successCount) {
-                        fallbackProxy = topCandidate;
-                    }
-                }
-            }
-            if (!bestProxy && fallbackProxy) {
-                bestProxy = fallbackProxy.proxy;
-            }
-            if (bestProxy) {
-                window.proxyFieldsData[window.activeProxyIndex || 0] = bestProxy;
-                if (typeof window.renderProxyFieldsUI === 'function') window.renderProxyFieldsUI();
-                document.getElementById("test-user-proxy-result").innerText = "";
-                toggleProxySelectorModal(false);
-                showToast("پـروکـسـی با بهترین امتیاز لود شد.");
-                testUserSocksProxy();
-            } else {
-                alert("هیچ پـروکـسـی سالمی (حتی با یک پینگ موفق) یافت نشد.");
-            }
-        } else {
-            alert("پـروکـسـی برای این کشور یافت نشد.");
-        }
-    } catch (e) {
-        alert("خطا در دریافت لیست پـروکـسـی‌ها از سرور.");
-    } finally {
-        loadingState.classList.add("hidden");
-        formState.classList.remove("hidden");
-        fetchBtn.disabled = false;
-    }
-}
-const WORKER_DONATE_URL = "https://si-491177.taile4bcbb.ts.net/donate";
-		function toggleDonateModal(show) {
-			setModalState('donate-modal', show);
-			if (!show) {
-				document.getElementById('donate-proxy-input').value = '';
-				const resultSpan = document.getElementById('donate-result');
-				if (resultSpan) {
-					resultSpan.innerText = '';
-					resultSpan.className = 'inline-block mt-1 text-[11px] font-bold transition-colors break-words leading-relaxed empty:hidden';
-				}
-			}
-		}
-		async function testAndDonateProxy() {
-			const proxyInput = document.getElementById('donate-proxy-input').value.trim();
-			const btn = document.getElementById('donate-submit-btn');
-			const resultSpan = document.getElementById('donate-result');
-			if (!proxyInput) {
-				resultSpan.innerText = 'لطفاً پـروکـسـی را وارد کنید!';
-				resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1';
-				return;
-			}
-			const strictProxyPattern = /^(?:(?:socks4|socks5|socks|http|https):\\/\\/)?([a-zA-Z0-9]{8}):([a-zA-Z0-9]{12})@([^:\\/]+):(\\d+)$/i;
-			if (!strictProxyPattern.test(proxyInput)) {
-				resultSpan.innerText = '❌ این پـروکـسـی اختصاصی نیست';
-				resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-				return;
-			}
-			btn.disabled = true;
-			btn.innerText = 'صبر کنید...';
-			resultSpan.innerText = 'در حال تست با اسکنر پـنـل...';
-			resultSpan.className = 'text-[11px] font-bold text-emerald-500 w-full mt-1';
-			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), 6000);
-			try {
-				const testRes = await fetch('/api/test-proxy', {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({ proxy: proxyInput }),
-					signal: controller.signal
-				});
-				clearTimeout(timeoutId);
-				const testData = await testRes.json();
-				if (!testRes.ok || !testData.success) {
-					throw new Error(testData.error || 'پـروکـسـی مسدود یا خاموش است');
-				}
-				const countryCode = testData.country || 'UN';
-				resultSpan.innerText = 'پـروکـسـی سالم است! در حال ارسال (' + countryCode + ')...';
-				const donateResponse = await fetch(WORKER_DONATE_URL, {
-					method: 'POST',
-					headers: { 'Content-Type': 'application/json' },
-					body: JSON.stringify({
-						proxy: proxyInput,
-						country: countryCode
-					})
-				});
-				const donateData = await donateResponse.json();
-				if (donateData.success) {
-					resultSpan.innerText = '✅ ' + donateData.message;
-					resultSpan.className = 'text-[11px] font-bold text-green-600 w-full mt-1';
-					document.getElementById('donate-proxy-input').value = '';
-				} else {
-					resultSpan.innerText = '❌ خطا: ' + donateData.error;
-					resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-				}
-			} catch (error) {
-				clearTimeout(timeoutId);
-				let errorMsg = error.message;
-				if (error.name === 'AbortError') errorMsg = 'تایم‌اوت در تست پـروکـسـی';
-				resultSpan.innerText = '❌ خطا: ' + errorMsg;
-				resultSpan.className = 'text-[11px] font-bold text-red-500 w-full mt-1 break-words';
-			} finally {
-				btn.disabled = false;
-				btn.innerText = 'تست و اهدا';
-			}
-		}
-		function toggleSupportModal(show) {
-            const modal = document.getElementById('support-modal');
-            const content = modal.firstElementChild;
-            if (show) {
-                modal.classList.remove('opacity-0', 'pointer-events-none');
-                content.classList.remove('opacity-0', 'scale-95');
-            } else {
-                modal.classList.add('opacity-0', 'pointer-events-none');
-                content.classList.add('opacity-0', 'scale-95');
-            }
-        }
-window.addEventListener('click', (e) => {
-    if (window._modalMouseDownTarget && window._modalMouseDownTarget !== e.target) return;
-    if (e.target.id === 'proxy-selector-modal') toggleProxySelectorModal(false);
-	if (e.target.id === 'donate-modal') toggleDonateModal(false);
-});
-    </script>
-</body>
-</html>`,
-	status: `<!DOCTYPE html>
-<html lang="fa" dir="rtl" class="dark">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>وضعیت اشتراک کاربر</title>
-    ${COMMON_HEAD}
-    <style>
-        body { font-family: 'Vazirmatn', sans-serif; }
-        .glass {
-            background: rgba(10, 10, 10, 0.6);
-            backdrop-filter: blur(12px);
-            -webkit-backdrop-filter: blur(12px);
-            border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-    </style>
-</head>
-<body class="bg-gray-50 text-gray-900 dark:bg-amoled-bg dark:text-zinc-100 min-h-screen flex flex-col items-center py-12 px-4 overflow-x-hidden">
-    <div class="w-full max-w-xl glass rounded-md shadow-2xl p-6 md:p-8 relative overflow-hidden">
-        <div class="absolute -left-12 -top-12 w-40 h-40 bg-blue-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div class="absolute -right-12 -bottom-12 w-40 h-40 bg-purple-500/10 rounded-full blur-3xl pointer-events-none"></div>
-        <div class="text-center mb-8 relative z-10">
-            <div class="inline-flex items-center justify-center p-3 bg-blue-950/60 border border-blue-500 text-blue-400 rounded-md mb-4 shadow-[0_0_15px_rgba(59,130,246,0.4)]">
-                <svg class="w-8 h-8 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+        </style>
+    </head>
+    <body>
+        <div class="matrix-bg"></div>
+        <div class="matrix-code-rain" id="matrixCodeRain"></div>
+            <div class="cp-hud">
+                <span class="cp-hud-line"><span class="cp-hud-label">SYS::</span> ${翻译值.terminal}</span>
+                <span class="cp-hud-line"><span class="cp-hud-label">NODE::</span> NIGHT_CITY</span>
+                <span class="cp-hud-line"><span class="cp-hud-label">LINK::</span> SECURE / ENC</span>
             </div>
-            <h1 class="text-xl font-bold tracking-tight text-gray-900 dark:text-white mb-1">پـنـل زئــوس - وضعیت اشتراک</h1>
-            <p id="display-username" class="text-sm font-bold text-blue-500 tracking-wide font-mono mb-2"></p>
-            <p id="display-flag" class="text-2xl font-bold tracking-wide mb-3" style="display:none;"></p>
-            <div id="live-connections-badge" style="display: none !important;">
-                <span class="w-2 h-2 rounded-full bg-green-600 animate-pulse"></span>
-                <span id="live-connections-text" dir="rtl">۰ دستگاه متصل</span>
+            <div class="cp-lang-wrapper">
+                <span class="cp-lang-tag">LANG_</span>
+                <select id="languageSelector" onchange="切换语言(this.value)">
+                    <option value="zh" ${!是否值236 ? 'selected' : ''}>🇨🇳 中文</option>
+                    <option value="fa" ${是否值236 ? 'selected' : ''}>🇮🇷 فارسی</option>
+                </select>
+            </div>
+            <button type="button" id="cpFxToggle" class="cp-fx-toggle" onclick="window.切换页面特效()" title="${是否值236 ? 'تغییر افکت‌های صفحه' : '切换页面特效'}" aria-label="FX toggle">
+                <span class="cp-fx-dot" aria-hidden="true"></span>
+                <span id="cpFxLabel">FX: ON</span>
+            </button>
+        <div class="container">
+            <div class="header">
+                    <h1 class="title cp-glitch" data-text="${翻译值.title}">${翻译值.title}</h1>
+                    <p class="subtitle">${翻译值.subtitle}</p>
+            </div>
+            <div class="card">
+                    <h2 class="card-title">${翻译值.selectClient}</h2>
+                <div class="client-grid">
+                    <button class="client-btn" onclick="生成客户端链接(atob('Y2xhc2g='), 'CLASH')">CLASH</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('Y2xhc2g='), 'STASH')">STASH</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('c3VyZ2U='), 'SURGE')">SURGE</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('c2luZ2JveA=='), 'SING-BOX')">SING-BOX</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('bG9vbg=='), 'LOON')">LOON</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('cXVhbng='), 'QUANTUMULT X')">QUANTUMULT X</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('djJyYXk='), 'V2RAY')">V2RAY</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('djJyYXk='), 'V2RAYNG')">V2RAYNG</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('djJyYXk='), 'NEKORAY')">NEKORAY</button>
+                    <button class="client-btn" onclick="生成客户端链接(atob('djJyYXk='), 'Shadowrocket')">Shadowrocket</button>
+                </div>
+                <div class="subscription-url" id="clientSubscriptionUrl"></div>
+            </div>
+            <div class="card">
+                    <h2 class="card-title">${翻译值.systemStatus}</h2>
+                <div id="systemStatus" style="margin: 20px 0; padding: 15px; background: rgba(8,10,14,0.8); border: 2px solid #c8f135; box-shadow: 0 0 20px rgba(200,241,53,0.3), inset 0 0 15px rgba(200,241,53,0.1); position: relative; overflow: hidden;">
+                        <div style="color: #c8f135; margin-bottom: 15px; font-weight: bold; ">[ ${翻译值.checking} ]</div>
+                        <div id="regionStatus" style="margin: 8px 0; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; ">${翻译值.workerRegion}${翻译值.checking}</div>
+                        <div id="geoInfo" style="margin: 8px 0; color: #9aa6b8; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.9rem; ">${翻译值.detectionMethod}${翻译值.checking}</div>
+                        <div id="backupStatus" style="margin: 8px 0; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; ">${翻译值.proxyIPStatus}${翻译值.checking}</div>
+                        <div id="currentIP" style="margin: 8px 0; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; ">${翻译值.currentIP}${翻译值.checking}</div>
+                        <div id="echStatus" style="margin: 8px 0; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;  font-size: 0.9rem;">ECH状态: ${翻译值.checking}</div>
+                        <div id="regionMatch" style="margin: 8px 0; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; ">${翻译值.regionMatch}${翻译值.checking}</div>
+                        <div id="selectionLogic" style="margin: 8px 0; color: #9aa6b8; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.9rem; ">${翻译值.selectionLogic}${翻译值.selectionLogicText}</div>
+                </div>
+            </div>
+            <div class="card" id="configCard" style="display: none;">
+                    <h2 class="card-title">${翻译值.configManagement}</h2>
+                <div id="kvStatus" style="margin-bottom: 20px; padding: 10px; background: rgba(8,10,14,0.8); border: 1px solid #c8f135; color: #c8f135;">
+                    ${翻译值.kvStatusChecking}
+                </div>
+                <div id="configContent" style="display: none;">
+                    <form id="regionForm" style="margin-bottom: 20px;">
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.specifyRegion}</label>
+                            <select id="wkRegion" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.autoDetect}</option>
+                                    <option value="HK">${翻译值.regionNames.HK}</option>
+                                    <option value="US">${翻译值.regionNames.US}</option>
+                                    <option value="SG">${翻译值.regionNames.SG}</option>
+                                    <option value="JP">${翻译值.regionNames.JP}</option>
+                                    <option value="KR">${翻译值.regionNames.KR}</option>
+                                    <option value="DE">${翻译值.regionNames.DE}</option>
+                                    <option value="SE">${翻译值.regionNames.SE}</option>
+                                    <option value="NL">${翻译值.regionNames.NL}</option>
+                                    <option value="FI">${翻译值.regionNames.FI}</option>
+                                    <option value="GB">${翻译值.regionNames.GB}</option>
+                            </select>
+                                <small id="wkRegionHint" style="color: #9aa6b8; font-size: 0.85rem; display: none;">⚠️ ${翻译值.customIPDisabledHint}</small>
+                        </div>
+                    </form>
+                    <form id="otherConfigForm" style="margin-bottom: 20px;">
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.protocolSelection}</label>
+                            <div style="padding: 15px; background: rgba(11,14,20,0.6); border: 1px solid #c8f135; border-radius: 5px;">
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="ev" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enableVLESS}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="et" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enableTrojan}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="ex" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enableXhttp}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(200,241,53,0.3);">
+                                    <div style="margin-bottom: 10px;">
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ech" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                                <span style="font-size: 1.1rem;">${翻译值.enableECH}</span>
+                                        </label>
+                                        <small style="color: #9aa6b8; font-size: 0.8rem; display: block; margin-top: 5px; margin-left: 26px;">${翻译值.enableECHHint}</small>
+                                    </div>
+                                    <div style="margin-top: 15px; margin-bottom: 10px;">
+                                        <label style="display: block; margin-bottom: 8px; color: #c8f135; font-size: 0.95rem;">${翻译值.customDNS}</label>
+                                        <input type="text" id="customDNS" placeholder="${翻译值.customDNSPlaceholder}" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                        <small style="color: #9aa6b8; font-size: 0.8rem; display: block; margin-top: 5px;">${翻译值.customDNSHint}</small>
+                                    </div>
+                                    <div style="margin-bottom: 10px;">
+                                        <label style="display: block; margin-bottom: 8px; color: #c8f135; font-size: 0.95rem;">${翻译值.customECHDomain}</label>
+                                        <input type="text" id="customECHDomain" placeholder="${翻译值.customECHDomainPlaceholder}" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                        <small style="color: #9aa6b8; font-size: 0.8rem; display: block; margin-top: 5px;">${翻译值.customECHDomainHint}</small>
+                                    </div>
+                                    <div style="margin-bottom: 10px;">
+                                        <label style="display: block; margin-bottom: 8px; color: #c8f135; font-size: 0.95rem;">${翻译值.alpn}</label>
+                                        <select id="alpn" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                            <option value="">${翻译值.alpnDefault}</option>
+                                            <option value="h3">h3</option>
+                                            <option value="h2">h2</option>
+                                            <option value="http/1.1">http/1.1</option>
+                                            <option value="h3,h2">h3,h2</option>
+                                            <option value="h2,http/1.1">h2,http/1.1</option>
+                                            <option value="h3,h2,http/1.1">h3,h2,http/1.1</option>
+                                        </select>
+                                        <small style="color: #9aa6b8; font-size: 0.8rem; display: block; margin-top: 5px;">${翻译值.alpnHint}</small>
+                                    </div>
+                                </div>
+                                <div style="margin-top: 15px; padding-top: 15px; border-top: 1px solid rgba(200,241,53,0.3);">
+                                        <label style="display: block; margin-bottom: 8px; color: #c8f135; font-size: 0.95rem;">${翻译值.trojanPassword}</label>
+                                        <input type="text" id="tp" placeholder="${翻译值.trojanPasswordPlaceholder}" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                        <small style="color: #9aa6b8; font-size: 0.8rem; display: block; margin-top: 5px;">${翻译值.trojanPasswordHint}</small>
+                                </div>
+                                    <small style="color: #9aa6b8; font-size: 0.85rem; display: block; margin-top: 10px;">${翻译值.protocolHint}</small>
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.customHomepage}</label>
+                                <input type="text" id="customHomepage" placeholder="${翻译值.customHomepagePlaceholder}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.customHomepageHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.customPath}</label>
+                                <input type="text" id="customPath" placeholder="${是否值236 ? 'مثال: /mypath یا خالی بگذارید تا از UUID استفاده شود' : '例如: /mypath 或留空使用 UUID'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${是否值236 ? 解码64('2YXYs9uM2LEg2KfYtNiq2LHYp9qpINiz2YHYp9ix2LTbjC4g2Kfar9ixINiu2KfZhNuMINio2q/YsNin2LHbjNivINin2LIgVVVJRCDYqNmHINi52YbZiNin2YYg2YXYs9uM2LEg2KfYs9iq2YHYp9iv2Ycg2YXbjOKAjNi02YjYry4=') : 解码64('6Ieq5a6a5LmJ6K6i6ZiF6Lev5b6E44CC55WZ56m65YiZ5L2/55SoIFVVSUQg5L2c5Li66Lev5b6E44CC')}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.customIP}</label>
+                                <input type="text" id="customIP" placeholder="${是否值236 ? 'مثال: 1.2.3.4:443' : '例如: 1.2.3.4:443'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${是否值236 ? 解码64('2KLYr9ix2LMg2Ygg2b7ZiNix2KogUHJveHlJUCDYs9mB2KfYsdi024w=') : 解码64('6Ieq5a6a5LmJUHJveHlJUOWcsOWdgOWSjOerr+WPow==')}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.preferredIPs}</label>
+                                <input type="text" id="yx" placeholder="${是否值236 ? 'مثال: 1.2.3.4:443#گره هنگ‌کنگ,5.6.7.8:80#گره آمریکا,example.com:8443#گره سنگاپور' : '例如: 1.2.3.4:443#日本节点,5.6.7.8:80#美国节点,example.com:8443#新加坡节点'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${是否值236 ? 'فرمت: IP:پورت#نام گره یا IP:پورت (بدون # از نام پیش‌فرض استفاده می‌شود). پشتیبانی از چندین مورد، با کاما جدا می‌شوند. <span style="color: #ffb454;">IP های اضافه شده از طریق API به طور خودکار در اینجا نمایش داده می‌شوند.</span>' : '格式: IP:端口#节点名称 或 IP:端口 (无#则使用默认名称)。支持多个，用逗号分隔。<span style="color: #ffb454;">API添加的IP会自动显示在这里。</span>'}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.preferredIPsURL}</label>
+                                <input type="text" id="yxURL" placeholder="${是否值236 ? 'URL منبع لیست IP ترجیحی را وارد کنید' : '输入优选IP列表来源URL'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${是否值236 ? 'URL منبع لیست IP ترجیحی سفارشی، اگر خالی بگذارید از آدرس پیش‌فرض استفاده می‌شود' : '自定义优选IP列表来源URL，留空则使用默认地址'}</small>
+                        </div>
+                        
+                        <div style="margin-bottom: 20px; padding: 15px; background: rgba(11,14,20,0.6); border: 2px solid #9aa6b8; border-radius: 8px;">
+                            <h4 style="color: #c8f135; margin: 0 0 15px 0; font-size: 1.1rem; ">⚡ ${翻译值.latencyTest}</h4>
+                            <div style="display: flex; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; align-items: center;">
+                                <div style="min-width: 120px;">
+                                    <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${翻译值.ipSource}</label>
+                                    <select id="ipSourceSelect" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px; cursor: pointer;">
+                                        <option value="manual">${翻译值.manualInput}</option>
+                                        <option value="cfRandom">${翻译值.cfRandomIP}</option>
+                                        <option value="urlFetch">${翻译值.urlFetch}</option>
+                                    </select>
+                                </div>
+                                <div style="width: 100px;">
+                                    <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${翻译值.latencyTestPort}</label>
+                                    <input type="number" id="latencyTestPort" value="443" min="1" max="65535" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                </div>
+                                <div id="randomCountDiv" style="width: 100px; display: none;">
+                                    <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${翻译值.randomCount}</label>
+                                    <input type="number" id="randomIPCount" value="20" min="1" max="100" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                </div>
+                                <div style="width: 80px;">
+                                    <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${是否值236 ? 'رشته‌ها' : '线程'}</label>
+                                    <input type="number" id="testThreads" value="5" min="1" max="50" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                </div>
+                            </div>
+                            <div id="manualInputDiv" style="margin-bottom: 10px;">
+                                <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${翻译值.latencyTestIP}</label>
+                                <input type="text" id="latencyTestInput" placeholder="${翻译值.latencyTestIPPlaceholder}" style="width: 100%; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                            </div>
+                            <div id="urlFetchDiv" style="margin-bottom: 10px; display: none;">
+                                <label style="display: block; margin-bottom: 5px; color: #c8f135; font-size: 0.9rem;">${翻译值.fetchURL}</label>
+                                <div style="display: flex; gap: 8px;">
+                                    <input type="text" id="fetchURLInput" placeholder="${翻译值.fetchURLPlaceholder}" style="flex: 1; padding: 10px; background: rgba(0, 0, 0, 0.8); border: 1px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 13px;">
+                                    <button type="button" id="fetchIPBtn" style="background: rgba(200,241,53,0.2); border: 1px solid #5b8cff; padding: 8px 16px; color: #5b8cff; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; white-space: nowrap;">⬇ ${翻译值.fetchIP}</button>
+                                </div>
+                            </div>
+                            <div id="cfRandomDiv" style="margin-bottom: 10px; display: none;">
+                                <button type="button" id="generateCFIPBtn" style="background: rgba(200,241,53,0.15); border: 1px solid #c8f135; padding: 10px 20px; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; width: 100%; transition: all 0.3s;">🎲 ${翻译值.generateIP}</button>
+                            </div>
+                            <div style="display: flex; gap: 10px; margin-bottom: 15px;">
+                                <button type="button" id="startLatencyTest" style="background: rgba(200,241,53,0.2); border: 1px solid #c8f135; padding: 8px 16px; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; transition: all 0.3s;">▶ ${翻译值.startTest}</button>
+                                <button type="button" id="stopLatencyTest" style="background: rgba(255,93,115,0.2); border: 1px solid #ff5d73; padding: 8px 16px; color: #ff5d73; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; cursor: pointer; display: none; transition: all 0.3s;">⏹ ${翻译值.stopTest}</button>
+                            </div>
+                            <div id="latencyTestStatus" style="color: #9aa6b8; font-size: 0.9rem; margin-bottom: 10px; display: none;"></div>
+                            <div id="latencyTestResults" style="max-height: 250px; overflow-y: auto; display: none;">
+                                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                                    <span style="color: #c8f135; font-weight: bold;">${翻译值.testResult}</span>
+                                    <div style="display: flex; gap: 8px;">
+                                        <button type="button" id="selectAllResults" style="background: transparent; border: 1px solid #9aa6b8; padding: 4px 10px; color: #9aa6b8; font-size: 0.8rem; cursor: pointer;">${翻译值.selectAll}</button>
+                                        <button type="button" id="deselectAllResults" style="background: transparent; border: 1px solid #9aa6b8; padding: 4px 10px; color: #9aa6b8; font-size: 0.8rem; cursor: pointer;">${翻译值.deselectAll}</button>
+                                    </div>
+                                </div>
+                                <div id="cityFilterContainer" style="margin-bottom: 10px; padding: 10px; background: rgba(11,14,20,0.6); border: 1px solid #9aa6b8; border-radius: 4px; display: none;">
+                                    <div style="margin-bottom: 8px;">
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135; font-size: 0.9rem;">
+                                            <input type="radio" name="cityFilterMode" value="all" checked style="margin-right: 6px; width: 16px; height: 16px; cursor: pointer;">
+                                            <span>${是否值236 ? '全部城市' : '全部城市'}</span>
+                                        </label>
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135; font-size: 0.9rem; margin-left: 15px;">
+                                            <input type="radio" name="cityFilterMode" value="fastest10" style="margin-right: 6px; width: 16px; height: 16px; cursor: pointer;">
+                                            <span>${是否值236 ? '只选择最快的10个' : '只选择最快的10个'}</span>
+                                        </label>
+                                    </div>
+                                    <div id="cityCheckboxesContainer" style="display: flex; flex-wrap: wrap; gap: 8px; max-height: 80px; overflow-y: auto; padding: 5px;"></div>
+                                </div>
+                                <div id="latencyResultsList" style="background: rgba(0, 0, 0, 0.5); border: 1px solid #0b1a08; border-radius: 4px; padding: 10px;"></div>
+                                <div style="margin-top: 10px; display: flex; gap: 10px;">
+                                    <button type="button" id="overwriteSelectedToYx" style="flex: 1; background: rgba(61,220,132,0.3); border: 1px solid #c8f135; padding: 10px 20px; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: bold; cursor: pointer; transition: all 0.3s;">${是否值236 ? '覆盖添加' : '覆盖添加'}</button>
+                                    <button type="button" id="appendSelectedToYx" style="flex: 1; background: rgba(61,220,132,0.18); border: 1px solid #9aa6b8; padding: 10px 20px; color: #9aa6b8; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: bold; cursor: pointer; transition: all 0.3s;">${是否值236 ? '追加添加' : '追加添加'}</button>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.socks5Config}</label>
+                                <input type="text" id="socksConfig" placeholder="${是否值236 ? 'مثال: user:pass@host:port یا host:port' : '例如: user:pass@host:port 或 host:port'}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${是否值236 ? 解码64('2KLYr9ix2LMg2b7YsdmI2qnYs9uMIFNPQ0tTNdiMINio2LHYp9uMINin2YbYqtmC2KfZhCDYqtmF2KfZhSDYqtix2KfZgduM2qkg2K7YsdmI2KzbjCDYp9iz2KrZgdin2K/ZhyDZhduM4oCM2LTZiNiv') : 解码64('U09DS1M15Luj55CG5Zyw5Z2A77yM55So5LqO6L2s5Y+R5omA5pyJ5Ye656uZ5rWB6YeP')}</small>
+                        </div>
+                    </form>
+
+                    <h3 style="color: #c8f135; margin: 20px 0 15px 0; font-size: 1.2rem;">${翻译值.advancedControl}</h3>
+                    <form id="advancedConfigForm" style="margin-bottom: 20px;">
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.subscriptionConverter}</label>
+                                <input type="text" id="scu" placeholder="${翻译值.subscriptionConverterPlaceholder}" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.subscriptionConverterHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.builtinPreferred}</label>
+                            <div style="padding: 15px; background: rgba(11,14,20,0.6); border: 1px solid #c8f135; border-radius: 5px;">
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="ena" style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enableNativeAddress}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="epd" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enablePreferredDomain}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="epi" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enablePreferredIP}</span>
+                                    </label>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                        <input type="checkbox" id="egi" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1.1rem;">${翻译值.enableGitHubPreferred}</span>
+                                    </label>
+                                </div>
+                                    <small style="color: #9aa6b8; font-size: 0.85rem; display: block; margin-top: 10px;">${翻译值.builtinPreferredHint}</small>
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">优选IP筛选设置</label>
+                            <div style="padding: 15px; background: rgba(11,14,20,0.6); border: 1px solid #c8f135; border-radius: 5px;">
+                                <div style="margin-bottom: 15px;">
+                                    <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">IP版本选择</label>
+                                    <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ipv4Enabled" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1rem;">IPv4</span>
+                                        </label>
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ipv6Enabled" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1rem;">IPv6</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                <div style="margin-bottom: 10px;">
+                                    <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">运营商选择</label>
+                                    <div style="display: flex; gap: 20px; flex-wrap: wrap;">
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ispMobile" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1rem;">移动</span>
+                                        </label>
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ispUnicom" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1rem;">联通</span>
+                                        </label>
+                                        <label style="display: inline-flex; align-items: center; cursor: pointer; color: #c8f135;">
+                                            <input type="checkbox" id="ispTelecom" checked style="margin-right: 8px; width: 18px; height: 18px; cursor: pointer;">
+                                            <span style="font-size: 1rem;">电信</span>
+                                        </label>
+                                    </div>
+                                </div>
+                                    <small style="color: #9aa6b8; font-size: 0.85rem; display: block; margin-top: 10px;">选择要使用的IP版本和运营商，未选中的将被过滤</small>
+                            </div>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.allowAPIManagement}</label>
+                            <select id="apiEnabled" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.apiEnabledDefault}</option>
+                                    <option value="yes">${翻译值.apiEnabledYes}</option>
+                            </select>
+                                <small style="color: #ffb454; font-size: 0.85rem;">${翻译值.apiEnabledHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.regionMatching}</label>
+                            <select id="regionMatching" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.regionMatchingDefault}</option>
+                                    <option value="no">${翻译值.regionMatchingNo}</option>
+                            </select>
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.regionMatchingHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.downgradeControl}</label>
+                            <select id="downgradeControl" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.downgradeControlDefault}</option>
+                                    <option value="no">${翻译值.downgradeControlNo}</option>
+                            </select>
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.downgradeControlHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.tlsControl}</label>
+                            <select id="portControl" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.tlsControlDefault}</option>
+                                    <option value="yes">${翻译值.tlsControlYes}</option>
+                            </select>
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.tlsControlHint}</small>
+                        </div>
+                        <div style="margin-bottom: 15px;">
+                                <label style="display: block; margin-bottom: 8px; color: #c8f135; font-weight: bold; ">${翻译值.preferredControl}</label>
+                            <select id="preferredControl" style="width: 100%; padding: 12px; background: rgba(0, 0, 0, 0.8); border: 2px solid #c8f135; color: #c8f135; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 14px;">
+                                    <option value="">${翻译值.preferredControlDefault}</option>
+                                    <option value="yes">${翻译值.preferredControlYes}</option>
+                            </select>
+                                <small style="color: #9aa6b8; font-size: 0.85rem;">${翻译值.preferredControlHint}</small>
+                        </div>
+                    </form>
+                    <div id="currentConfig" style="background: rgba(0, 0, 0, 0.9); border: 1px solid #c8f135; padding: 15px; margin: 10px 0; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #c8f135;">
+                            ${翻译值.loading}
+                    </div>
+                    <div id="pathTypeInfo" style="background: rgba(11,14,20,0.7); border: 1px solid #c8f135; padding: 15px; margin: 10px 0; font-family: 'Manrope', 'Vazirmatn', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #c8f135;">
+                            <div style="font-weight: bold; margin-bottom: 8px; color: #3ddc84; ">${翻译值.currentConfig}</div>
+                            <div id="pathTypeStatus">${翻译值.checking}</div>
+                    </div>
+                </div>
+                <div id="statusMessage" style="display: none; padding: 10px; margin: 10px 0; border: 1px solid #c8f135; background: rgba(8,10,14,0.8); color: #c8f135; "></div>
+            </div>
+
+            <div class="card">
+                <h2 class="card-title">${是否值236 ? 'به‌روزرسانی پنل' : '面板更新'}</h2>
+                <div style="margin-bottom:14px;color:#9aa6b8;font-size:0.85rem;">
+                    ${是否值236 ? 'نسخه فعلی: ' : '当前版本: '}<b style="color:#c8f135;">${面板版本}</b>
+                    &nbsp;·&nbsp;<span id="updLatestLabel">${是否值236 ? 'نسخه‌ی جدید هنوز بررسی نشده' : '尚未检查最新版本'}</span>
+                </div>
+                <div style="display:grid;grid-template-columns:1fr;gap:10px;margin-bottom:14px;">
+                    <input type="text" id="updVerUrl" placeholder="${是否值236 ? 'آدرس فایل VERSION (raw) برای بررسی نسخه جدید' : 'VERSION 文件的 raw 地址'}" style="width:100%;padding:10px;background:rgba(0,0,0,0.8);border:1px solid #c8f135;color:#c8f135;font-family:'JetBrains Mono',monospace;font-size:13px;">
+                    <input type="text" id="updSrcUrl" placeholder="${是否值236 ? 'آدرس worker-source.js جدید (raw)' : '最新 worker-source.js 的 raw 地址'}" style="width:100%;padding:10px;background:rgba(0,0,0,0.8);border:1px solid #c8f135;color:#c8f135;font-family:'JetBrains Mono',monospace;font-size:13px;">
+                    <input type="password" id="cfToken" placeholder="${是否值236 ? 'توکن API کلادفلر (فقط Workers Scripts:Edit)' : 'Cloudflare API Token（仅需 Workers Scripts:Edit）'}" style="width:100%;padding:10px;background:rgba(0,0,0,0.8);border:1px solid #c8f135;color:#c8f135;font-family:'JetBrains Mono',monospace;font-size:13px;">
+                    <input type="text" id="cfAccountId" placeholder="${是否值236 ? 'شناسه اکانت کلادفلر (Account ID)' : 'Cloudflare Account ID'}" style="width:100%;padding:10px;background:rgba(0,0,0,0.8);border:1px solid #c8f135;color:#c8f135;font-family:'JetBrains Mono',monospace;font-size:13px;">
+                    <input type="text" id="cfScriptName" placeholder="${是否值236 ? 'نام اسکریپت ورکر روی کلادفلر' : 'Worker 脚本名称'}" style="width:100%;padding:10px;background:rgba(0,0,0,0.8);border:1px solid #c8f135;color:#c8f135;font-family:'JetBrains Mono',monospace;font-size:13px;">
+                </div>
+                <div style="display:flex;gap:10px;flex-wrap:wrap;">
+                    <button type="button" id="updSaveBtn" style="background:rgba(200,241,53,0.15);border:1px solid #c8f135;padding:10px 18px;color:#c8f135;font-family:'Manrope',sans-serif;cursor:pointer;">${是否值236 ? 'ذخیره تنظیمات' : '保存设置'}</button>
+                    <button type="button" id="updCheckBtn" style="background:rgba(91,140,255,0.15);border:1px solid #5b8cff;padding:10px 18px;color:#5b8cff;font-family:'Manrope',sans-serif;cursor:pointer;">${是否值236 ? 'بررسی به‌روزرسانی' : '检查更新'}</button>
+                    <button type="button" id="updApplyBtn" style="background:rgba(61,220,132,0.15);border:1px solid #3ddc84;padding:10px 18px;color:#3ddc84;font-family:'Manrope',sans-serif;cursor:pointer;display:none;">${是否值236 ? 'دریافت و اعمال به‌روزرسانی' : '获取并应用更新'}</button>
+                </div>
+                <div id="updStatus" style="display:none;margin-top:12px;padding:10px;border:1px solid #c8f135;background:rgba(8,10,14,0.8);color:#c8f135;font-size:0.85rem;"></div>
+                <div style="margin-top:10px;color:#9aa6b8;font-size:0.75rem;">
+                    ${是否值236
+                      ? 'توکن فقط با اجازه‌ی «Workers Scripts:Edit» بساز، نه دسترسی کامل اکانت. این توکن در KV همین ورکر ذخیره می‌شود و هرگز جای دیگری فرستاده نمی‌شود.'
+                      : '请仅使用具有 "Workers Scripts:Edit" 权限的 Token，不要使用完整账户权限。该 Token 仅保存在本 Worker 的 KV 中，不会发送到任何其他地方。'}
+                </div>
+            </div>
+
+            <div class="card">
+                    <h2 class="card-title">${翻译值.relatedLinks}</h2>
+                <div style="text-align: center; margin: 20px 0;">
+                        <a href="https://github.com/byJoey/cfnew" target="_blank" style="color: #c8f135; text-decoration: none; margin: 0 20px; font-size: 1.2rem; ">${翻译值.githubProject}</a>
+                        <a href="https://github.com/byJoey/yx-tools/releases/" target="_blank" rel="noopener noreferrer" style="color: #c8f135; text-decoration: none; margin: 0 20px; font-size: 1.2rem; ">${翻译值.优选工具}</a>
+                    <a href="https://www.youtube.com/@joeyblog" target="_blank" style="color: #c8f135; text-decoration: none; margin: 0 20px; font-size: 1.2rem; ">YouTube @joeyblog</a>
+                </div>
             </div>
         </div>
-        <div id="status-card" class="mb-6 rounded-md p-4 text-center border font-bold relative z-10 transition duration-300">
-            <span id="status-text" class="text-sm">در حال بارگذاری وضعیت...</span>
-        </div>
-        <div class="grid grid-cols-2 gap-3 mb-8 relative z-10">
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
-                <div class="flex justify-between items-center mb-2">
-                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
-                        <svg class="w-3.5 h-3.5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path></svg>
-                        حجم مصرفی
-                    </span>
-                    <span id="volume-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
-                    <div id="volume-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-                    <span id="used-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-                    <span id="limit-vol" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-                </div>
-            </div>
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
-                <div class="flex justify-between items-center mb-2">
-                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
-                        <svg class="w-3.5 h-3.5 text-purple-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                        زمان باقی‌مانده
-                    </span>
-                    <span id="expiry-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2 flex justify-end">
-                    <div id="expiry-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-                    <span id="days-remaining" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
-                    <span id="total-days" class="font-bold text-gray-800 dark:text-zinc-200" dir="rtl">-</span>
-                </div>
-            </div>
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
-                <div class="flex justify-between items-center mb-2">
-                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
-                        <svg class="w-3.5 h-3.5 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
-                        ریکوئست‌ها
-                    </span>
-                    <span id="req-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
-                    <div id="req-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-                    <span id="used-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-                    <span id="limit-req" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-                </div>
-            </div>
-            <div class="bg-white/40 dark:bg-zinc-900/30 border border-gray-200 dark:border-amoled-border rounded-md p-3 shadow-sm flex flex-col justify-between">
-                <div class="flex justify-between items-center mb-2">
-                    <span class="text-[10px] font-semibold text-gray-600 dark:text-zinc-400 flex items-center gap-1">
-                        <svg class="w-3.5 h-3.5 text-sky-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 20h5v-2a3 3 0 00-5.356-1.857M17 20H7m10 0v-2c0-.656-.126-1.283-.356-1.857M7 20H2v-2a3 3 0 015.356-1.857M7 20v-2c0-.656.126-1.283.356-1.857m0 0a5.002 5.002 0 019.288 0M15 7a3 3 0 11-6 0 3 3 0 016 0zm6 3a2 2 0 11-4 0 2 2 0 014 0zM7 10a2 2 0 11-4 0 2 2 0 014 0z"></path></svg>
-                        دستگاه متصل
-                    </span>
-                    <span id="online-pct" class="text-[10px] font-bold text-gray-800 dark:text-zinc-200">۰٪</span>
-                </div>
-                <div class="w-full bg-gray-200 dark:bg-zinc-800 rounded-full h-1.5 overflow-hidden mb-2">
-                    <div id="online-progress" class="h-1.5 rounded-full transition-all duration-1000" style="width: 0%"></div>
-                </div>
-                <div class="flex justify-between text-[9px] text-gray-500 dark:text-zinc-400 font-medium">
-                    <span id="online-count" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">۰</span>
-                    <span id="limit-online" class="font-bold text-gray-800 dark:text-zinc-200" dir="ltr">-</span>
-                </div>
-            </div>
-        </div>
-        <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 relative z-10">
-            <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
-                <svg class="w-4 h-4 text-green-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z"></path></svg>
-                دریافت کـانفـیگ و اشتراک‌ها
-            </h2>
-            <div class="space-y-3">
-                <button onclick="copyTextSub()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-indigo-500 dark:hover:border-indigo-500 rounded-md text-xs font-medium transition shadow-sm">
-                    <span class="flex items-center gap-2">⛓️ کپی لینک ساب‌اسکریپشن متنی</span>
-                    <span class="text-indigo-500">کپی</span>
-                </button>
-				<button onclick="showSubQr()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-amber-500 dark:hover:border-amber-500 rounded-md text-xs font-medium transition shadow-sm">
-                    <span class="flex items-center gap-2">📱 دریافت کیوآر کد ساب</span>
-                    <span class="text-amber-500">نمایش</span>
-                </button>
-                <button onclick="copyvIeesConfig()" class="w-full flex justify-between items-center px-4 py-3 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border hover:border-blue-500 dark:hover:border-blue-500 rounded-md text-xs font-medium transition shadow-sm">
-                    <span class="flex items-center gap-2">🚀 کپی کـانفـیگ vIees (مستقیم)</span>
-                    <span class="text-blue-500">کپی</span>
-                </button>
-            </div>
-        </div>
-        <div class="border-t border-gray-100 dark:border-zinc-800 pt-6 mt-6 relative z-10 w-full">
-            <h2 class="text-sm font-bold mb-4 flex items-center gap-2">
-                <svg class="w-4 h-4 text-pink-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
-                دانلود نرم افزار ها
-            </h2>
-            <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <!-- Android -->
-                <div class="bg-emerald-50/50 dark:bg-emerald-950/20 border border-emerald-200/50 dark:border-emerald-800/30 rounded-md p-2.5">
-                    <div class="flex items-center gap-1.5 mb-2.5 text-emerald-700 dark:text-emerald-500 font-bold text-[11px]">
-                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M17.523 15.3414c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993.0004.5511-.4482.9997-.9993.9997m-11.046 0c-.5511 0-.9993-.4486-.9993-.9997s.4482-.9993.9993-.9993c.5511 0 .9993.4482.9993.9993 0 .5511-.4482.9997-.9993.9997m11.4045-6.02L19.695 6.183c.1568-.2716.0637-.6182-.2079-.7754-.2716-.1564-.6183-.0633-.775.2082l-1.8584 3.2185c-1.3853-.6328-2.9697-.9881-4.6644-.9881-1.6946 0-3.279.3553-4.664.9881L5.6664 5.6158c-.1567-.2715-.5038-.3646-.775-.2082-.2716.1572-.3647.5038-.2079.7754l1.8136 3.1385C2.963 11.2384 1.1571 14.5422 1 18.4234h22c-.1572-3.8812-1.963-7.185-5.4955-9.102"/></svg>
-                        اندروید
-                    </div>
-                    <div class="flex flex-col gap-1.5">
-                        <a href="https://github.com/2dust/v2rayNG/releases/latest" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>v2rayNG</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-                        <a href="https://github.com/Happ-proxy/happ-android/releases/latest/download/Happ.apk" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>happ</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-                        <a href="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Android-universal.apk" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>Hiddify</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-                        <a href="https://play.google.com/store/apps/details?id=com.napsternetlabs.napsternetv" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>Npv Tunnel</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-						<a href="https://play.google.com/store/apps/details?id=dev.hexasoftware.v2box" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>V2Box</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-						<a href="https://github.com/KaringX/karing/releases/latest" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>Karing</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-						<a href="https://github.com/ExclaveNetwork/Exclave/releases/latest" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-emerald-400 dark:hover:border-emerald-500 transition shadow-sm"><span>Exclave</span><span class="text-emerald-500 text-[12px]">📥</span></a>
-					</div>
-                </div>
-                <!-- Windows -->
-                <div class="bg-blue-50/50 dark:bg-blue-950/20 border border-blue-200/50 dark:border-blue-800/30 rounded-md p-2.5">
-                    <div class="flex items-center gap-1.5 mb-2.5 text-blue-700 dark:text-blue-500 font-bold text-[11px]">
-                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M0 3.449L9.75 2.1v9.451H0m10.949-9.602L24 0v11.4H10.949M0 12.6h9.75v9.451L0 20.699M10.949 12.6H24V24l-13.051-1.801"/></svg>
-                        ویندوز
-                    </div>
-                    <div class="flex flex-col gap-1.5">
-                        <a href="https://github.com/2dust/v2rayN/releases/latest/download/v2rayN-windows-64.zip" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-500 transition shadow-sm"><span>v2rayN</span><span class="text-blue-500 text-[12px]">📥</span></a>
-                        <a href="https://github.com/Happ-proxy/happ-desktop/releases/latest/download/setup-Happ.x64.exe" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-500 transition shadow-sm"><span>happ</span><span class="text-blue-500 text-[12px]">📥</span></a>
-                        <a href="https://github.com/hiddify/hiddify-app/releases/latest/download/Hiddify-Windows-Setup-x64.exe" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-500 transition shadow-sm"><span>Hiddify</span><span class="text-blue-500 text-[12px]">📥</span></a>
-						<a href="https://github.com/KaringX/karing/releases/latest" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-blue-400 dark:hover:border-blue-500 transition shadow-sm"><span>Karing</span><span class="text-blue-500 text-[12px]">📥</span></a>
-                    </div>
-                </div>
-                <!-- iOS -->
-                <div class="bg-gray-50/50 dark:bg-zinc-800/30 border border-gray-200/50 dark:border-gray-700/50 rounded-md p-2.5">
-                    <div class="flex items-center gap-1.5 mb-2.5 text-gray-700 dark:text-gray-300 font-bold text-[11px]">
-                        <svg class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.05 2.95.72 3.88 1.84-3.46 2.06-2.89 6.18.54 7.42-.85 1.58-1.54 2.82-3.07 3.75zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
-                        آیفون
-                    </div>
-                    <div class="flex flex-col gap-1.5">
-						<a href="https://apps.apple.com/us/app/v2box-v2ray-client/id6446814690" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-gray-400 dark:hover:border-gray-500 transition shadow-sm"><span>V2Box</span><span class="text-gray-500 text-[12px]">📥</span></a>
-                        <a href="https://apps.apple.com/us/app/streisand/id6450534064" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-gray-400 dark:hover:border-gray-500 transition shadow-sm"><span>Streisand</span><span class="text-gray-500 text-[12px]">📥</span></a>
-                        <a href="https://apps.apple.com/us/app/npv-tunnel/id1629465476" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-gray-400 dark:hover:border-gray-500 transition shadow-sm"><span>NapsternetV</span><span class="text-gray-500 text-[12px]">📥</span></a>
-                        <a href="https://apps.apple.com/us/app/happ-proxy-utility/id6504287215" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-gray-400 dark:hover:border-gray-500 transition shadow-sm"><span>happ</span><span class="text-gray-500 text-[12px]">📥</span></a>
-                        <a href="https://apps.apple.com/us/app/hiddify-proxy-vpn/id6596777532" target="_blank" class="flex justify-between items-center bg-white dark:bg-amoled-card border border-gray-100 dark:border-zinc-800 px-2 py-1.5 rounded text-[10px] font-semibold text-gray-700 dark:text-zinc-300 hover:border-gray-400 dark:hover:border-gray-500 transition shadow-sm"><span>Hiddify</span><span class="text-gray-500 text-[12px]">📥</span></a>
-                    </div>
-                </div>
-            </div>
-        </div>
-    </div>
-<div id="qr-modal" class="fixed inset-0 z-[110] flex items-center justify-center p-4 bg-black/70 opacity-0 pointer-events-none transition-opacity duration-200 ease-out">
-    <div id="qr-modal-card" class="w-full max-w-sm bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-md shadow-2xl p-6 transform transition-all scale-95 opacity-0 duration-200 text-center">
-        <div class="flex justify-between items-center mb-4">
-            <h3 class="text-lg font-bold text-gray-900 dark:text-white">QR Code</h3>
-            <button onclick="toggleQrModal(false)" class="p-1.5 rounded-md bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-900/50 text-red-600 dark:text-red-500 hover:bg-red-100 dark:hover:bg-red-900/50 transition-all duration-200 shadow-sm">
-                <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+        <div id="cpToastStack" class="cp-toast-stack" aria-live="polite" aria-atomic="false"></div>
+        <div id="cpActionStatus" class="cp-action-status" role="status" aria-live="polite"></div>
+        <div id="cpActionBar" class="cp-action-bar" role="toolbar" aria-label="${翻译值.configManagement}">
+            <button type="button" id="cpBtnSaveAll" class="cp-fab-save" title="${是否值236 ? 'ذخیره همه تنظیمات' : '保存所有配置 (Ctrl+S)'}">
+                <span class="cp-fab-icon">▣</span>
+                <span>${是否值236 ? 'ذخیره همه' : '保 存 全 部'}</span>
+                <span class="cp-fab-dot" aria-hidden="true"></span>
+            </button>
+            <button type="button" id="cpBtnRefresh" class="cp-action-btn" data-tip="${翻译值.refreshConfig}" aria-label="${翻译值.refreshConfig}">
+                <span aria-hidden="true">↻</span>
+                <span class="cp-btn-label">${翻译值.refreshConfig}</span>
+            </button>
+            <button type="button" id="cpBtnReset" class="cp-action-btn cp-action-btn-danger" data-tip="${翻译值.resetConfig}" aria-label="${翻译值.resetConfig}">
+                <span aria-hidden="true">⌫</span>
+                <span class="cp-btn-label">${翻译值.resetConfig}</span>
             </button>
         </div>
-        <div class="flex justify-center bg-white p-4 rounded-md mb-4">
-            <div id="qrcode-container"></div>
-        </div>
-        <button onclick="downloadQrCode()" class="w-full py-2.5 bg-transparent border-2 border-green-600 text-green-700 hover:bg-green-900/20 hover:text-green-800 dark:border-green-500 dark:text-green-500 dark:hover:bg-green-900/40 dark:hover:text-green-400 font-bold rounded-md text-sm transition duration-200 shadow-sm flex items-center justify-center gap-2">
-            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0L8 8m4-4v12"></path></svg>
-            دانلود تصویر QR
-        </button>
-    </div>
-</div>
-<div class="flex flex-col gap-4 mt-6 z-10">
-    <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-        <a href="https://github.com/zeus-panel/ZEUS-PANEL" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-black dark:hover:text-white group">
-            <svg class="w-5 h-5 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
-                <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.477 2 12c0 4.42 2.87 8.17 6.84 9.5.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34-.46-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.6.07-.6 1 .07 1.53 1.03 1.53 1.03.87 1.52 2.34 1.07 2.91.83.09-.65.35-1.09.63-1.34-2.22-.25-4.55-1.11-4.55-4.92 0-1.11.38-2 1.03-2.71-.1-.25-.45-1.29.1-2.64 0 0 .84-.27 2.75 1.02.79-.22 1.65-.33 2.5-.33.85 0 1.71.11 2.5.33 1.91-1.29 2.75-1.02 2.75-1.02.55 1.35.2 2.39.1 2.64.65.71 1.03 1.6 1.03 2.71 0 3.82-2.34 4.66-4.57 4.91.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0012 2z"/>
-            </svg>
-            گیت‌هاب
-        </a>
-        <a href="https://t.me/PANEL_ZEUS" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-gray-700 dark:text-zinc-300 hover:text-sky-500 dark:hover:text-sky-400 group">
-            <svg class="w-5 h-5 text-sky-500 group-hover:scale-110 transition" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 00-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.94-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.37.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .24z"/>
-            </svg>
-            PANEL_ZEUS@
-        </a>
-    </div>
-    <div class="flex flex-wrap items-center gap-3 sm:gap-4 justify-center">
-        <a href="https://t.me/ZEUS_PANEL_BOT" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-amber-600 dark:text-amber-400 hover:text-amber-500 dark:hover:text-amber-300 group">
-            <svg class="w-5 h-5 text-amber-500 dark:text-amber-400 group-hover:scale-110 transition" fill="none" stroke="currentColor" stroke-width="2.5" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z"/>
-            </svg>
-            ساخت رایگان پـنـل
-        </a>
-        <a href="https://donatonion.ir-netlify.workers.dev" target="_blank" class="flex items-center gap-2 px-4 py-2 bg-white dark:bg-amoled-card border border-gray-200 dark:border-amoled-border rounded-full shadow-sm hover:shadow-md transition text-sm font-bold text-red-600 dark:text-red-400 hover:text-red-500 dark:hover:text-red-300 group">
-            <svg class="w-5 h-5 text-red-500 dark:text-red-400 group-hover:scale-110 transition" fill="currentColor" viewBox="0 0 24 24">
-                <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3 9.24 3 10.91 3.81 12 5.08 13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
-            </svg>
-            دونیت
-        </a>
-    </div>
-</div>
-${COMMON_TOAST_HTML}
-    <script>
-        /* {{USER_DATA_PLACEHOLDER}} */
-        ${COMMON_TOAST_JS}
-        function getHost() {
-            return window.location.host;
-        }
-        function getvIeesLink() {
-			const u = window.statusUser;
-			if (!u) return '';
-			const host = getHost();
-			var ips = [host];
-			if (u.ips) {
-				const parsedIps = u.ips.split('\\n').map(function(ip) { return ip.trim(); }).filter(function(ip) { return ip.length > 0; });
-				if (parsedIps.length > 0) ips = parsedIps;
-			}
-			var ports = String(u.port || '443').split(',').map(function(p) { return p.trim(); }).filter(function(p) { return p.length > 0; });
-			var fp = u.fingerprint || 'chrome';
-			const dynPath = encodeURIComponent("/stream/PANEL_ZEUS/" + (u.uuid ? u.uuid.split("-")[4] : "default"));
-			const links = [];
-			const m1 = decodeURIComponent('%E2%9A%A0%EF%B8%8F%D9%BE%D9%86%D9%84%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%20%D9%88%20%D8%BA%DB%8C%D8%B1%20%D9%82%D8%A7%D8%A8%D9%84%20%D9%81%D8%B1%D9%88%D8%B4%E2%9A%A0%EF%B8%8F');
-			const m2 = decodeURIComponent('%F0%9F%9A%80%40PANEL_ZEUS%20%D8%B3%D8%A7%D8%AE%D8%AA%20%D8%B1%D8%A7%DB%8C%DA%AF%D8%A7%D9%86%F0%9F%9A%80');
-			links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m1));
-			links.push('vle' + 'ss://' + (u.uuid || '') + '@0.0.0.0:1?encryption=none&security=none&type=ws&host=' + host + '&path=' + dynPath + '#' + encodeURIComponent(m2));
-			let remVol = "Unlimited";
-			if (u.limit_gb) {
-				let rem = u.limit_gb - (u.used_gb || 0);
-				remVol = rem > 0 ? rem.toFixed(2) + "GB" : "0GB";
-			}
-			let remTime = "Unlimited";
-			if (u.expiry_days && u.created_at) {
-				const created = new Date(u.created_at);
-				const expiryDate = new Date(created.getTime() + u.expiry_days * 24 * 60 * 60 * 1000);
-				const diffDays = Math.ceil((expiryDate.getTime() - Date.now()) / (1000 * 60 * 60 * 24));
-				remTime = diffDays > 0 ? diffDays + "Days" : "0Days";
-			}
-			let remReq = "Unlimited";
-			if (u.limit_req) {
-				let rem = u.limit_req - (u.used_req || 0);
-				remReq = rem > 0 ? rem.toLocaleString() + "Req" : "0Req";
-			}
-			const infoRemark = "📊 remaining | \u200E" + remVol + " | \u200E" + remTime + " | \u200E" + remReq;
-			links.push('vle' + 'ss://' + (u.uuid || '') + '@' + host + ':80?path=' + dynPath + '&security=none&encryption=none&host=' + host + '&fp=' + fp + '&type=ws#' + encodeURIComponent(infoRemark));
-			const rawPath = "/stream/PANEL_ZEUS/" + (u.uuid ? u.uuid.split("-")[4] : "default");
-			let proxyList = [];
-			try {
-				if (u.user_socks5 && u.user_socks5.trim().startsWith("[")) {
-					proxyList = JSON.parse(u.user_socks5);
-				} else if (u.user_socks5 || u.user_proxy_ip) {
-					proxyList = [u.user_socks5 || u.user_proxy_ip];
-				} else {
-					proxyList = [null];
-				}
-			} catch (e) {
-				proxyList = [u.user_socks5 || u.user_proxy_ip];
-			}
-			if (!Array.isArray(proxyList) || proxyList.length === 0) proxyList = [null];
-			let proxyFlagCache = {};
-			try { proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}'); } catch(e) {}
-			for (let locIdx = 0; locIdx < proxyList.length; locIdx++) {
-				let proxyItem = proxyList[locIdx];
-				let proxyStr = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.proxy : proxyItem;
-				let countryCode = typeof proxyItem === "object" && proxyItem !== null ? proxyItem.country : (u.user_proxy_iata || "");
-				let flagEmoji = "🌐";
-				if (countryCode && typeof getFlagEmoji === 'function') {
-					flagEmoji = getFlagEmoji(countryCode);
-				} else if (proxyStr && proxyFlagCache[proxyStr]) {
-					flagEmoji = proxyFlagCache[proxyStr];
-				}
-				const currentDynPath = encodeURIComponent(rawPath + ((proxyList[0] !== null && proxyList[0] !== "") ? "?loc=" + locIdx : ""));
-				ips.forEach((ip) => {
-					ports.forEach((portStr) => {
-						const isTlsPort = ["443", "2053", "2083", "2087", "2096", "8443"].includes(portStr);
-						const tlsVal = isTlsPort ? "tls" : "none";
-						const userFrag = u.frag_len && u.frag_int ? "&fragment=" + u.frag_len + "," + u.frag_int : "";
-						const remark = "ZEUS | " + flagEmoji + " | " + u.username;
-						links.push('vle' + 'ss://' + (u.uuid || '') + '@' + ip + ':' + portStr + '?path=' + currentDynPath + '&security=' + tlsVal + '&encryption=none&insecure=0&host=' + host + '&fp=' + fp + '&type=ws&allowInsecure=0&sni=' + host + userFrag + '#' + encodeURIComponent(remark));
-					});
-				});
-			}
-			return links.join('\\n');
-		}
-        function copyvIeesConfig() {
-            navigator.clipboard.writeText(getvIeesLink()).then(() => alert('✅ کـانفـیگ vIees با موفقیت کپی شد!'));
-        }
-        function copyTextSub() {
-            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
-            navigator.clipboard.writeText(link).then(() => alert('✅ لینک ساب متنی کپی شد!'));
-        }
-		function toggleQrModal(show, text) {
-			const modal = document.getElementById('qr-modal');
-			const card = document.getElementById('qr-modal-card');
-			const container = document.getElementById('qrcode-container');
-			if (show) {
-				container.innerHTML = '';
-				new QRCode(container, {
-					text: text,
-					width: 200,
-					height: 200,
-					colorDark: "#000000",
-					colorLight: "#ffffff",
-					correctLevel: QRCode.CorrectLevel.M
-				});
-				modal.classList.remove('opacity-0', 'pointer-events-none');
-				modal.classList.add('opacity-100', 'pointer-events-auto');
-				card.classList.remove('opacity-0', 'scale-95');
-				card.classList.add('opacity-100', 'scale-100');
-			} else {
-				modal.classList.remove('opacity-100', 'pointer-events-auto');
-				modal.classList.add('opacity-0', 'pointer-events-none');
-				card.classList.remove('opacity-100', 'scale-100');
-				card.classList.add('opacity-0', 'scale-95');
-			}
-		}
-		function downloadQrCode() {
-			const container = document.getElementById('qrcode-container');
-			if (!container) return;
-			const canvas = container.querySelector('canvas');
-			const img = container.querySelector('img');
-			let dataUrl = '';
-			if (canvas) {
-				dataUrl = canvas.toDataURL("image/png");
-			} else if (img && img.src) {
-				dataUrl = img.src;
-			}
-			if (!dataUrl) {
-				alert('⚠️ تصویر QR برای دانلود یافت نشد!');
-				return;
-			}
-			const downloadAnchor = document.createElement('a');
-			downloadAnchor.href = dataUrl;
-			downloadAnchor.download = "zeus_qrcode_" + Date.now() + ".png";
-			document.body.appendChild(downloadAnchor);
-			downloadAnchor.click();
-			downloadAnchor.remove();
-		}
-        function showSubQr() {
-            const link = window.location.protocol + '//' + getHost() + '/sub/' + encodeURIComponent(window.statusUser.username);
-            toggleQrModal(true, link);
-        }
-		function getFlagEmoji(countryCode) {
-            if (!countryCode) return '🌐';
-            const codePoints = countryCode.toUpperCase().split('').map(char => 127397 + char.charCodeAt(0));
-            try {
-                return String.fromCodePoint(...codePoints);
-            } catch (e) {
-                return '🌐';
-            }
-        }
-        document.addEventListener('DOMContentLoaded', () => {
-            const u = window.statusUser;
-            if (!u) return;
-            const limit = u.ip_limit !== undefined ? u.ip_limit : u.max_connections;
-            document.getElementById('display-username').innerText = u.username;
-const flagContainer = document.getElementById('display-flag');
-if (u.user_proxy_iata) {
-    const flag = getFlagEmoji(u.user_proxy_iata);
-    flagContainer.innerText = flag + " " + u.user_proxy_iata.toUpperCase();
-    flagContainer.style.display = 'block'; 
-} else if (u.user_socks5 || u.user_proxy_ip) {
-    flagContainer.style.display = 'block';
-    let proxyList = [];
-    try {
-        if (u.user_socks5 && u.user_socks5.trim().startsWith("[")) {
-            proxyList = JSON.parse(u.user_socks5);
-        } else {
-            proxyList = [u.user_socks5 || u.user_proxy_ip];
-        }
-    } catch(e) {
-        proxyList = [u.user_socks5 || u.user_proxy_ip];
-    }
-    // ۱. نمایش اولیه از کش (یا علامت لودینگ)
-    let initialFlags = proxyList.map(item => {
-        let targetProxy = typeof item === 'object' && item !== null ? item.proxy : item;
-        let targetCountry = typeof item === 'object' && item !== null ? item.country : null;
-        if (targetCountry) return getFlagEmoji(targetCountry);
-        try {
-            const proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}');
-            if (proxyFlagCache[targetProxy]) return proxyFlagCache[targetProxy];
-        } catch(e) {}
-        return '⏳';
-    });
-    flagContainer.innerText = initialFlags.join(' ');
-    // ۲. دریافت اطلاعات برای پرچم‌های نامشخص و آپدیت نهایی
-    Promise.all(proxyList.map((item, index) => {
-        let targetProxy = typeof item === 'object' && item !== null ? item.proxy : item;
-        let targetCountry = typeof item === 'object' && item !== null ? item.country : null;
-        if (targetCountry) return Promise.resolve(getFlagEmoji(targetCountry));
-        try {
-            const proxyFlagCache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}');
-            if (proxyFlagCache[targetProxy]) return Promise.resolve(proxyFlagCache[targetProxy]);
-        } catch(e) {}
-        return fetch('/api/test-proxy', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ proxy: targetProxy })
-        })
-        .then(res => res.json())
-        .then(data => {
-            if (data.success && data.country) {
-                const flag = getFlagEmoji(data.country);
-                try {
-                    const cache = JSON.parse(localStorage.getItem('proxy_flag_cache') || '{}');
-                    cache[targetProxy] = flag;
-                    localStorage.setItem('proxy_flag_cache', JSON.stringify(cache));
-                } catch(e) {}
-                return flag;
-            }
-            return '🌐';
-        })
-        .catch(() => '🌐');
-    })).then(flags => {
-        flagContainer.innerText = flags.join(' ');
-    });
-}
-            const badge = document.getElementById('live-connections-badge');
-            badge.classList.remove('hidden');
-            if (u.online_count && u.online_count > 0) {
-                document.getElementById('live-connections-text').innerText = u.online_count + (limit ? '/' + limit : '') + ' دستگاه متصل';
-                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-green-600/10 border border-green-600/20 text-green-600 rounded-full text-xs font-bold shadow-sm';
-                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-green-600 animate-pulse';
-            } else {
-                document.getElementById('live-connections-text').innerText = '۰ دستگاه متصل';
-                badge.className = 'inline-flex items-center gap-1.5 px-3 py-1 bg-gray-500/10 border border-gray-500/20 text-gray-500 dark:text-zinc-400 rounded-full text-xs font-bold shadow-sm';
-                badge.querySelector('span.w-2').className = 'w-2 h-2 rounded-full bg-gray-500';
-            }
-            const usedGb = u.used_gb || 0;
-            const limitGb = u.limit_gb;
-            const formattedUsed = usedGb < 1 ? (usedGb * 1024).toFixed(0) + ' MB' : usedGb.toFixed(2) + ' GB';
-            document.getElementById('used-vol').innerText = formattedUsed;
-            let isVolumeExpired = false;
-            if (limitGb) {
-                document.getElementById('limit-vol').innerText = limitGb + ' GB';
-                const pct = Math.min((usedGb / limitGb) * 100, 100);
-                document.getElementById('volume-pct').innerText = pct.toFixed(0) + '٪';
-                document.getElementById('volume-progress').style.width = pct + '%';
-                const hue = 120 - (pct * 1.2);
-                document.getElementById('volume-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
-                if (usedGb >= limitGb) isVolumeExpired = true;
-            } else {
-                document.getElementById('limit-vol').innerText = 'نامحدود';
-                document.getElementById('volume-pct').innerText = '۰٪';
-                document.getElementById('volume-progress').style.width = '100%';
-                document.getElementById('volume-progress').style.backgroundColor = '#3b82f6';
-            }
-            let daysRemaining = 'نامحدود';
-            let totalDays = 'نامحدود';
-            let isTimeExpired = false;
-            if (u.expiry_days) {
-                totalDays = u.expiry_days + ' روز';
-                if (u.created_at) {
-                    const created = new Date(u.created_at);
-                    const expiryDate = new Date(created.getTime() + (u.expiry_days * 24 * 60 * 60 * 1000));
-                    const diffDays = Math.ceil((expiryDate - new Date()) / (1000 * 60 * 60 * 24));
-                    daysRemaining = diffDays > 0 ? diffDays : 0;
-                    const pct = Math.max(0, Math.min(100, (daysRemaining / u.expiry_days) * 100));
-                    document.getElementById('expiry-pct').innerText = pct.toFixed(0) + '٪';
-                    document.getElementById('expiry-progress').style.width = pct + '%';
-                    const hue = pct * 1.2;
-                    document.getElementById('expiry-progress').style.backgroundColor = 'hsl(' + hue + ', 80%, 45%)';
-                    if (new Date() > expiryDate) isTimeExpired = true;
-                }
-            } else {
-                document.getElementById('expiry-pct').innerText = '۰٪';
-                document.getElementById('expiry-progress').style.width = '100%';
-                document.getElementById('expiry-progress').style.backgroundColor = '#3b82f6';
-            }
-            document.getElementById('days-remaining').innerText = daysRemaining === 'نامحدود' ? 'نامحدود' : daysRemaining + ' روز';
-            document.getElementById('total-days').innerText = totalDays;
-            const usedReq = u.used_req || 0;
-            const limitReq = u.limit_req;
-            document.getElementById('used-req').innerText = usedReq.toLocaleString();
-            let isReqExpired = false;
-            if (limitReq) {
-                document.getElementById('limit-req').innerText = limitReq.toLocaleString();
-                const rPct = Math.min((usedReq / limitReq) * 100, 100);
-                document.getElementById('req-pct').innerText = rPct.toFixed(0) + '٪';
-                document.getElementById('req-progress').style.width = rPct + '%';
-                const rHue = 120 - (rPct * 1.2);
-                document.getElementById('req-progress').style.backgroundColor = 'hsl(' + rHue + ', 80%, 45%)';
-                if (usedReq >= limitReq) isReqExpired = true;
-            } else {
-                document.getElementById('limit-req').innerText = 'نامحدود';
-                document.getElementById('req-pct').innerText = '۰٪';
-                document.getElementById('req-progress').style.width = '100%';
-                document.getElementById('req-progress').style.backgroundColor = '#3b82f6';
-            }
-            const onlineCount = u.online_count || 0;
-            document.getElementById('online-count').innerText = onlineCount;
-            if (limit) {
-                document.getElementById('limit-online').innerText = limit;
-                const oPct = Math.min((onlineCount / limit) * 100, 100);
-                document.getElementById('online-pct').innerText = oPct.toFixed(0) + '٪';
-                document.getElementById('online-progress').style.width = oPct + '%';
-                const oHue = 120 - (oPct * 1.2);
-                document.getElementById('online-progress').style.backgroundColor = 'hsl(' + oHue + ', 80%, 45%)';
-            } else {
-                document.getElementById('limit-online').innerText = 'نامحدود';
-                document.getElementById('online-pct').innerText = '۰٪';
-                document.getElementById('online-progress').style.width = '100%';
-                document.getElementById('online-progress').style.backgroundColor = onlineCount > 0 ? '#16a34a' : '#9ca3af'; 
-            }
-            const statusCard = document.getElementById('status-card');
-            const statusText = document.getElementById('status-text');
-            if (u.is_active === 0) {
-                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-red-500/10 border-red-500/30 text-red-500 shadow-md shadow-red-500/5';
-                statusCard.style.boxShadow = 'inset 0 0 12px rgba(239, 68, 68, 0.1)';
-                statusText.innerText = '❌ وضعیت اشتراک: غیرفعال / مسدود دستی';
-            } else if (isVolumeExpired || isReqExpired || isTimeExpired) {
-                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-yellow-500/10 border-yellow-500/30 text-yellow-500 shadow-md shadow-yellow-500/5';
-                if (isVolumeExpired) statusText.innerText = '⚠️ وضعیت اشتراک: تمام شدن حجم مجاز';
-                else if (isReqExpired) statusText.innerText = '📈 وضعیت اشتراک: تمام شدن ریکوئست مجاز';
-                else if (isTimeExpired) statusText.innerText = '⏳ وضعیت اشتراک: منقضی شده (پایان زمان اعتبار)';
-            } else {
-                statusCard.className = 'mb-6 rounded-md p-4 text-center border font-bold relative z-10 bg-green-600/10 border-green-600/30 text-green-600 shadow-md shadow-green-600/5';
-                statusText.innerText = '✅ وضعیت اشتراک: فعال و متصل';
-            }
-        });
-        window.addEventListener('click', (e) => {
-            if (e.target.id === 'qr-modal') toggleQrModal(false);
-        });
-    </script>
-</body>
-</html>`,
+        <script>
+// 地址从服务器配置注入
+var 订阅转换网址 = "${订阅转换接口}";
+// 远程配置URL（硬编码）
+var 远程配置网址 = "${远程配置网址}";
+
+// 翻译对象
+const 本地值20215 = {
+  zh: {
+    subscriptionCopied: '${解码64('6K6i6ZiF6ZO+5o6l5bey5aSN5Yi2')}',
+    autoSubscriptionCopied: '${解码64('6Ieq5Yqo6K+G5Yir6K6i6ZiF6ZO+5o6l5bey5aSN5Yi277yM5a6i5oi356uv6K6/6Zeu5pe25Lya5qC55o2uVXNlci1BZ2VudOiHquWKqOivhuWIq+W5tui/lOWbnuWvueW6lOagvOW8jw==')}'
+  },
+  fa: {
+    subscriptionCopied: 'لینک اشتراک کپی شد',
+    autoSubscriptionCopied: 'لینک اشتراک تشخیص خودکار کپی شد، کلاینت هنگام دسترسی بر اساس User-Agent به طور خودکار تشخیص داده و قالب مربوطه را برمی‌گرداند'
+  }
 };
+function 获取凭据20214(名称20213) {
+  const 值20212 = '; ' + document.cookie;
+  const 部分列表20211 = 值20212.split('; ' + 名称20213 + '=');
+  if (部分列表20211.length === 2) return 部分列表20211.pop().split(';').shift();
+  return null;
+}
+const 浏览器语言20210 = navigator.language || navigator.userLanguage || '';
+const 已保存语言20209 = localStorage.getItem('preferredLanguage') || 获取凭据20214('preferredLanguage');
+let 是否值20208 = false;
+if (已保存语言20209 === 'fa' || 已保存语言20209 === 'fa-IR') {
+  是否值20208 = true;
+} else if (已保存语言20209 === 'zh' || 已保存语言20209 === 'zh-CN') {
+  是否值20208 = false;
+} else {
+  是否值20208 = 浏览器语言20210.includes('fa') || 浏览器语言20210.includes('fa-IR');
+}
+const 翻译值20207 = 本地值20215[是否值20208 ? 'fa' : 'zh'];
+function 切换语言(语言) {
+  localStorage.setItem('preferredLanguage', 语言);
+  // 设置Cookie（有效期1年）
+  const 过期日期20206 = new Date();
+  过期日期20206.setFullYear(过期日期20206.getFullYear() + 1);
+  document.cookie = 'preferredLanguage=' + 语言 + '; path=/; expires=' + 过期日期20206.toUTCString() + '; SameSite=Lax';
+  // 刷新页面，不使用URL参数
+  window.location.reload();
+}
+
+// 页面加载时检查 localStorage 和 Cookie，并清理URL参数
+window.addEventListener('DOMContentLoaded', function () {
+  const 已保存语言20205 = localStorage.getItem('preferredLanguage') || 获取凭据20214('preferredLanguage');
+  const 网址参数 = new URLSearchParams(window.location.search);
+  const 网址语言 = 网址参数.get('lang');
+
+  // 如果URL中有语言参数，移除它并设置Cookie
+  if (网址语言) {
+    const 当前网址20204 = new URL(window.location.href);
+    当前网址20204.searchParams.delete('lang');
+    const 新网址 = 当前网址20204.toString();
+
+    // 设置Cookie
+    const 过期日期20203 = new Date();
+    过期日期20203.setFullYear(过期日期20203.getFullYear() + 1);
+    document.cookie = 'preferredLanguage=' + 网址语言 + '; path=/; expires=' + 过期日期20203.toUTCString() + '; SameSite=Lax';
+    localStorage.setItem('preferredLanguage', 网址语言);
+
+    // 使用history API移除URL参数，不刷新页面
+    window.history.replaceState({}, '', 新网址);
+  } else if (已保存语言20205) {
+    // 如果localStorage中有但Cookie中没有，同步到Cookie
+    const 过期日期 = new Date();
+    过期日期.setFullYear(过期日期.getFullYear() + 1);
+    document.cookie = 'preferredLanguage=' + 已保存语言20205 + '; path=/; expires=' + 过期日期.toUTCString() + '; SameSite=Lax';
+  }
+});
+
+// 赛博朋克风 toast 通知 (替代 alert)
+window.显示提示 = function (消息20202, 类型20201, 本地值20200) {
+  本地值20200 = 本地值20200 || {};
+  var 堆栈 = document.getElementById('cpToastStack');
+  if (!堆栈) return;
+  var 类型映射 = {
+    success: '✓',
+    info: '⌬',
+    warn: '⚠',
+    error: '✕'
+  };
+  var 标题映射 = {
+    success: 'SUCCESS',
+    info: 'INFO',
+    warn: 'WARN',
+    error: 'ERROR'
+  };
+  类型20201 = 类型映射[类型20201] ? 类型20201 : 'success';
+  var 持续时间 = 本地值20200.duration || 3200;
+  var 提示 = document.createElement('div');
+  提示.className = 'cp-toast cp-toast-' + 类型20201;
+  提示.style.setProperty('--cp-toast-dur', 持续时间 + 'ms');
+  var 图标 = document.createElement('span');
+  图标.className = 'cp-toast-icon';
+  图标.textContent = 类型映射[类型20201];
+  var 主体 = document.createElement('div');
+  主体.className = 'cp-toast-body';
+  var 标题 = document.createElement('div');
+  标题.className = 'cp-toast-title';
+  标题.textContent = 本地值20200.title || 标题映射[类型20201];
+  var 消息20199 = document.createElement('div');
+  消息20199.className = 'cp-toast-msg';
+  消息20199.textContent = String(消息20202 == null ? '' : 消息20202);
+  主体.appendChild(标题);
+  主体.appendChild(消息20199);
+  var 关闭 = document.createElement('button');
+  关闭.type = 'button';
+  关闭.className = 'cp-toast-close';
+  关闭.setAttribute('aria-label', 'close');
+  关闭.textContent = '✕';
+  提示.appendChild(图标);
+  提示.appendChild(主体);
+  提示.appendChild(关闭);
+  堆栈.appendChild(提示);
+  requestAnimationFrame(function () {
+    提示.classList.add('cp-show');
+  });
+  var 本地值20198 = false;
+  function 关闭提示() {
+    if (本地值20198) return;
+    本地值20198 = true;
+    提示.classList.remove('cp-show');
+    提示.classList.add('cp-hide');
+    setTimeout(function () {
+      if (提示.parentNode) 提示.parentNode.removeChild(提示);
+    }, 400);
+  }
+  关闭.addEventListener('click', 关闭提示);
+  var 计时器 = setTimeout(关闭提示, 持续时间);
+  提示.addEventListener('mouseenter', function () {
+    clearTimeout(计时器);
+  });
+  提示.addEventListener('mouseleave', function () {
+    计时器 = setTimeout(关闭提示, 1200);
+  });
+  return {
+    dismiss: 关闭提示,
+    element: 提示
+  };
+};
+function 尝试打开应用(方案网址20197, 回退回调, 超时20196) {
+  超时20196 = 超时20196 || 2500;
+  var 应用已打开 = false;
+  var 回调已执行 = false;
+  var 开始值 = Date.now();
+  var 值值20195 = function () {
+    var 耗时20194 = Date.now() - 开始值;
+    if (耗时20194 < 3000 && !回调已执行) {
+      应用已打开 = true;
+    }
+  };
+  window.addEventListener('blur', 值值20195);
+  var 值值20193 = function () {
+    var 耗时 = Date.now() - 开始值;
+    if (耗时 < 3000 && !回调已执行) {
+      应用已打开 = true;
+    }
+  };
+  document.addEventListener('visibilitychange', 值值20193);
+  var 内嵌框架 = document.createElement('iframe');
+  内嵌框架.style.display = 'none';
+  内嵌框架.style.width = '1px';
+  内嵌框架.style.height = '1px';
+  内嵌框架.src = 方案网址20197;
+  document.body.appendChild(内嵌框架);
+  setTimeout(function () {
+    内嵌框架.parentNode && 内嵌框架.parentNode.removeChild(内嵌框架);
+    window.removeEventListener('blur', 值值20195);
+    document.removeEventListener('visibilitychange', 值值20193);
+    if (!回调已执行) {
+      回调已执行 = true;
+      if (!应用已打开 && 回退回调) {
+        回退回调();
+      }
+    }
+  }, 超时20196);
+}
+function 生成客户端链接(客户端类型, 客户端名称) {
+  var 当前网址20192 = window.location.href;
+  var 订阅网址20191 = 当前网址20192 + "/sub";
+  var 方案网址 = '';
+  var 显示名称 = 客户端名称 || '';
+  var 最终网址 = 订阅网址20191;
+  if (客户端类型 === atob('djJyYXk=')) {
+    最终网址 = 订阅网址20191;
+    var 网址值20190 = document.getElementById("clientSubscriptionUrl");
+    网址值20190.textContent = 最终网址;
+    网址值20190.style.display = "block";
+    网址值20190.style.overflowWrap = "break-word";
+    网址值20190.style.wordBreak = "break-all";
+    网址值20190.style.overflowX = "auto";
+    网址值20190.style.maxWidth = "100%";
+    网址值20190.style.boxSizing = "border-box";
+    if (客户端名称 === 'V2RAY') {
+      navigator.clipboard.writeText(最终网址).then(function () {
+        显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+      });
+    } else if (客户端名称 === 'Shadowrocket') {
+      方案网址 = '${解码64('c2hhZG93cm9ja2V0Oi8vYWRkLw==')}' + encodeURIComponent(最终网址);
+      尝试打开应用(方案网址, function () {
+        navigator.clipboard.writeText(最终网址).then(function () {
+          显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+        });
+      });
+    } else if (客户端名称 === 'V2RAYNG') {
+      方案网址 = '${解码64('djJyYXluZzovL2luc3RhbGw/dXJsPQ==')}' + encodeURIComponent(最终网址);
+      尝试打开应用(方案网址, function () {
+        navigator.clipboard.writeText(最终网址).then(function () {
+          显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+        });
+      });
+    } else if (客户端名称 === 'NEKORAY') {
+      方案网址 = '${解码64('bmVrb3JheTovL2luc3RhbGwtY29uZmlnP3VybD0=')}' + encodeURIComponent(最终网址);
+      尝试打开应用(方案网址, function () {
+        navigator.clipboard.writeText(最终网址).then(function () {
+          显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+        });
+      });
+    }
+  } else {
+    // 统一走内部格式转换
+    最终网址 = 订阅网址20191 + (订阅网址20191.includes('?') ? '&' : '?') + "target=" + 客户端类型;
+    var 网址值20190 = document.getElementById("clientSubscriptionUrl");
+    网址值20190.textContent = 最终网址;
+    网址值20190.style.display = "block";
+    网址值20190.style.overflowWrap = "break-word";
+    网址值20190.style.wordBreak = "break-all";
+    网址值20190.style.overflowX = "auto";
+    网址值20190.style.maxWidth = "100%";
+    网址值20190.style.boxSizing = "border-box";
+    if (客户端类型 === atob('Y2xhc2g=')) {
+      if (客户端名称 === 'STASH') {
+        方案网址 = '${解码64('c3Rhc2g6Ly9pbnN0YWxsP3VybD0=')}' + encodeURIComponent(最终网址);
+        显示名称 = 'STASH';
+      } else {
+        方案网址 = '${解码64('Y2xhc2g6Ly9pbnN0YWxsLWNvbmZpZz91cmw9')}' + encodeURIComponent(最终网址);
+        显示名称 = 'CLASH';
+      }
+    } else if (客户端类型 === atob('c3VyZ2U=')) {
+      方案网址 = '${解码64('c3VyZ2U6Ly8vaW5zdGFsbC1jb25maWc/dXJsPQ==')}' + encodeURIComponent(最终网址);
+      显示名称 = 'SURGE';
+    } else if (客户端类型 === atob('c2luZ2JveA==')) {
+      方案网址 = '${解码64('c2luZy1ib3g6Ly9pbnN0YWxsLWNvbmZpZz91cmw9')}' + encodeURIComponent(最终网址);
+      显示名称 = 'SING-BOX';
+    } else if (客户端类型 === atob('bG9vbg==')) {
+      方案网址 = '${解码64('bG9vbjovL2luc3RhbGw/dXJsPQ==')}' + encodeURIComponent(最终网址);
+      显示名称 = 'LOON';
+    } else if (客户端类型 === atob('cXVhbng=')) {
+      方案网址 = '${解码64('cXVhbnR1bXVsdC14Oi8vaW5zdGFsbC1jb25maWc/dXJsPQ==')}' + encodeURIComponent(最终网址);
+      显示名称 = 'QUANTUMULT X';
+    }
+    if (方案网址) {
+      尝试打开应用(方案网址, function () {
+        navigator.clipboard.writeText(最终网址).then(function () {
+          显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+        });
+      });
+    } else {
+      navigator.clipboard.writeText(最终网址).then(function () {
+        显示提示(显示名称 + " " + 翻译值20207.subscriptionCopied, 'success');
+      });
+    }
+  }
+}
+
+// 页面特效图形化开关 (localStorage 持久化)
+window.应用页面特效 = function () {
+  var 本地值20189 = localStorage.getItem('cp-fx-off') === '1';
+  document.body.classList.toggle('fx-off', 本地值20189);
+  var 本地值20188 = document.getElementById('cpFxLabel');
+  if (本地值20188) 本地值20188.textContent = 本地值20189 ? 'FX: OFF' : 'FX: ON';
+  if (本地值20189) {
+    var 本地值20187 = document.getElementById('matrixCodeRain');
+    if (本地值20187) 本地值20187.innerHTML = '';
+  } else if (typeof 创建矩阵雨 === 'function') {
+    var 结果值 = document.getElementById('matrixCodeRain');
+    if (结果值 && !结果值.firstChild) 创建矩阵雨();
+  }
+};
+window.切换页面特效 = function () {
+  var 本地值20186 = localStorage.getItem('cp-fx-off') === '1';
+  localStorage.setItem('cp-fx-off', 本地值20186 ? '0' : '1');
+  window.应用页面特效();
+};
+(function () {
+  if (localStorage.getItem('cp-fx-off') === '1') {
+    document.addEventListener('DOMContentLoaded', function () {
+      document.body.classList.add('fx-off');
+      var 本地值20185 = document.getElementById('cpFxLabel');
+      if (本地值20185) 本地值20185.textContent = 'FX: OFF';
+    });
+  }
+})();
+function 创建矩阵雨() {
+  if (document.body && document.body.classList.contains('fx-off')) return;
+  const 矩阵值 = document.getElementById('matrixCodeRain');
+  if (!矩阵值) return;
+  const 赛博字符列表 = '01アイウエオカキクケコサシスセソタチツテトナニヌネノ$%#@!?<>+=ABCDEF';
+  const 调色板 = ['#c8f135', '#5b8cff', '#ffb454', '#3ddc84'];
+  const 列数 = Math.floor(window.innerWidth / 20);
+  for (let 索引值20184 = 0; 索引值20184 < 列数; 索引值20184++) {
+    const 列20183 = document.createElement('div');
+    列20183.className = 'matrix-column';
+    列20183.style.left = 索引值20184 * 20 + 'px';
+    列20183.style.animationDelay = -Math.random() * 15 + 's';
+    列20183.style.animationDuration = Math.random() * 14 + 8 + 's';
+    列20183.style.fontSize = Math.random() * 4 + 12 + 'px';
+    列20183.style.opacity = (Math.random() * 0.7 + 0.3).toFixed(2);
+    let 文本20182 = '';
+    const 字符数量 = Math.floor(Math.random() * 30 + 18);
+    for (let 次索引值 = 0; 次索引值 < 字符数量; 次索引值++) {
+      const 字符 = 赛博字符列表[Math.floor(Math.random() * 赛博字符列表.length)];
+      const 值强调 = Math.random() > 0.85;
+      const 颜色 = 值强调 ? 调色板[Math.floor(Math.random() * 调色板.length)] : '';
+      文本20182 += 颜色 ? '<span style="color:' + 颜色 + ';">' + 字符 + '</span><br>' : '<span>' + 字符 + '</span><br>';
+    }
+    列20183.innerHTML = 文本20182;
+    矩阵值.appendChild(列20183);
+  }
+  setInterval(function () {
+    const 列列表 = 矩阵值.querySelectorAll('.matrix-column');
+    列列表.forEach(function (列) {
+      if (Math.random() > 0.94) {
+        const 字符列表 = 列.querySelectorAll('span');
+        if (字符列表.length > 0) {
+          const 目标20181 = 字符列表[Math.floor(Math.random() * 字符列表.length)];
+          const 本地值20180 = 目标20181.style.color;
+          目标20181.style.color = '#ffffff';
+          目标20181.style.textShadow = '0 0 10px #ffffff, 0 0 18px #c8f135';
+          setTimeout(function () {
+            目标20181.style.color = 本地值20180;
+            目标20181.style.textShadow = '';
+          }, 200);
+        }
+      }
+    });
+  }, 110);
+}
+async function 检查系统状态() {
+  try {
+    const 云墙状态 = document.getElementById('cfStatus');
+    const 地区状态 = document.getElementById('regionStatus');
+    const 值值20179 = document.getElementById('geoInfo');
+    const 备用状态 = document.getElementById('backupStatus');
+    const 当前地址 = document.getElementById('currentIP');
+    const 地区值 = document.getElementById('regionMatch');
+
+    // 获取当前语言设置（优先从Cookie/localStorage读取）
+    function 获取凭据20178(名称20177) {
+      const 值20176 = '; ' + document.cookie;
+      const 部分列表20175 = 值20176.split('; ' + 名称20177 + '=');
+      if (部分列表20175.length === 2) return 部分列表20175.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言20174 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言20173 = localStorage.getItem('preferredLanguage') || 获取凭据20178('preferredLanguage');
+    let 是否值20172 = false;
+    if (已保存语言20173 === 'fa' || 已保存语言20173 === 'fa-IR') {
+      是否值20172 = true;
+    } else if (已保存语言20173 === 'zh' || 已保存语言20173 === 'zh-CN') {
+      是否值20172 = false;
+    } else {
+      是否值20172 = 浏览器语言20174.includes('fa') || 浏览器语言20174.includes('fa-IR');
+    }
+    const 本地值20171 = {
+      zh: {
+        workerRegion: 'Worker地区: ',
+        detectionMethod: '检测方式: ',
+        proxyIPStatus: '${解码64('UHJveHlJUOeKtuaAgTog')}',
+        currentIP: '当前使用IP: ',
+        regionMatch: '地区匹配: ',
+        regionNames: {
+          'HK': '🇭🇰 香港',
+          'US': '🇺🇸 美国',
+          'SG': '🇸🇬 新加坡',
+          'JP': '🇯🇵 日本',
+          'KR': '🇰🇷 韩国',
+          'DE': '🇩🇪 德国',
+          'SE': '🇸🇪 瑞典',
+          'NL': '🇳🇱 荷兰',
+          'FI': '🇫🇮 芬兰',
+          'GB': '🇬🇧 英国'
+        },
+        customIPMode: '${解码64('6Ieq5a6a5LmJUHJveHlJUOaooeW8jyAocOWPmOmHj+WQr+eUqCk=')}',
+        customIPModeDesc: '自定义IP模式 (已禁用地区匹配)',
+        usingCustomProxyIP: '${解码64('5L2/55So6Ieq5a6a5LmJUHJveHlJUDog')}',
+        customIPConfig: ' (p变量配置)',
+        customIPModeDisabled: '自定义IP模式，地区选择已禁用',
+        manualRegion: '手动指定地区',
+        manualRegionDesc: ' (手动指定)',
+        proxyIPAvailable: '${解码64('MTAvMTAg5Y+v55SoIChQcm94eUlQ5Z+f5ZCN6aKE6K6+5Y+v55SoKQ==')}',
+        smartSelection: '智能就近选择中',
+        sameRegionIP: '同地区IP可用 (1个)',
+        cloudflareDetection: 'Cloudflare内置检测',
+        detectionFailed: '检测失败',
+        unknown: '未知'
+      },
+      fa: {
+        workerRegion: 'منطقه Worker: ',
+        detectionMethod: 'روش تشخیص: ',
+        proxyIPStatus: '${解码64('2YjYtti524zYqiBQcm94eUlQOiA=')}',
+        currentIP: 'IP فعلی: ',
+        regionMatch: 'تطبیق منطقه: ',
+        regionNames: {
+          'HK': '🇭🇰 هنگ کنگ',
+          'US': '🇺🇸 آمریکا',
+          'SG': '🇸🇬 سنگاپور',
+          'JP': '🇯🇵 ژاپن',
+          'KR': '🇰🇷 کره جنوبی',
+          'DE': '🇩🇪 آلمان',
+          'SE': '🇸🇪 سوئد',
+          'NL': '🇳🇱 هلند',
+          'FI': '🇫🇮 فنلاند',
+          'GB': '🇬🇧 بریتانیا'
+        },
+        customIPMode: '${解码64('2K3Yp9mE2KogUHJveHlJUCDYs9mB2KfYsdi024wgKNmF2KrYutuM2LEgcCDZgdi52KfZhCDYp9iz2Kop')}',
+        customIPModeDesc: 'حالت IP سفارشی (تطبیق منطقه غیرفعال است)',
+        usingCustomProxyIP: '${解码64('2KfYs9iq2YHYp9iv2Ycg2KfYsiBQcm94eUlQINiz2YHYp9ix2LTbjDog')}',
+        customIPConfig: ' (پیکربندی متغیر p)',
+        customIPModeDisabled: 'حالت IP سفارشی، انتخاب منطقه غیرفعال است',
+        manualRegion: 'تعیین منطقه دستی',
+        manualRegionDesc: ' (تعیین دستی)',
+        proxyIPAvailable: '${解码64('MTAvMTAg2K/YsSDYr9iz2KrYsdizICjYr9in2YXZhtmHINm+24zYtOKAjNmB2LHYtiBQcm94eUlQINiv2LEg2K/Ys9iq2LHYsyDYp9iz2Kop')}',
+        smartSelection: 'انتخاب هوشمند نزدیک در حال انجام است',
+        sameRegionIP: 'IP هم‌منطقه در دسترس است (1)',
+        cloudflareDetection: 'تشخیص داخلی Cloudflare',
+        detectionFailed: 'تشخیص ناموفق',
+        unknown: 'ناشناخته'
+      }
+    };
+    const 翻译值20170 = 本地值20171[是否值20172 ? 'fa' : 'zh'];
+    let 值地区20169 = 'US'; // 默认值
+    let 是否自定义地址值 = false;
+    let 是否手动地区值 = false;
+    try {
+      const 响应20168 = await fetch(window.location.pathname + '/region');
+      const 数据20167 = await 响应20168.json();
+      if (数据20167.region === 'CUSTOM') {
+        是否自定义地址值 = true;
+        值地区20169 = 'CUSTOM';
+
+        // 获取自定义IP的详细信息
+        const 自定义地址值 = 数据20167.ci || 翻译值20170.unknown;
+        值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #ffb454;">⚙️ ' + 翻译值20170.customIPMode + '</span>';
+        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #ffb454;">🔧 ' + 翻译值20170.customIPModeDesc + '</span>';
+
+        // 显示自定义IP配置状态，包含具体IP
+        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #ffb454;">🔧 ' + 翻译值20170.usingCustomProxyIP + 自定义地址值 + '</span>';
+        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #ffb454;">✅ ' + 自定义地址值 + 翻译值20170.customIPConfig + '</span>';
+        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #ffb454;">⚠️ ' + 翻译值20170.customIPModeDisabled + '</span>';
+        return; // 提前返回，不执行后续的地区匹配逻辑
+      } else if (数据20167.detectionMethod === '手动指定地区' || 数据20167.detectionMethod === 'تعیین منطقه دستی') {
+        是否手动地区值 = true;
+        值地区20169 = 数据20167.region;
+        值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #3ddc84;">' + 翻译值20170.manualRegion + '</span>';
+        地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #3ddc84;">🎯 ' + 翻译值20170.regionNames[值地区20169] + 翻译值20170.manualRegionDesc + '</span>';
+
+        // 显示配置状态而不是检测状态
+        if (备用状态) 备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.proxyIPAvailable + '</span>';
+        if (当前地址) 当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.smartSelection + '</span>';
+        if (地区值) 地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.sameRegionIP + '</span>';
+        return; // 提前返回，不执行后续的地区匹配逻辑
+      } else if (数据20167.region && 翻译值20170.regionNames[数据20167.region]) {
+        值地区20169 = 数据20167.region;
+      }
+      值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #3ddc84;">' + 翻译值20170.cloudflareDetection + '</span>';
+    } catch (事件值20166) {
+      值值20179.innerHTML = 翻译值20170.detectionMethod + '<span style="color: #ff5d73;">' + 翻译值20170.detectionFailed + '</span>';
+    }
+    地区状态.innerHTML = 翻译值20170.workerRegion + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.regionNames[值地区20169] + '</span>';
+
+    // 直接显示配置状态，不再进行检测
+    if (备用状态) {
+      备用状态.innerHTML = 翻译值20170.proxyIPStatus + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.proxyIPAvailable + '</span>';
+    }
+    if (当前地址) {
+      当前地址.innerHTML = 翻译值20170.currentIP + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.smartSelection + '</span>';
+    }
+    if (地区值) {
+      地区值.innerHTML = 翻译值20170.regionMatch + '<span style="color: #3ddc84;">✅ ' + 翻译值20170.sameRegionIP + '</span>';
+    }
+  } catch (错误20165) {
+    function 获取凭据20164(名称20163) {
+      const 值20162 = '; ' + document.cookie;
+      const 部分列表20161 = 值20162.split('; ' + 名称20163 + '=');
+      if (部分列表20161.length === 2) return 部分列表20161.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言20160 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言20159 = localStorage.getItem('preferredLanguage') || 获取凭据20164('preferredLanguage');
+    let 是否值20158 = false;
+    if (已保存语言20159 === 'fa' || 已保存语言20159 === 'fa-IR') {
+      是否值20158 = true;
+    } else {
+      是否值20158 = 浏览器语言20160.includes('fa') || 浏览器语言20160.includes('fa-IR');
+    }
+    const 本地值20157 = {
+      zh: {
+        workerRegion: 'Worker地区: ',
+        detectionMethod: '检测方式: ',
+        proxyIPStatus: '${解码64('UHJveHlJUOeKtuaAgTog')}',
+        currentIP: '当前使用IP: ',
+        regionMatch: '地区匹配: ',
+        detectionFailed: '检测失败'
+      },
+      fa: {
+        workerRegion: 'منطقه Worker: ',
+        detectionMethod: 'روش تشخیص: ',
+        proxyIPStatus: '${解码64('2YjYtti524zYqiBQcm94eUlQOiA=')}',
+        currentIP: 'IP فعلی: ',
+        regionMatch: 'تطبیق منطقه: ',
+        detectionFailed: 'تشخیص ناموفق'
+      }
+    };
+    const 翻译值20156 = 本地值20157[是否值20158 ? 'fa' : 'zh'];
+    document.getElementById('regionStatus').innerHTML = 翻译值20156.workerRegion + '<span style="color: #ff5d73;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('geoInfo').innerHTML = 翻译值20156.detectionMethod + '<span style="color: #ff5d73;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('backupStatus').innerHTML = 翻译值20156.proxyIPStatus + '<span style="color: #ff5d73;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('currentIP').innerHTML = 翻译值20156.currentIP + '<span style="color: #ff5d73;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+    document.getElementById('regionMatch').innerHTML = 翻译值20156.regionMatch + '<span style="color: #ff5d73;">❌ ' + 翻译值20156.detectionFailed + '</span>';
+  }
+}
+async function 测试接口() {
+  try {
+    function 获取凭据20155(名称20154) {
+      const 值20153 = '; ' + document.cookie;
+      const 部分列表20152 = 值20153.split('; ' + 名称20154 + '=');
+      if (部分列表20152.length === 2) return 部分列表20152.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言20151 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言20150 = localStorage.getItem('preferredLanguage') || 获取凭据20155('preferredLanguage');
+    let 是否值20149 = false;
+    if (已保存语言20150 === 'fa' || 已保存语言20150 === 'fa-IR') {
+      是否值20149 = true;
+    } else {
+      是否值20149 = 浏览器语言20151.includes('fa') || 浏览器语言20151.includes('fa-IR');
+    }
+    const 本地值20148 = {
+      zh: {
+        apiTestResult: 'API检测结果: ',
+        apiTestTime: '检测时间: ',
+        apiTestFailed: 'API检测失败: ',
+        unknownError: '未知错误',
+        apiTestError: 'API测试失败: '
+      },
+      fa: {
+        apiTestResult: 'نتیجه تشخیص API: ',
+        apiTestTime: 'زمان تشخیص: ',
+        apiTestFailed: 'تشخیص API ناموفق: ',
+        unknownError: 'خطای ناشناخته',
+        apiTestError: 'تست API ناموفق: '
+      }
+    };
+    const 翻译值20147 = 本地值20148[是否值20149 ? 'fa' : 'zh'];
+    const 响应20146 = await fetch(window.location.pathname + '/test-api');
+    const 数据20145 = await 响应20146.json();
+    if (数据20145.detectedRegion) {
+      显示提示(翻译值20147.apiTestResult + 数据20145.detectedRegion + '\\n' + 翻译值20147.apiTestTime + 数据20145.timestamp, 'info', {
+        duration: 5000
+      });
+    } else {
+      显示提示(翻译值20147.apiTestFailed + (数据20145.error || 翻译值20147.unknownError), 'error', {
+        duration: 4500
+      });
+    }
+  } catch (错误20144) {
+    function 获取凭据20143(名称20142) {
+      const 值20141 = '; ' + document.cookie;
+      const 部分列表20140 = 值20141.split('; ' + 名称20142 + '=');
+      if (部分列表20140.length === 2) return 部分列表20140.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言20139 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言20138 = localStorage.getItem('preferredLanguage') || 获取凭据20143('preferredLanguage');
+    let 是否值20137 = false;
+    if (已保存语言20138 === 'fa' || 已保存语言20138 === 'fa-IR') {
+      是否值20137 = true;
+    } else {
+      是否值20137 = 浏览器语言20139.includes('fa') || 浏览器语言20139.includes('fa-IR');
+    }
+    const 本地值20136 = {
+      zh: {
+        apiTestError: 'API测试失败: '
+      },
+      fa: {
+        apiTestError: 'تست API ناموفق: '
+      }
+    };
+    const 翻译值20135 = 本地值20136[是否值20137 ? 'fa' : 'zh'];
+    显示提示(翻译值20135.apiTestError + 错误20144.message, 'error', {
+      duration: 4500
+    });
+  }
+}
+
+// 配置管理相关函数
+async function 检查键值状态() {
+  const 接口网址20134 = window.location.pathname + '/api/config';
+  try {
+    const 响应20133 = await fetch(接口网址20134);
+    function 获取凭据20132(名称20131) {
+      const 值20130 = '; ' + document.cookie;
+      const 部分列表20129 = 值20130.split('; ' + 名称20131 + '=');
+      if (部分列表20129.length === 2) return 部分列表20129.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言20128 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言20127 = localStorage.getItem('preferredLanguage') || 获取凭据20132('preferredLanguage');
+    let 是否值20126 = false;
+    if (已保存语言20127 === 'fa' || 已保存语言20127 === 'fa-IR') {
+      是否值20126 = true;
+    } else {
+      是否值20126 = 浏览器语言20128.includes('fa') || 浏览器语言20128.includes('fa-IR');
+    }
+    const 本地值20125 = {
+      zh: {
+        kvDisabled: '⚠️ KV存储未启用或未配置',
+        kvNotConfigured: 'KV存储未配置，无法使用配置管理功能。\\n\\n请在Cloudflare Workers中:\\n1. 创建KV命名空间\\n2. 绑定环境变量 C\\n3. 重新部署代码',
+        kvNotEnabled: 'KV存储未配置',
+        kvEnabled: '✅ KV存储已启用，可以使用配置管理功能',
+        kvCheckFailed: '⚠️ KV存储检测失败',
+        kvCheckFailedFormat: 'KV存储检测失败: 响应格式错误',
+        kvCheckFailedStatus: 'KV存储检测失败 - 状态码: ',
+        kvCheckFailedError: 'KV存储检测失败 - 错误: '
+      },
+      fa: {
+        kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
+        kvNotConfigured: 'ذخیره‌سازی KV پیکربندی نشده است، نمی‌توانید از عملکرد مدیریت تنظیمات استفاده کنید.\\n\\nلطفا در Cloudflare Workers:\\n1. فضای نام KV ایجاد کنید\\n2. متغیر محیطی C را پیوند دهید\\n3. کد را دوباره مستقر کنید',
+        kvNotEnabled: 'ذخیره‌سازی KV پیکربندی نشده است',
+        kvEnabled: '✅ ذخیره‌سازی KV فعال است، می‌توانید از مدیریت تنظیمات استفاده کنید',
+        kvCheckFailed: '⚠️ بررسی ذخیره‌سازی KV ناموفق',
+        kvCheckFailedFormat: 'بررسی ذخیره‌سازی KV ناموفق: خطای فرمت پاسخ',
+        kvCheckFailedStatus: 'بررسی ذخیره‌سازی KV ناموفق - کد وضعیت: ',
+        kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+      }
+    };
+    const 翻译值20124 = 本地值20125[是否值20126 ? 'fa' : 'zh'];
+    if (响应20133.status === 503) {
+      // KV未配置
+      document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb454;">' + 翻译值20124.kvDisabled + '</span>';
+      document.getElementById('configCard').style.display = 'block';
+      document.getElementById('currentConfig').textContent = 翻译值20124.kvNotConfigured;
+    } else if (响应20133.ok) {
+      try {
+        const 数据20123 = await 响应20133.json();
+
+        // 检查响应是否包含KV配置信息
+        if (数据20123 && 数据20123.kvEnabled === true) {
+          document.getElementById('kvStatus').innerHTML = '<span style="color: #3ddc84;">' + 翻译值20124.kvEnabled + '</span>';
+          document.getElementById('configContent').style.display = 'block';
+          document.getElementById('configCard').style.display = 'block';
+          await 加载当前配置();
+        } else {
+          document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb454;">' + 翻译值20124.kvDisabled + '</span>';
+          document.getElementById('configCard').style.display = 'block';
+          document.getElementById('currentConfig').textContent = 翻译值20124.kvNotEnabled;
+        }
+      } catch (数据对象错误) {
+        document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb454;">' + 翻译值20124.kvCheckFailed + '</span>';
+        document.getElementById('configCard').style.display = 'block';
+        document.getElementById('currentConfig').textContent = 翻译值20124.kvCheckFailedFormat;
+      }
+    } else {
+      document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb454;">' + 翻译值20124.kvDisabled + '</span>';
+      document.getElementById('configCard').style.display = 'block';
+      document.getElementById('currentConfig').textContent = 翻译值20124.kvCheckFailedStatus + 响应20133.status;
+    }
+  } catch (错误20122) {
+    function 获取凭据(名称) {
+      const 值20121 = '; ' + document.cookie;
+      const 部分列表20120 = 值20121.split('; ' + 名称 + '=');
+      if (部分列表20120.length === 2) return 部分列表20120.pop().split(';').shift();
+      return null;
+    }
+    const 浏览器语言 = navigator.language || navigator.userLanguage || '';
+    const 已保存语言 = localStorage.getItem('preferredLanguage') || 获取凭据('preferredLanguage');
+    let 是否值 = false;
+    if (已保存语言 === 'fa' || 已保存语言 === 'fa-IR') {
+      是否值 = true;
+    } else {
+      是否值 = 浏览器语言.includes('fa') || 浏览器语言.includes('fa-IR');
+    }
+    const 本地值20119 = {
+      zh: {
+        kvDisabled: '⚠️ KV存储未启用或未配置',
+        kvCheckFailedError: 'KV存储检测失败 - 错误: '
+      },
+      fa: {
+        kvDisabled: '⚠️ ذخیره‌سازی KV فعال نیست یا پیکربندی نشده است',
+        kvCheckFailedError: 'بررسی ذخیره‌سازی KV ناموفق - خطا: '
+      }
+    };
+    const 翻译值20118 = 本地值20119[是否值 ? 'fa' : 'zh'];
+    document.getElementById('kvStatus').innerHTML = '<span style="color: #ffb454;">' + 翻译值20118.kvDisabled + '</span>';
+    document.getElementById('configCard').style.display = 'block';
+    document.getElementById('currentConfig').textContent = 翻译值20118.kvCheckFailedError + 错误20122.message;
+  }
+}
+function 读取字段值(标识) {
+  const 元素 = document.getElementById(标识);
+  return 元素 ? 元素.value : '';
+}
+
+function 写入字段值(标识, 值 = '') {
+  const 元素 = document.getElementById(标识);
+  if (元素) 元素.value = 值 || '';
+}
+
+function 是否开关启用(值, 默认启用 = false) {
+  if (值 === undefined || 值 === null || 值 === '') return 默认启用;
+  if (值 === true || 值 === false) return 值;
+  const 文本 = String(值).trim().toLowerCase();
+  if (文本 === 'yes' || 文本 === 'true' || 文本 === '1' || 文本 === 'on') return true;
+  if (文本 === 'no' || 文本 === 'false' || 文本 === '0' || 文本 === 'off') return false;
+  return 默认启用;
+}
+
+function 写入开关值(标识, 值, 默认启用 = false) {
+  const 元素 = document.getElementById(标识);
+  if (元素) 元素.checked = 是否开关启用(值, 默认启用);
+}
+
+function 读取开关值(标识, 默认启用 = false) {
+  const 元素 = document.getElementById(标识);
+  if (!元素) return 默认启用 ? 'yes' : 'no';
+  return 元素.checked ? 'yes' : 'no';
+}
+
+function 同步协议界面状态() {
+  const 明文开关 = document.getElementById('ev');
+  const 木马开关 = document.getElementById('et');
+  const 扩展开关 = document.getElementById('ex');
+  if (明文开关 && 木马开关 && 扩展开关 && !明文开关.checked && !木马开关.checked && !扩展开关.checked) {
+    明文开关.checked = true;
+  }
+}
+
+function 同步联动界面状态() {
+  同步协议界面状态();
+  const 加密客户端问候复选框 = document.getElementById('ech');
+  const 端口控制 = document.getElementById('portControl');
+  if (加密客户端问候复选框 && 端口控制 && 加密客户端问候复选框.checked) {
+    端口控制.value = 'yes';
+  }
+  更新路径类型状态(读取字段值('customPath'));
+  更新工作器地区状态();
+}
+
+function 应用配置到界面(配置) {
+  写入字段值('wkRegion', 配置.wk);
+  写入开关值('ev', 配置.ev, true);
+  写入开关值('et', 配置.et, false);
+  写入开关值('ex', 配置.ex, false);
+  写入开关值('ech', 配置.ech, false);
+  写入字段值('tp', 配置.tp);
+  写入字段值('customDNS', 配置.customDNS);
+  写入字段值('customECHDomain', 配置.customECHDomain);
+  写入字段值('alpn', 配置.alpn);
+  写入字段值('scu', 配置.scu);
+  写入开关值('ena', 配置.ena, false);
+  写入开关值('epd', 配置.epd, true);
+  写入开关值('epi', 配置.epi, true);
+  写入开关值('egi', 配置.egi, true);
+  写入开关值('ipv4Enabled', 配置.ipv4, true);
+  写入开关值('ipv6Enabled', 配置.ipv6, true);
+  写入开关值('ispMobile', 配置.ispMobile, true);
+  写入开关值('ispUnicom', 配置.ispUnicom, true);
+  写入开关值('ispTelecom', 配置.ispTelecom, true);
+  写入字段值('customPath', 配置.d);
+  写入字段值('customIP', 配置.p);
+  写入字段值('yx', 配置.yx);
+  写入字段值('yxURL', 配置.yxURL);
+  写入字段值('socksConfig', 配置.s);
+  写入字段值('customHomepage', 配置.homepage);
+  写入字段值('apiEnabled', 配置.ae);
+  写入字段值('regionMatching', 配置.rm);
+  写入字段值('downgradeControl', 配置.qj);
+  写入字段值('portControl', 配置.dkby);
+  写入字段值('preferredControl', 配置.yxby);
+  写入字段值('updVerUrl', 配置.updVerUrl);
+  写入字段值('updSrcUrl', 配置.updSrcUrl);
+  写入字段值('cfToken', 配置.cfToken);
+  写入字段值('cfAccountId', 配置.cfAccountId);
+  写入字段值('cfScriptName', 配置.cfScriptName);
+  同步联动界面状态();
+}
+
+function 收集界面配置() {
+  const 配置 = {
+    wk: 读取字段值('wkRegion'),
+    ev: 读取开关值('ev', true),
+    et: 读取开关值('et', false),
+    ex: 读取开关值('ex', false),
+    ech: 读取开关值('ech', false),
+    tp: 读取字段值('tp'),
+    customDNS: 读取字段值('customDNS'),
+    customECHDomain: 读取字段值('customECHDomain'),
+    alpn: 读取字段值('alpn'),
+    d: 读取字段值('customPath'),
+    p: 读取字段值('customIP'),
+    yx: 读取字段值('yx'),
+    yxURL: 读取字段值('yxURL'),
+    s: 读取字段值('socksConfig'),
+    homepage: 读取字段值('customHomepage'),
+    scu: 读取字段值('scu'),
+    ena: 读取开关值('ena', false),
+    epd: 读取开关值('epd', true),
+    epi: 读取开关值('epi', true),
+    egi: 读取开关值('egi', true),
+    ae: 读取字段值('apiEnabled'),
+    rm: 读取字段值('regionMatching'),
+    qj: 读取字段值('downgradeControl'),
+    dkby: 读取字段值('portControl'),
+    yxby: 读取字段值('preferredControl'),
+    ipv4: 读取开关值('ipv4Enabled', true),
+    ipv6: 读取开关值('ipv6Enabled', true),
+    ispMobile: 读取开关值('ispMobile', true),
+    ispUnicom: 读取开关值('ispUnicom', true),
+    ispTelecom: 读取开关值('ispTelecom', true),
+    updVerUrl: 读取字段值('updVerUrl'),
+    updSrcUrl: 读取字段值('updSrcUrl'),
+    cfToken: 读取字段值('cfToken'),
+    cfAccountId: 读取字段值('cfAccountId'),
+    cfScriptName: 读取字段值('cfScriptName')
+  };
+  if (配置.ev === 'no' && 配置.et === 'no' && 配置.ex === 'no') {
+    配置.ev = 'yes';
+    写入开关值('ev', 'yes', true);
+  }
+  if (配置.ech === 'yes') {
+    配置.dkby = 'yes';
+    写入字段值('portControl', 'yes');
+  }
+  return 配置;
+}
+
+async function 加载当前配置() {
+  const 接口网址20117 = window.location.pathname + '/api/config';
+  try {
+    const 响应20116 = await fetch(接口网址20117);
+    if (响应20116.status === 503) {
+      document.getElementById('currentConfig').textContent = 'KV存储未配置，无法加载配置';
+      return;
+    }
+    if (!响应20116.ok) {
+      const 错误文本20115 = await 响应20116.text();
+      document.getElementById('currentConfig').textContent = '加载配置失败: ' + 错误文本20115;
+      return;
+    }
+    const 配置 = await 响应20116.json();
+
+    // 过滤掉内部字段 kvEnabled
+    const 显示配置 = {};
+    for (const [键20114, 值20113] of Object.entries(配置)) {
+      if (键20114 !== 'kvEnabled') {
+        显示配置[键20114] = 值20113;
+      }
+    }
+    let 配置文本 = '当前配置:\\n';
+    if (Object.keys(显示配置).length === 0) {
+      配置文本 += '(暂无配置)';
+    } else {
+      for (const [键, 值20112] of Object.entries(显示配置)) {
+        配置文本 += 键 + ': ' + (值20112 || '(未设置)') + '\\n';
+      }
+    }
+    document.getElementById('currentConfig').textContent = 配置文本;
+
+    应用配置到界面(配置);
+  } catch (错误20111) {
+    document.getElementById('currentConfig').textContent = '加载配置失败: ' + 错误20111.message;
+  }
+}
+
+// 更新路径类型显示
+function 更新路径类型状态(自定义路径) {
+  const 路径类型状态 = document.getElementById('pathTypeStatus');
+  const 当前网址20110 = window.location.href;
+  const 路径部分列表 = window.location.pathname.split('/').filter(参数值20109 => 参数值20109);
+  const 当前路径 = 路径部分列表.length > 0 ? 路径部分列表[0] : '';
+  if (自定义路径 && 自定义路径.trim()) {
+    // 使用自定义路径 (d)
+    路径类型状态.innerHTML = '<div style="color: #3ddc84;">使用类型: <strong>自定义路径 (d)</strong></div>' + '<div style="margin-top: 5px; color: #c8f135;">当前路径: <span style="color: #ffb454;">' + 自定义路径 + '</span></div>' + '<div style="margin-top: 5px; font-size: 0.9rem; color: #9aa6b8;">访问地址: ' + (当前网址20110.split('/')[0] + '//' + 当前网址20110.split('/')[2]) + 自定义路径 + '/sub</div>';
+  } else {
+    // 使用 UUID (u)
+    路径类型状态.innerHTML = '<div style="color: #3ddc84;">使用类型: <strong>UUID 路径 (u)</strong></div>' + '<div style="margin-top: 5px; color: #c8f135;">当前路径: <span style="color: #ffb454;">' + (当前路径 || '(UUID)') + '</span></div>' + '<div style="margin-top: 5px; font-size: 0.9rem; color: #9aa6b8;">访问地址: ' + 当前网址20110.split('/sub')[0] + '/sub</div>';
+  }
+}
+
+// 更新wk地区选择的启用/禁用状态
+function 更新工作器地区状态() {
+  const 自定义地址输入20108 = document.getElementById('customIP');
+  const 值地区 = document.getElementById('wkRegion');
+  const 值地区值 = document.getElementById('wkRegionHint');
+  if (自定义地址输入20108 && 值地区) {
+    const 是否有自定义地址 = 自定义地址输入20108.value.trim() !== '';
+    值地区.disabled = 是否有自定义地址;
+
+    // 添加视觉反馈
+    if (是否有自定义地址) {
+      值地区.style.opacity = '0.5';
+      值地区.style.cursor = 'not-allowed';
+      值地区.style.backgroundColor = 'rgba(0, 0, 0, 0.5)';
+      // 显示提示信息
+      if (值地区值) {
+        值地区值.style.display = 'block';
+        值地区值.style.color = '#ffb454';
+      }
+    } else {
+      值地区.style.opacity = '1';
+      值地区.style.cursor = 'pointer';
+      值地区.style.backgroundColor = 'rgba(0, 0, 0, 0.8)';
+      // 隐藏提示信息
+      if (值地区值) {
+        值地区值.style.display = 'none';
+      }
+    }
+  }
+}
+async function 保存配置(配置数据20107) {
+  const 接口网址 = window.location.pathname + '/api/config';
+  try {
+    const 响应20106 = await fetch(接口网址, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(配置数据20107)
+    });
+    if (响应20106.status === 503) {
+      显示状态('KV存储未配置，无法保存配置。请先在Cloudflare Workers中配置KV存储。', 'error');
+      return;
+    }
+    if (!响应20106.ok) {
+      const 错误文本20105 = await 响应20106.text();
+
+      // 尝试解析 JSON 错误信息
+      try {
+        const 错误数据20104 = JSON.parse(错误文本20105);
+        显示状态(错误数据20104.message || '保存失败', 'error');
+      } catch (解析错误20103) {
+        // 如果不是 JSON，直接显示文本
+        显示状态('保存失败: ' + 错误文本20105, 'error');
+      }
+      return;
+    }
+    const 结果20102 = await 响应20106.json();
+    显示状态(结果20102.message, 结果20102.success ? 'success' : 'error');
+    if (结果20102.success) {
+      await 加载当前配置();
+      // 更新wk地区选择状态
+      更新工作器地区状态();
+      // 保存成功后刷新页面以更新系统状态
+      setTimeout(function () {
+        window.location.reload();
+      }, 1500);
+    } else {}
+  } catch (错误20101) {
+    显示状态('保存失败: ' + 错误20101.message, 'error');
+  }
+}
+function 显示状态(消息20100, 类型20099) {
+  const 状态值 = document.getElementById('statusMessage');
+  if (状态值) {
+    状态值.textContent = 消息20100;
+    状态值.style.display = 'block';
+    状态值.style.color = 类型20099 === 'success' ? '#c8f135' : '#ff5d73';
+    状态值.style.borderColor = 类型20099 === 'success' ? '#c8f135' : '#ff5d73';
+    setTimeout(function () {
+      状态值.style.display = 'none';
+    }, 3000);
+  }
+  // 同步在底部操作条上方弹出霓虹反馈
+  if (typeof window.显示操作状态 === 'function') {
+    window.显示操作状态(消息20100, 类型20099 === 'success' ? 'ok' : 'err');
+  }
+}
+async function 重置全部配置() {
+  if (confirm('确定要重置所有配置吗？这将清空所有KV配置，恢复为环境变量设置。')) {
+    try {
+      const 响应20098 = await fetch(window.location.pathname + '/api/config', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          wk: '',
+          d: '',
+          p: '',
+          yx: '',
+          yxURL: '',
+          s: '',
+          ae: '',
+          rm: '',
+          qj: '',
+          dkby: '',
+          yxby: '',
+          ev: '',
+          et: '',
+          ex: '',
+          ech: '',
+          tp: '',
+          customDNS: '',
+          customECHDomain: '',
+          scu: '',
+          epd: '',
+          epi: '',
+          egi: '',
+          ipv4: '',
+          ipv6: '',
+          ispMobile: '',
+          ispUnicom: '',
+          ispTelecom: '',
+          homepage: '',
+          alpn: ''
+        })
+      });
+      if (响应20098.status === 503) {
+        显示状态('KV存储未配置，无法重置配置。', 'error');
+        return;
+      }
+      if (!响应20098.ok) {
+        const 错误文本 = await 响应20098.text();
+
+        // 尝试解析 JSON 错误信息
+        try {
+          const 错误数据 = JSON.parse(错误文本);
+          显示状态(错误数据.message || '重置失败', 'error');
+        } catch (解析错误) {
+          // 如果不是 JSON，直接显示文本
+          显示状态('重置失败: ' + 错误文本, 'error');
+        }
+        return;
+      }
+      const 结果20097 = await 响应20098.json();
+      显示状态(结果20097.message || '配置已重置', 结果20097.success ? 'success' : 'error');
+      if (结果20097.success) {
+        await 加载当前配置();
+        // 更新wk地区选择状态
+        更新工作器地区状态();
+        // 刷新页面以更新系统状态
+        setTimeout(function () {
+          window.location.reload();
+        }, 1500);
+      }
+    } catch (错误20096) {
+      显示状态('重置失败: ' + 错误20096.message, 'error');
+    }
+  }
+}
+
+/* ---- self-update: save settings / check for update / pull & apply update ---- */
+function 显示更新状态(消息, 类型) {
+  const 元素 = document.getElementById('updStatus');
+  if (!元素) return;
+  元素.style.display = 'block';
+  元素.textContent = 消息;
+  元素.style.color = 类型 === 'error' ? '#ff5d73' : (类型 === 'ok' ? '#3ddc84' : '#c8f135');
+  元素.style.borderColor = 元素.style.color;
+}
+
+async function 保存更新设置() {
+  try {
+    const 响应 = await fetch(window.location.pathname + '/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        updVerUrl: document.getElementById('updVerUrl').value.trim(),
+        updSrcUrl: document.getElementById('updSrcUrl').value.trim(),
+        cfToken: document.getElementById('cfToken').value.trim(),
+        cfAccountId: document.getElementById('cfAccountId').value.trim(),
+        cfScriptName: document.getElementById('cfScriptName').value.trim()
+      })
+    });
+    const 结果 = await 响应.json().catch(() => ({}));
+    显示更新状态(结果.message || (响应.ok ? 'تنظیمات ذخیره شد' : 'ذخیره ناموفق بود'), 响应.ok ? 'ok' : 'error');
+  } catch (خطا) {
+    显示更新状态('ذخیره ناموفق: ' + خطا.message, 'error');
+  }
+}
+
+async function بررسی_به_روزرسانی() {
+  显示更新状态('در حال بررسی نسخه جدید…', 'info');
+  try {
+    const 响应 = await fetch(window.location.pathname + '/api/update');
+    const نتیجه = await 响应.json();
+    const برچسب = document.getElementById('updLatestLabel');
+    const دکمهاعمال = document.getElementById('updApplyBtn');
+    if (نتیجه.error) {
+      显示更新状态(نتیجه.error, 'error');
+      return;
+    }
+    if (برچسب) برچسب.textContent = 'آخرین نسخه: ' + (نتیجه.latest || '—');
+    if (نتیجه.hasUpdate) {
+      显示更新状态('نسخه جدید موجود است: ' + نتیجه.latest, 'ok');
+      if (دکمهاعمال) دکمهاعمال.style.display = 'inline-block';
+    } else {
+      显示更新状态('پنل شما به‌روز است (نسخه ' + نتیجه.current + ')', 'info');
+      if (دکمهاعمال) دکمهاعمال.style.display = 'none';
+    }
+  } catch (خطا) {
+    显示更新状态('بررسی نسخه ناموفق: ' + خطا.message, 'error');
+  }
+}
+
+async function اعمال_به_روزرسانی() {
+  if (!confirm('آیا مطمئنی؟ کد فعلی ورکر با نسخه جدید جایگزین می‌شود.')) return;
+  显示更新状态('در حال دریافت و اعمال به‌روزرسانی… چند ثانیه صبر کن', 'info');
+  try {
+    const 响应 = await fetch(window.location.pathname + '/api/update', { method: 'POST' });
+    const 结果 = await 响应.json();
+    显示更新状态(结果.message, 结果.success ? 'ok' : 'error');
+    if (结果.success) {
+      setTimeout(function () { window.location.reload(); }, 2000);
+    }
+  } catch (خطا) {
+    显示更新状态('به‌روزرسانی ناموفق: ' + خطا.message, 'error');
+  }
+}
+
+async function 检查加密问候状态() {
+  const 加密客户端问候状态值 = document.getElementById('echStatus');
+  if (!加密客户端问候状态值) return;
+  try {
+    const 当前网址 = window.location.href;
+    const 订阅网址 = 当前网址 + '/sub';
+    加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ffb454;">检测中...</span>';
+    const 响应20095 = await fetch(订阅网址, {
+      method: 'GET',
+      headers: {
+        'Accept': 'text/plain'
+      }
+    });
+    const 加密客户端问候状态头部 = 响应20095.headers.get('X-ECH-Status');
+    const 加密客户端问候配置长度 = 响应20095.headers.get('X-ECH-Config-Length');
+    if (加密客户端问候状态头部 === 'ENABLED') {
+      加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #3ddc84;">✅ 已启用' + (加密客户端问候配置长度 ? ' (配置长度: ' + 加密客户端问候配置长度 + ')' : '') + '</span>';
+    } else {
+      加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ffb454;">⚠️ 未启用</span>';
+    }
+  } catch (错误20094) {
+    加密客户端问候状态值.innerHTML = 'ECH状态: <span style="color: #ff5d73;">❌ 检测失败: ' + 错误20094.message + '</span>';
+  }
+}
+document.addEventListener('DOMContentLoaded', function () {
+  创建矩阵雨();
+  检查系统状态();
+  检查键值状态();
+  检查加密问候状态();
+
+  // ECH 开启时自动联动开启仅TLS
+  const 加密客户端问候复选框 = document.getElementById('ech');
+  const 端口控制 = document.getElementById('portControl');
+  if (加密客户端问候复选框 && 端口控制) {
+    加密客户端问候复选框.addEventListener('change', function () {
+      if (this.checked) {
+        // ECH 开启时，自动设置仅TLS为 yes
+        端口控制.value = 'yes';
+      }
+      同步联动界面状态();
+    });
+
+    // 页面加载时，如果 ECH 已勾选，也自动设置仅TLS
+    if (加密客户端问候复选框.checked) {
+      端口控制.value = 'yes';
+    }
+  }
+
+  // 监听customIP输入框变化，实时更新wk地区选择状态
+  const 自定义地址输入 = document.getElementById('customIP');
+  if (自定义地址输入) {
+    自定义地址输入.addEventListener('input', function () {
+      同步联动界面状态();
+    });
+  }
+
+  const 自定义路径输入 = document.getElementById('customPath');
+  if (自定义路径输入) {
+    自定义路径输入.addEventListener('input', function () {
+      同步联动界面状态();
+    });
+  }
+
+  ['ev', 'et', 'ex'].forEach(function (协议标识) {
+    const 协议开关 = document.getElementById(协议标识);
+    if (协议开关) {
+      协议开关.addEventListener('change', function () {
+        同步联动界面状态();
+      });
+    }
+  });
+
+  // 阻止表单默认提交（保存按钮已统一到底部操作条）
+  ['regionForm', 'otherConfigForm', 'advancedConfigForm'].forEach(function (本地值20093) {
+    const 表单值 = document.getElementById(本地值20093);
+    if (表单值) 表单值.addEventListener('submit', function (事件值20092) {
+      事件值20092.preventDefault();
+    });
+  });
+
+  // 在任意输入框按下回车，触发统一保存
+  document.querySelectorAll('#configContent input[type="text"], #configContent input[type="number"]').forEach(function (本地值20091) {
+    本地值20091.addEventListener('keydown', function (事件值20090) {
+      if (事件值20090.key === 'Enter') {
+        事件值20090.preventDefault();
+        保存全部配置();
+      }
+    });
+  });
+
+  // 统一保存：一次性收齐所有字段
+  function 收集全部配置() {
+    return 收集界面配置();
+  }
+  async function 保存全部配置() {
+    // 至少启用一个通道
+    const 值值20085 = document.getElementById('ev'),
+      值值20084 = document.getElementById('et'),
+      值值20083 = document.getElementById('ex');
+    if (值值20085 && 值值20084 && 值值20083 && !值值20085.checked && !值值20084.checked && !值值20083.checked) {
+      显示操作状态('${是否值236 ? 解码64('2K3Yr9in2YLZhCDbjNqpINm+2LHZiNiq2qnZhCDYsdinINmB2LnYp9mEINqp2YbbjNivIQ==') : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'err');
+      显示提示('${是否值236 ? 解码64('2K3Yr9in2YLZhCDbjNqpINm+2LHZiNiq2qnZhCDYsdinINmB2LnYp9mEINqp2YbbjNivIQ==') : 解码64('6Iez5bCR6ZyA6KaB5ZCv55So5LiA5Liq5Y2P6K6u77yB')}', 'warn');
+      return;
+    }
+    const 本地值20082 = document.getElementById('cpBtnSaveAll');
+    if (本地值20082) {
+      本地值20082.classList.add('cp-action-btn-saving');
+      本地值20082.disabled = true;
+    }
+    try {
+      await 保存配置(收集全部配置());
+    } finally {
+      if (本地值20082) {
+        本地值20082.classList.remove('cp-action-btn-saving');
+        本地值20082.disabled = false;
+      }
+    }
+  }
+  window.保存全部配置 = 保存全部配置;
+  function 显示操作状态(消息, 类型) {
+    const 本地值20081 = document.getElementById('cpActionStatus');
+    if (!本地值20081) return;
+    本地值20081.textContent = 消息;
+    本地值20081.classList.toggle('cp-err', 类型 === 'err');
+    本地值20081.classList.add('cp-show');
+    clearTimeout(显示操作状态._t);
+    显示操作状态._t = setTimeout(function () {
+      本地值20081.classList.remove('cp-show');
+    }, 2400);
+  }
+  window.显示操作状态 = 显示操作状态;
+
+  // 绑定底部统一操作条
+  const 值操作值 = document.getElementById('cpActionBar');
+  const 值值保存值 = document.getElementById('cpBtnSaveAll');
+  if (值值保存值) 值值保存值.addEventListener('click', async function () {
+    值值保存值.classList.add('cp-action-btn-saving');
+    try {
+      await 保存全部配置();
+      if (值操作值) 值操作值.classList.remove('cp-dirty');
+    } finally {
+      值值保存值.classList.remove('cp-action-btn-saving');
+    }
+  });
+  const 值值值20080 = document.getElementById('cpBtnRefresh');
+  if (值值值20080) 值值值20080.addEventListener('click', async function () {
+    值值值20080.classList.add('cp-action-btn-saving');
+    try {
+      await 加载当前配置();
+      if (值操作值) 值操作值.classList.remove('cp-dirty');
+      显示操作状态('${是否值236 ? 'تنظیمات تازه‌سازی شد' : '配置已刷新'}');
+    } finally {
+      值值值20080.classList.remove('cp-action-btn-saving');
+    }
+  });
+  const 值值重置 = document.getElementById('cpBtnReset');
+  if (值值重置) 值值重置.addEventListener('click', 重置全部配置);
+  const 值值更新保存 = document.getElementById('updSaveBtn'); if (值值更新保存) 值值更新保存.addEventListener('click', 保存更新设置);
+  const 值值更新检查 = document.getElementById('updCheckBtn'); if (值值更新检查) 值值更新检查.addEventListener('click', بررسی_به_روزرسانی);
+  const 值值更新应用 = document.getElementById('updApplyBtn'); if (值值更新应用) 值值更新应用.addEventListener('click', اعمال_به_روزرسانی);
+
+  // 修改字段时把 FAB 标记为 "未保存"
+  function 标记已修改() {
+    if (值操作值) 值操作值.classList.add('cp-dirty');
+  }
+  const 已修改范围 = document.getElementById('configContent') || document;
+  ['input', 'change'].forEach(function (本地值20079) {
+    已修改范围.addEventListener(本地值20079, function (事件值20078) {
+      const 本地值20077 = 事件值20078.target;
+      if (!本地值20077 || !本地值20077.tagName) return;
+      const 本地值20076 = 本地值20077.tagName.toLowerCase();
+      if (本地值20076 === 'input' || 本地值20076 === 'select' || 本地值20076 === 'textarea') {
+        // 跳过延迟测试相关输入，避免误触
+        if (本地值20077.id && /^(latencyTestInput|fetchURLInput|latencyTestPort|randomIPCount|testThreads|ipSourceSelect)$/.test(本地值20077.id)) return;
+        标记已修改();
+      }
+    });
+  });
+
+  // Ctrl+S / Cmd+S 触发保存
+  window.addEventListener('keydown', function (事件值20075) {
+    if ((事件值20075.ctrlKey || 事件值20075.metaKey) && (事件值20075.key === 's' || 事件值20075.key === 'S')) {
+      事件值20075.preventDefault();
+      if (值值保存值 && !值值保存值.classList.contains('cp-action-btn-saving')) {
+        值值保存值.click();
+      }
+    }
+  });
+  let 测试值控制器 = null;
+  let 测试结果列表 = [];
+  const 开始测试值 = document.getElementById('startLatencyTest');
+  const 值测试值 = document.getElementById('stopLatencyTest');
+  const 测试状态 = document.getElementById('latencyTestStatus');
+  const 测试结果列表值 = document.getElementById('latencyTestResults');
+  const 结果列表列表 = document.getElementById('latencyResultsList');
+  const 覆盖已选值 = document.getElementById('overwriteSelectedToYx');
+  const 追加已选值 = document.getElementById('appendSelectedToYx');
+  const 选择值值 = document.getElementById('selectAllResults');
+  const 值值值 = document.getElementById('deselectAllResults');
+  const 地址源选择 = document.getElementById('ipSourceSelect');
+  const 手动输入值 = document.getElementById('manualInputDiv');
+  const 网址获取值 = document.getElementById('urlFetchDiv');
+  const 延迟测试输入 = document.getElementById('latencyTestInput');
+  const 获取网址输入 = document.getElementById('fetchURLInput');
+  const 延迟测试端口 = document.getElementById('latencyTestPort');
+  const 随机地址数量 = document.getElementById('randomIPCount');
+  const 云墙随机值 = document.getElementById('cfRandomDiv');
+  const 随机数量值 = document.getElementById('randomCountDiv');
+  const 生成云墙地址值 = document.getElementById('generateCFIPBtn');
+  const 获取地址值 = document.getElementById('fetchIPBtn');
+  if (延迟测试输入) {
+    const 已保存测试输入 = localStorage.getItem('latencyTestInput');
+    if (已保存测试输入) 延迟测试输入.value = 已保存测试输入;
+    延迟测试输入.addEventListener('input', function () {
+      localStorage.setItem('latencyTestInput', this.value);
+    });
+  }
+  if (获取网址输入) {
+    const 已保存获取网址 = localStorage.getItem('fetchURLInput');
+    if (已保存获取网址) 获取网址输入.value = 已保存获取网址;
+    获取网址输入.addEventListener('input', function () {
+      localStorage.setItem('fetchURLInput', this.value);
+    });
+  }
+  if (延迟测试端口) {
+    const 已保存端口 = localStorage.getItem('latencyTestPort');
+    if (已保存端口) 延迟测试端口.value = 已保存端口;
+    延迟测试端口.addEventListener('input', function () {
+      localStorage.setItem('latencyTestPort', this.value);
+    });
+  }
+  if (随机地址数量) {
+    const 已保存数量 = localStorage.getItem('randomIPCount');
+    if (已保存数量) 随机地址数量.value = 已保存数量;
+    随机地址数量.addEventListener('input', function () {
+      localStorage.setItem('randomIPCount', this.value);
+    });
+    // 初始化时，如果默认是隐藏的，则禁用输入框
+    if (随机数量值 && 随机数量值.style.display === 'none') {
+      随机地址数量.disabled = true;
+    }
+  }
+  const 测试线程数输入 = document.getElementById('testThreads');
+  if (测试线程数输入) {
+    const 已保存线程数 = localStorage.getItem('testThreads');
+    if (已保存线程数) 测试线程数输入.value = 已保存线程数;
+    测试线程数输入.addEventListener('input', function () {
+      localStorage.setItem('testThreads', this.value);
+    });
+  }
+  if (地址源选择) {
+    const 已保存源 = localStorage.getItem('ipSourceSelect');
+    const 当前源 = 已保存源 || 地址源选择.value || 'manual';
+    if (已保存源) {
+      地址源选择.value = 已保存源;
+    }
+    手动输入值.style.display = 当前源 === 'manual' ? 'block' : 'none';
+    网址获取值.style.display = 当前源 === 'urlFetch' ? 'block' : 'none';
+    云墙随机值.style.display = 当前源 === 'cfRandom' ? 'block' : 'none';
+    随机数量值.style.display = 当前源 === 'cfRandom' ? 'block' : 'none';
+    // 当隐藏时禁用输入框，避免表单验证错误
+    if (随机地址数量) {
+      随机地址数量.disabled = 当前源 !== 'cfRandom';
+    }
+  }
+  const 云墙网段列表 = ['173.245.48.0/20', '103.21.244.0/22', '103.22.200.0/22', '103.31.4.0/22', '141.101.64.0/18', '108.162.192.0/18', '190.93.240.0/20', '188.114.96.0/20', '197.234.240.0/22', '198.41.128.0/17', '162.158.0.0/15', '104.16.0.0/13', '104.24.0.0/14', '172.64.0.0/13', '131.0.72.0/22'];
+  function 从网段生成随机地址(网段20074) {
+    const [基础地址, 前缀长度] = 网段20074.split('/');
+    const 前缀 = parseInt(前缀长度);
+    const 主机值 = 32 - 前缀;
+    const 地址部分列表 = 基础地址.split('.').map(参数值20073 => parseInt(参数值20073));
+    const 地址值 = 地址部分列表[0] << 24 | 地址部分列表[1] << 16 | 地址部分列表[2] << 8 | 地址部分列表[3];
+    const 随机偏移 = Math.floor(Math.random() * Math.pow(2, 主机值));
+    const 掩码 = 0xFFFFFFFF << 主机值 >>> 0;
+    const 随机地址 = ((地址值 & 掩码) >>> 0) + 随机偏移 >>> 0;
+    return [随机地址 >>> 24 & 0xFF, 随机地址 >>> 16 & 0xFF, 随机地址 >>> 8 & 0xFF, 随机地址 & 0xFF].join('.');
+  }
+  function 生成云墙随机地址(数量20072, 端口20071) {
+    const 地址列表20070 = [];
+    for (let 索引值20069 = 0; 索引值20069 < 数量20072; 索引值20069++) {
+      const 网段 = 云墙网段列表[Math.floor(Math.random() * 云墙网段列表.length)];
+      const 地址20068 = 从网段生成随机地址(网段);
+      地址列表20070.push(地址20068 + ':' + 端口20071);
+    }
+    return 地址列表20070;
+  }
+  if (地址源选择) {
+    地址源选择.addEventListener('change', function () {
+      const 值 = this.value;
+      localStorage.setItem('ipSourceSelect', 值);
+      手动输入值.style.display = 值 === 'manual' ? 'block' : 'none';
+      网址获取值.style.display = 值 === 'urlFetch' ? 'block' : 'none';
+      云墙随机值.style.display = 值 === 'cfRandom' ? 'block' : 'none';
+      随机数量值.style.display = 值 === 'cfRandom' ? 'block' : 'none';
+      // 当隐藏时禁用输入框，避免表单验证错误
+      if (随机地址数量) {
+        随机地址数量.disabled = 值 !== 'cfRandom';
+      }
+    });
+  }
+  if (生成云墙地址值) {
+    生成云墙地址值.addEventListener('click', function () {
+      const 数量 = parseInt(document.getElementById('randomIPCount').value) || 20;
+      const 端口20067 = document.getElementById('latencyTestPort').value || '443';
+      const 地址列表 = 生成云墙随机地址(数量, 端口20067);
+      document.getElementById('latencyTestInput').value = 地址列表.join(',');
+      手动输入值.style.display = 'block';
+      显示状态('${是否值236 ? 'تولید شد' : '已生成'} ' + 数量 + ' ${是否值236 ? 'IP تصادفی CF' : '个CF随机IP'}', 'success');
+    });
+  }
+  if (获取地址值) {
+    获取地址值.addEventListener('click', async function () {
+      const 网址输入 = document.getElementById('fetchURLInput');
+      const 获取网址 = 网址输入.value.trim();
+      if (!获取网址) {
+        显示提示('${是否值236 ? 'لطفا URL را وارد کنید' : '请输入URL'}', 'warn');
+        return;
+      }
+      获取地址值.disabled = true;
+      获取地址值.textContent = '${是否值236 ? 'در حال دریافت...' : '获取中...'}';
+      try {
+        // 支持多个 URL（逗号分隔）以及返回内容中逗号分隔的多个 IP/节点
+        const 网址列表 = Array.from(new Set(获取网址.split(',').map(网址值20066 => 网址值20066.trim()).filter(网址值20065 => 网址值20065)));
+        const 值项目列表 = [];
+        for (const 网址值 of 网址列表) {
+          const 响应 = await fetch(网址值);
+          if (!响应.ok) {
+            throw new Error('HTTP ' + 响应.status + ' @ ' + 网址值);
+          }
+          const 文本20064 = await 响应.text();
+
+          // 先按行分割，再在每行内按逗号分割，兼容“多行 + 逗号分隔”两种格式
+          const 值网址项目列表 = 文本20064.split(/\\r?\\n/).map(行值20063 => 行值20063.trim()).filter(行值20062 => 行值20062 && !行值20062.startsWith('#')).flatMap(行值 => 行值.split(',').map(参数值20061 => 参数值20061.trim()).filter(参数值 => 参数值));
+          值项目列表.push(...值网址项目列表);
+        }
+        if (值项目列表.length > 0) {
+          document.getElementById('latencyTestInput').value = 值项目列表.join(',');
+          手动输入值.style.display = 'block';
+          显示状态('${是否值236 ? 'دریافت شد' : '已获取'} ' + 值项目列表.length + ' ${是否值236 ? 'IP' : '个IP'}', 'success');
+        } else {
+          显示状态('${是否值236 ? 'داده‌ای یافت نشد' : '未获取到数据'}', 'error');
+        }
+      } catch (错误20060) {
+        显示状态('${是否值236 ? 'خطا در دریافت' : '获取失败'}: ' + 错误20060.message, 'error');
+      } finally {
+        获取地址值.disabled = false;
+        获取地址值.textContent = '⬇ ${是否值236 ? 'دریافت IP' : '获取IP'}';
+      }
+    });
+  }
+  if (开始测试值) {
+    开始测试值.addEventListener('click', async function () {
+      const 输入值20059 = document.getElementById('latencyTestInput');
+      const 端口值 = document.getElementById('latencyTestPort');
+      const 线程数值 = document.getElementById('testThreads');
+      const 输入值 = 输入值20059.value.trim();
+      const 默认端口 = 端口值.value || '443';
+      const 线程数 = parseInt(线程数值.value) || 5;
+      if (!输入值) {
+        显示状态('${是否值236 ? 'لطفا IP یا دامنه وارد کنید' : '请输入IP或域名'}', 'error');
+        return;
+      }
+      const 本地值20058 = 输入值.split(',').map(翻译值20057 => 翻译值20057.trim()).filter(翻译值20056 => 翻译值20056);
+      if (本地值20058.length === 0) return;
+      开始测试值.style.display = 'none';
+      值测试值.style.display = 'inline-block';
+      测试状态.style.display = 'block';
+      测试结果列表值.style.display = 'block';
+      结果列表列表.innerHTML = '';
+      测试结果列表 = [];
+      if (城市筛选值) {
+        城市筛选值.style.display = 'none';
+      }
+      测试值控制器 = new AbortController();
+      let 本地值20055 = 0;
+      const 本地值20054 = 本地值20058.length;
+      function 解析目标(目标20053) {
+        let 主机20052 = 目标20053;
+        let 端口20051 = 默认端口;
+        let 节点名称20050 = '';
+        if (目标20053.includes('#')) {
+          const 部分列表20049 = 目标20053.split('#');
+          节点名称20050 = 部分列表20049[1] || '';
+          主机20052 = 部分列表20049[0];
+        }
+        if (主机20052.includes(':') && !主机20052.startsWith('[')) {
+          const 值值20048 = 主机20052.lastIndexOf(':');
+          const 值端口 = 主机20052.substring(值值20048 + 1);
+          if (/^[0-9]+$/.test(值端口)) {
+            端口20051 = 值端口;
+            主机20052 = 主机20052.substring(0, 值值20048);
+          }
+        } else if (主机20052.includes(']:')) {
+          const 部分列表20047 = 主机20052.split(']:');
+          主机20052 = 部分列表20047[0] + ']';
+          端口20051 = 部分列表20047[1];
+        }
+        return {
+          host: 主机20052,
+          port: 端口20051,
+          nodeName: 节点名称20050
+        };
+      }
+      function 渲染结果(结果20046, 索引20045, 值值20044 = true) {
+        // 只展示在线优选成功的结果，失败/超时的不再显示
+        if (!结果20046.success) {
+          return null;
+        }
+        const 结果项目 = document.createElement('div');
+        结果项目.style.cssText = 'display: flex; align-items: center; padding: 8px; border-bottom: 1px solid #08130a; gap: 10px;';
+        结果项目.dataset.index = 索引20045;
+        结果项目.dataset.colo = 结果20046.colo || '';
+        if (!值值20044) {
+          结果项目.style.display = 'none';
+        }
+        const 复选框20043 = document.createElement('input');
+        复选框20043.type = 'checkbox';
+        复选框20043.checked = true;
+        复选框20043.disabled = false;
+        复选框20043.dataset.index = 索引20045;
+        复选框20043.style.cssText = 'width: 18px; height: 18px; cursor: pointer;';
+        const 本地值20042 = document.createElement('div');
+        本地值20042.style.cssText = 'flex: 1; font-family: monospace; font-size: 13px;';
+        const 机房名称20041 = 结果20046.colo ? 获取机房名称(结果20046.colo) : '';
+        const 机房显示 = 机房名称20041 ? ' <span style="color: #5b8cff;">[' + 机房名称20041 + ']</span>' : '';
+        本地值20042.innerHTML = '<span style="color: #c8f135;">' + 结果20046.host + ':' + 结果20046.port + '</span>' + 机房显示 + ' <span style="color: #ffb454;">' + 结果20046.latency + 'ms</span>';
+        结果项目.appendChild(复选框20043);
+        结果项目.appendChild(本地值20042);
+        结果列表列表.appendChild(结果项目);
+        return 结果项目;
+      }
+      async function 测试单项(目标) {
+        if (测试值控制器.signal.aborted) return null;
+        const {
+          host: 主机20040,
+          port: 端口20039,
+          nodeName: 节点名称
+        } = 解析目标(目标);
+        const 结果20038 = await 测试延迟(主机20040, 端口20039, 测试值控制器.signal);
+        结果20038.host = 主机20040;
+        结果20038.port = 端口20039;
+        结果20038.nodeName = 结果20038.success && 结果20038.colo ? 节点名称 || 'CF-' + 结果20038.colo : 节点名称 || 主机20040;
+        return 结果20038;
+      }
+      for (let 索引值20037 = 0; 索引值20037 < 本地值20054; 索引值20037 += 线程数) {
+        if (测试值控制器.signal.aborted) break;
+        const 本地值20036 = 本地值20058.slice(索引值20037, Math.min(索引值20037 + 线程数, 本地值20054));
+        测试状态.textContent = '${是否值236 ? 'در حال تست' : '测试中'}: ' + (索引值20037 + 1) + '-' + Math.min(索引值20037 + 线程数, 本地值20054) + '/' + 本地值20054 + ' (${是否值236 ? 'رشته‌ها' : '线程'}: ' + 线程数 + ')';
+        const 结果列表 = await Promise.all(本地值20036.map(翻译值 => 测试单项(翻译值)));
+        for (const 结果20035 of 结果列表) {
+          if (结果20035) {
+            const 索引20034 = 测试结果列表.length;
+            测试结果列表.push(结果20035);
+            渲染结果(结果20035, 索引20034);
+            本地值20055++;
+          }
+        }
+      }
+      测试状态.textContent = '${是否值236 ? 'تست کامل شد' : '测试完成'}: ' + 本地值20055 + '/' + 本地值20054;
+      开始测试值.style.display = 'inline-block';
+      值测试值.style.display = 'none';
+
+      // 更新城市选择器
+      更新城市筛选();
+    });
+  }
+  if (值测试值) {
+    值测试值.addEventListener('click', function () {
+      if (测试值控制器) {
+        测试值控制器.abort();
+      }
+      开始测试值.style.display = 'inline-block';
+      值测试值.style.display = 'none';
+      测试状态.textContent = '${是否值236 ? 'تست متوقف شد' : '测试已停止'}';
+    });
+  }
+  if (选择值值) {
+    选择值值.addEventListener('click', function () {
+      const 本地值20033 = 结果列表列表.querySelectorAll('input[type="checkbox"]:not(:disabled)');
+      本地值20033.forEach(本地值20032 => 本地值20032.checked = true);
+    });
+  }
+  if (值值值) {
+    值值值.addEventListener('click', function () {
+      const 本地值20031 = 结果列表列表.querySelectorAll('input[type="checkbox"]');
+      本地值20031.forEach(本地值20030 => 本地值20030.checked = false);
+    });
+  }
+
+  // 获取选中项的通用函数
+  function 获取已选项目() {
+    const 本地值20029 = 结果列表列表.querySelectorAll('input[type="checkbox"]:checked');
+    if (本地值20029.length === 0) {
+      显示状态('${是否值236 ? 'لطفا حداقل یک مورد انتخاب کنید' : '请至少选择一项'}', 'error');
+      return null;
+    }
+    const 已选项目列表20028 = [];
+    本地值20029.forEach(本地值20027 => {
+      const 索引20026 = parseInt(本地值20027.dataset.index);
+      const 结果20025 = 测试结果列表[索引20026];
+      if (结果20025 && 结果20025.success) {
+        const 机房名称 = 结果20025.colo ? 获取机房名称(结果20025.colo) : 结果20025.nodeName;
+        const 项目字符串 = 结果20025.host + ':' + 结果20025.port + '#' + 机房名称;
+        已选项目列表20028.push(项目字符串);
+      }
+    });
+    return 已选项目列表20028;
+  }
+
+  // 覆盖添加
+  if (覆盖已选值) {
+    覆盖已选值.addEventListener('click', async function () {
+      const 已选项目列表20024 = 获取已选项目();
+      if (!已选项目列表20024 || 已选项目列表20024.length === 0) return;
+      const 值输入20023 = document.getElementById('yx');
+      const 新值20022 = 已选项目列表20024.join(',');
+      值输入20023.value = 新值20022;
+      覆盖已选值.disabled = true;
+      追加已选值.disabled = true;
+      覆盖已选值.textContent = '${是否值236 ? 'در حال ذخیره...' : '保存中...'}';
+      try {
+        const 配置数据20021 = {
+          customIP: document.getElementById('customIP').value,
+          yx: 新值20022,
+          yxURL: document.getElementById('yxURL').value,
+          s: document.getElementById('socksConfig').value
+        };
+        await 保存配置(配置数据20021);
+        显示状态('${是否值236 ? 'موفقیت‌آمیز بود' : '已覆盖'} ' + 已选项目列表20024.length + ' ${是否值236 ? 'مورد و ذخیره شد' : '项并已保存'}', 'success');
+      } catch (错误20020) {
+        显示状态('${是否值236 ? 'خطا در ذخیره' : '保存失败'}: ' + 错误20020.message, 'error');
+      } finally {
+        覆盖已选值.disabled = false;
+        追加已选值.disabled = false;
+        覆盖已选值.textContent = '${是否值236 ? '覆盖添加' : '覆盖添加'}';
+      }
+    });
+  }
+
+  // 追加添加
+  if (追加已选值) {
+    追加已选值.addEventListener('click', async function () {
+      const 已选项目列表 = 获取已选项目();
+      if (!已选项目列表 || 已选项目列表.length === 0) return;
+      const 值输入 = document.getElementById('yx');
+      const 当前值 = 值输入.value.trim();
+      const 新项目列表 = 已选项目列表.join(',');
+      const 新值 = 当前值 ? 当前值 + ',' + 新项目列表 : 新项目列表;
+      值输入.value = 新值;
+      覆盖已选值.disabled = true;
+      追加已选值.disabled = true;
+      追加已选值.textContent = '${是否值236 ? 'در حال ذخیره...' : '保存中...'}';
+      try {
+        const 配置数据 = {
+          customIP: document.getElementById('customIP').value,
+          yx: 新值,
+          yxURL: document.getElementById('yxURL').value,
+          s: document.getElementById('socksConfig').value
+        };
+        await 保存配置(配置数据);
+        显示状态('${是否值236 ? 'موفقیت‌آمیز بود' : '已追加'} ' + 已选项目列表.length + ' ${是否值236 ? 'مورد و ذخیره شد' : '项并已保存'}', 'success');
+      } catch (错误20019) {
+        显示状态('${是否值236 ? 'خطا در ذخیره' : '保存失败'}: ' + 错误20019.message, 'error');
+      } finally {
+        覆盖已选值.disabled = false;
+        追加已选值.disabled = false;
+        追加已选值.textContent = '${是否值236 ? '追加添加' : '追加添加'}';
+      }
+    });
+  }
+  function 地址转十六进制(地址) {
+    const 部分列表 = 地址.split('.');
+    if (部分列表.length !== 4) return null;
+    let 十六进制 = '';
+    for (let 索引值 = 0; 索引值 < 4; 索引值++) {
+      const 数字 = parseInt(部分列表[索引值]);
+      if (isNaN(数字) || 数字 < 0 || 数字 > 255) return null;
+      十六进制 += 数字.toString(16).padStart(2, '0');
+    }
+    return 十六进制;
+  }
+  const 机房映射 = {
+    'SJC': '🇺🇸 圣何塞',
+    'LAX': '🇺🇸 洛杉矶',
+    'SEA': '🇺🇸 西雅图',
+    'SFO': '🇺🇸 旧金山',
+    'DFW': '🇺🇸 达拉斯',
+    'ORD': '🇺🇸 芝加哥',
+    'IAD': '🇺🇸 华盛顿',
+    'ATL': '🇺🇸 亚特兰大',
+    'MIA': '🇺🇸 迈阿密',
+    'DEN': '🇺🇸 丹佛',
+    'PHX': '🇺🇸 凤凰城',
+    'BOS': '🇺🇸 波士顿',
+    'EWR': '🇺🇸 纽瓦克',
+    'JFK': '🇺🇸 纽约',
+    'LAS': '🇺🇸 拉斯维加斯',
+    'MSP': '🇺🇸 明尼阿波利斯',
+    'DTW': '🇺🇸 底特律',
+    'PHL': '🇺🇸 费城',
+    'CLT': '🇺🇸 夏洛特',
+    'SLC': '🇺🇸 盐湖城',
+    'PDX': '🇺🇸 波特兰',
+    'SAN': '🇺🇸 圣地亚哥',
+    'TPA': '🇺🇸 坦帕',
+    'IAH': '🇺🇸 休斯顿',
+    'MCO': '🇺🇸 奥兰多',
+    'AUS': '🇺🇸 奥斯汀',
+    'BNA': '🇺🇸 纳什维尔',
+    'RDU': '🇺🇸 罗利',
+    'IND': '🇺🇸 印第安纳波利斯',
+    'CMH': '🇺🇸 哥伦布',
+    'MCI': '🇺🇸 堪萨斯城',
+    'OMA': '🇺🇸 奥马哈',
+    'ABQ': '🇺🇸 阿尔伯克基',
+    'OKC': '🇺🇸 俄克拉荷马城',
+    'MEM': '🇺🇸 孟菲斯',
+    'JAX': '🇺🇸 杰克逊维尔',
+    'RIC': '🇺🇸 里士满',
+    'BUF': '🇺🇸 布法罗',
+    'PIT': '🇺🇸 匹兹堡',
+    'CLE': '🇺🇸 克利夫兰',
+    'CVG': '🇺🇸 辛辛那提',
+    'MKE': '🇺🇸 密尔沃基',
+    'STL': '🇺🇸 圣路易斯',
+    'SAT': '🇺🇸 圣安东尼奥',
+    'HNL': '🇺🇸 檀香山',
+    'ANC': '🇺🇸 安克雷奇',
+    'SMF': '🇺🇸 萨克拉门托',
+    'ONT': '🇺🇸 安大略',
+    'OAK': '🇺🇸 奥克兰',
+    'HKG': '🇭🇰 香港',
+    'TPE': '🇹🇼 台北',
+    'TSA': '🇹🇼 台北松山',
+    'KHH': '🇹🇼 高雄',
+    'NRT': '🇯🇵 东京成田',
+    'HND': '🇯🇵 东京羽田',
+    'KIX': '🇯🇵 大阪关西',
+    'ITM': '🇯🇵 大阪伊丹',
+    'NGO': '🇯🇵 名古屋',
+    'FUK': '🇯🇵 福冈',
+    'CTS': '🇯🇵 札幌',
+    'OKA': '🇯🇵 冲绳',
+    'ICN': '🇰🇷 首尔仁川',
+    'GMP': '🇰🇷 首尔金浦',
+    'PUS': '🇰🇷 釜山',
+    'SIN': '🇸🇬 新加坡',
+    'BKK': '🇹🇭 曼谷',
+    'DMK': '🇹🇭 曼谷廊曼',
+    'KUL': '🇲🇾 吉隆坡',
+    'CGK': '🇮🇩 雅加达',
+    'MNL': '🇵🇭 马尼拉',
+    'CEB': '🇵🇭 宿务',
+    'HAN': '🇻🇳 河内',
+    'SGN': '🇻🇳 胡志明',
+    'DAD': '🇻🇳 岘港',
+    'RGN': '🇲🇲 仰光',
+    'PNH': '🇰🇭 金边',
+    'REP': '🇰🇭 暹粒',
+    'VTE': '🇱🇦 万象',
+    'BOM': '🇮🇳 孟买',
+    'DEL': '🇮🇳 新德里',
+    'MAA': '🇮🇳 金奈',
+    'BLR': '🇮🇳 班加罗尔',
+    'CCU': '🇮🇳 加尔各答',
+    'HYD': '🇮🇳 海得拉巴',
+    'AMD': '🇮🇳 艾哈迈达巴德',
+    'COK': '🇮🇳 科钦',
+    'PNQ': '🇮🇳 浦那',
+    'GOI': '🇮🇳 果阿',
+    'CMB': '🇱🇰 科伦坡',
+    'DAC': '🇧🇩 达卡',
+    'KTM': '🇳🇵 加德满都',
+    'ISB': '🇵🇰 伊斯兰堡',
+    'KHI': '🇵🇰 卡拉奇',
+    'LHE': '🇵🇰 拉合尔',
+    'LHR': '🇬🇧 伦敦希思罗',
+    'LGW': '🇬🇧 伦敦盖特威克',
+    'STN': '🇬🇧 伦敦斯坦斯特德',
+    'LTN': '🇬🇧 伦敦卢顿',
+    'MAN': '🇬🇧 曼彻斯特',
+    'EDI': '🇬🇧 爱丁堡',
+    'BHX': '🇬🇧 伯明翰',
+    'CDG': '🇫🇷 巴黎戴高乐',
+    'ORY': '🇫🇷 巴黎奥利',
+    'MRS': '🇫🇷 马赛',
+    'LYS': '🇫🇷 里昂',
+    'NCE': '🇫🇷 尼斯',
+    'FRA': '🇩🇪 法兰克福',
+    'MUC': '🇩🇪 慕尼黑',
+    'TXL': '🇩🇪 柏林',
+    'BER': '🇩🇪 柏林勃兰登堡',
+    'HAM': '🇩🇪 汉堡',
+    'DUS': '🇩🇪 杜塞尔多夫',
+    'CGN': '🇩🇪 科隆',
+    'STR': '🇩🇪 斯图加特',
+    'AMS': '🇳🇱 阿姆斯特丹',
+    'BRU': '🇧🇪 布鲁塞尔',
+    'LUX': '🇱🇺 卢森堡',
+    'ZRH': '🇨🇭 苏黎世',
+    'GVA': '🇨🇭 日内瓦',
+    'BSL': '🇨🇭 巴塞尔',
+    'VIE': '🇦🇹 维也纳',
+    'PRG': '🇨🇿 布拉格',
+    'BUD': '🇭🇺 布达佩斯',
+    'WAW': '🇵🇱 华沙',
+    'KRK': '🇵🇱 克拉科夫',
+    'MXP': '🇮🇹 米兰马尔彭萨',
+    'LIN': '🇮🇹 米兰利纳特',
+    'FCO': '🇮🇹 罗马',
+    'VCE': '🇮🇹 威尼斯',
+    'NAP': '🇮🇹 那不勒斯',
+    'FLR': '🇮🇹 佛罗伦萨',
+    'BGY': '🇮🇹 贝加莫',
+    'MAD': '🇪🇸 马德里',
+    'BCN': '🇪🇸 巴塞罗那',
+    'PMI': '🇪🇸 帕尔马',
+    'AGP': '🇪🇸 马拉加',
+    'VLC': '🇪🇸 瓦伦西亚',
+    'SVQ': '🇪🇸 塞维利亚',
+    'BIO': '🇪🇸 毕尔巴鄂',
+    'LIS': '🇵🇹 里斯本',
+    'OPO': '🇵🇹 波尔图',
+    'FAO': '🇵🇹 法鲁',
+    'DUB': '🇮🇪 都柏林',
+    'CPH': '🇩🇰 哥本哈根',
+    'ARN': '🇸🇪 斯德哥尔摩',
+    'GOT': '🇸🇪 哥德堡',
+    'OSL': '🇳🇴 奥斯陆',
+    'BGO': '🇳🇴 卑尔根',
+    'HEL': '🇫🇮 赫尔辛基',
+    'RIX': '🇱🇻 里加',
+    'TLL': '🇪🇪 塔林',
+    'VNO': '🇱🇹 维尔纽斯',
+    'ATH': '🇬🇷 雅典',
+    'SKG': '🇬🇷 塞萨洛尼基',
+    'SOF': '🇧🇬 索非亚',
+    'OTP': '🇷🇴 布加勒斯特',
+    'BEG': '🇷🇸 贝尔格莱德',
+    'ZAG': '🇭🇷 萨格勒布',
+    'LJU': '🇸🇮 卢布尔雅那',
+    'KBP': '🇺🇦 基辅',
+    'IEV': '🇺🇦 基辅茹良尼',
+    'ODS': '🇺🇦 敖德萨',
+    'SVO': '🇷🇺 莫斯科谢列梅捷沃',
+    'DME': '🇷🇺 莫斯科多莫杰多沃',
+    'VKO': '🇷🇺 莫斯科伏努科沃',
+    'LED': '🇷🇺 圣彼得堡',
+    'IST': '🇹🇷 伊斯坦布尔',
+    'SAW': '🇹🇷 伊斯坦布尔萨比哈',
+    'ESB': '🇹🇷 安卡拉',
+    'AYT': '🇹🇷 安塔利亚',
+    'ADB': '🇹🇷 伊兹密尔',
+    'TLV': '🇮🇱 特拉维夫',
+    'AMM': '🇯🇴 安曼',
+    'BEY': '🇱🇧 贝鲁特',
+    'BAH': '🇧🇭 巴林',
+    'KWI': '🇰🇼 科威特',
+    'DXB': '🇦🇪 迪拜',
+    'AUH': '🇦🇪 阿布扎比',
+    'SHJ': '🇦🇪 沙迦',
+    'DOH': '🇶🇦 多哈',
+    'MCT': '🇴🇲 马斯喀特',
+    'RUH': '🇸🇦 利雅得',
+    'JED': '🇸🇦 吉达',
+    'DMM': '🇸🇦 达曼',
+    'CAI': '🇪🇬 开罗',
+    'HBE': '🇪🇬 亚历山大',
+    'SSH': '🇪🇬 沙姆沙伊赫',
+    'CMN': '🇲🇦 卡萨布兰卡',
+    'RAK': '🇲🇦 马拉喀什',
+    'TUN': '🇹🇳 突尼斯',
+    'ALG': '🇩🇿 阿尔及尔',
+    'LOS': '🇳🇬 拉各斯',
+    'ABV': '🇳🇬 阿布贾',
+    'ACC': '🇬🇭 阿克拉',
+    'NBO': '🇰🇪 内罗毕',
+    'MBA': '🇰🇪 蒙巴萨',
+    'ADD': '🇪🇹 亚的斯亚贝巴',
+    'DAR': '🇹🇿 达累斯萨拉姆',
+    'JNB': '🇿🇦 约翰内斯堡',
+    'CPT': '🇿🇦 开普敦',
+    'DUR': '🇿🇦 德班',
+    'HRE': '🇿🇼 哈拉雷',
+    'LUN': '🇿🇲 卢萨卡',
+    'MRU': '🇲🇺 毛里求斯',
+    'SEZ': '🇸🇨 塞舌尔',
+    'SYD': '🇦🇺 悉尼',
+    'MEL': '🇦🇺 墨尔本',
+    'BNE': '🇦🇺 布里斯班',
+    'PER': '🇦🇺 珀斯',
+    'ADL': '🇦🇺 阿德莱德',
+    'CBR': '🇦🇺 堪培拉',
+    'OOL': '🇦🇺 黄金海岸',
+    'CNS': '🇦🇺 凯恩斯',
+    'AKL': '🇳🇿 奥克兰',
+    'WLG': '🇳🇿 惠灵顿',
+    'CHC': '🇳🇿 基督城',
+    'ZQN': '🇳🇿 皇后镇',
+    'NAN': '🇫🇯 楠迪',
+    'PPT': '🇵🇫 帕皮提',
+    'GUM': '🇬🇺 关岛',
+    'GRU': '🇧🇷 圣保罗瓜鲁柳斯',
+    'CGH': '🇧🇷 圣保罗孔戈尼亚斯',
+    'GIG': '🇧🇷 里约热内卢',
+    'BSB': '🇧🇷 巴西利亚',
+    'CNF': '🇧🇷 贝洛奥里藏特',
+    'POA': '🇧🇷 阿雷格里港',
+    'CWB': '🇧🇷 库里蒂巴',
+    'FOR': '🇧🇷 福塔莱萨',
+    'REC': '🇧🇷 累西腓',
+    'SSA': '🇧🇷 萨尔瓦多',
+    'EZE': '🇦🇷 布宜诺斯艾利斯',
+    'AEP': '🇦🇷 布宜诺斯艾利斯城',
+    'COR': '🇦🇷 科尔多瓦',
+    'MDZ': '🇦🇷 门多萨',
+    'SCL': '🇨🇱 圣地亚哥',
+    'LIM': '🇵🇪 利马',
+    'BOG': '🇨🇴 波哥大',
+    'MDE': '🇨🇴 麦德林',
+    'CLO': '🇨🇴 卡利',
+    'UIO': '🇪🇨 基多',
+    'GYE': '🇪🇨 瓜亚基尔',
+    'CCS': '🇻🇪 加拉加斯',
+    'MVD': '🇺🇾 蒙得维的亚',
+    'ASU': '🇵🇾 亚松森',
+    'PTY': '🇵🇦 巴拿马城',
+    'SJO': '🇨🇷 圣何塞',
+    'GUA': '🇬🇹 危地马拉城',
+    'SAL': '🇸🇻 圣萨尔瓦多',
+    'TGU': '🇭🇳 特古西加尔巴',
+    'MGA': '🇳🇮 马那瓜',
+    'BZE': '🇧🇿 伯利兹城',
+    'MEX': '🇲🇽 墨西哥城',
+    'GDL': '🇲🇽 瓜达拉哈拉',
+    'MTY': '🇲🇽 蒙特雷',
+    'CUN': '🇲🇽 坎昆',
+    'TIJ': '🇲🇽 蒂华纳',
+    'SJD': '🇲🇽 圣何塞德尔卡沃',
+    'YYZ': '🇨🇦 多伦多',
+    'YVR': '🇨🇦 温哥华',
+    'YUL': '🇨🇦 蒙特利尔',
+    'YYC': '🇨🇦 卡尔加里',
+    'YEG': '🇨🇦 埃德蒙顿',
+    'YOW': '🇨🇦 渥太华',
+    'YWG': '🇨🇦 温尼伯',
+    'YHZ': '🇨🇦 哈利法克斯',
+    'HAV': '🇨🇺 哈瓦那',
+    'SJU': '🇵🇷 圣胡安',
+    'SDQ': '🇩🇴 圣多明各',
+    'PAP': '🇭🇹 太子港',
+    'KIN': '🇯🇲 金斯顿',
+    'NAS': '🇧🇸 拿骚',
+    'MBJ': '🇯🇲 蒙特哥贝'
+  };
+  function 获取机房名称(机房20018) {
+    return 机房映射[机房20018] || 机房20018;
+  }
+
+  // 城市筛选相关函数
+  const 城市筛选值 = document.getElementById('cityFilterContainer');
+  const 城市值值 = document.getElementById('cityCheckboxesContainer');
+  function 更新城市筛选() {
+    if (!城市筛选值 || !城市值值) return;
+
+    // 从测试结果中提取所有可用的城市
+    const 城市映射 = new Map();
+    测试结果列表.forEach((结果20017, 索引20016) => {
+      if (结果20017.success && 结果20017.colo) {
+        const 机房20015 = 结果20017.colo;
+        if (!城市映射.has(机房20015)) {
+          城市映射.set(机房20015, {
+            colo: 机房20015,
+            name: 获取机房名称(机房20015),
+            count: 0
+          });
+        }
+        城市映射.get(机房20015).count++;
+      }
+    });
+    if (城市映射.size === 0) {
+      城市筛选值.style.display = 'none';
+      return;
+    }
+    城市筛选值.style.display = 'block';
+    城市值值.innerHTML = '';
+
+    // 按城市名称排序
+    const 城市列表 = Array.from(城市映射.values()).sort((甲值20014, 乙值20013) => 甲值20014.name.localeCompare(乙值20013.name));
+    城市列表.forEach(城市 => {
+      const 标签 = document.createElement('label');
+      标签.style.cssText = 'display: inline-flex; align-items: center; cursor: pointer; color: #c8f135; font-size: 0.85rem; padding: 4px 8px; background: rgba(11,14,20,0.4); border: 1px solid #9aa6b8; border-radius: 4px;';
+      const 复选框20012 = document.createElement('input');
+      复选框20012.type = 'checkbox';
+      复选框20012.value = 城市.colo;
+      复选框20012.checked = true;
+      复选框20012.dataset.colo = 城市.colo;
+      复选框20012.style.cssText = 'margin-right: 6px; width: 16px; height: 16px; cursor: pointer;';
+      const 本地值20011 = document.createElement('span');
+      本地值20011.textContent = 城市.name + ' (' + 城市.count + ')';
+      标签.appendChild(复选框20012);
+      标签.appendChild(本地值20011);
+      城市值值.appendChild(标签);
+      复选框20012.addEventListener('change', 按城市筛选结果);
+    });
+
+    // 监听筛选模式变化
+    const 筛选值值 = document.querySelectorAll('input[name="cityFilterMode"]');
+    筛选值值.forEach(单选框 => {
+      单选框.addEventListener('change', function () {
+        if (this.value === 'all') {
+          // 切换到"全部城市"模式时，自动选中所有城市复选框
+          const 城市值20010 = 城市值值.querySelectorAll('input[type="checkbox"]');
+          城市值20010.forEach(本地值20009 => {
+            本地值20009.checked = true;
+            本地值20009.disabled = false;
+          });
+        }
+        按城市筛选结果();
+      });
+    });
+  }
+  function 按城市筛选结果() {
+    if (!结果列表列表 || !城市值值) return;
+    const 筛选值 = document.querySelector('input[name="cityFilterMode"]:checked')?.value || 'all';
+    const 结果项目列表 = 结果列表列表.querySelectorAll('[data-index]');
+    const 城市值 = 城市值值.querySelectorAll('input[type="checkbox"]');
+    if (筛选值 === 'fastest10') {
+      // 只选择最快的10个
+      const 值结果列表 = 测试结果列表.map((结果, 索引20008) => ({
+        result: 结果,
+        index: 索引20008
+      })).filter(项目20007 => 项目20007.result.success).sort((甲值, 乙值) => 甲值.result.latency - 乙值.result.latency).slice(0, 10);
+      const 最快索引集合 = new Set(值结果列表.map(项目20006 => 项目20006.index));
+      结果项目列表.forEach(项目20005 => {
+        const 索引 = parseInt(项目20005.dataset.index);
+        const 复选框20004 = 项目20005.querySelector('input[type="checkbox"]');
+        if (最快索引集合.has(索引)) {
+          项目20005.style.display = 'flex';
+          if (复选框20004) 复选框20004.checked = true;
+        } else {
+          项目20005.style.display = 'none';
+          if (复选框20004) 复选框20004.checked = false;
+        }
+      });
+
+      // 禁用城市复选框
+      城市值.forEach(本地值20003 => 本地值20003.disabled = true);
+    } else {
+      // 根据选中的城市筛选
+      const 已选城市列表 = new Set();
+      城市值.forEach(本地值20002 => {
+        if (本地值20002.checked) {
+          已选城市列表.add(本地值20002.value);
+        }
+      });
+
+      // 如果所有城市都被选中（或没有选中任何城市），显示所有结果
+      const 值值20001 = 城市值.length > 0 && 已选城市列表.size === 城市值.length;
+      const 值值 = 已选城市列表.size === 0;
+      结果项目列表.forEach(项目 => {
+        const 机房20000 = 项目.dataset.colo || '';
+        const 复选框 = 项目.querySelector('input[type="checkbox"]');
+        if (值值20001 || 值值 || 已选城市列表.has(机房20000)) {
+          项目.style.display = 'flex';
+          // 同步更新结果项复选框的选中状态
+          if (复选框) {
+            if (值值20001) {
+              // 所有城市都选中时，所有结果项复选框都选中
+              复选框.checked = true;
+            } else if (值值) {
+              // 没有选中任何城市时，所有结果项复选框都取消选中
+              复选框.checked = false;
+            } else {
+              // 根据城市选择状态同步复选框
+              复选框.checked = 已选城市列表.has(机房20000);
+            }
+          }
+        } else {
+          项目.style.display = 'none';
+          // 取消选中隐藏的结果项复选框
+          if (复选框) {
+            复选框.checked = false;
+          }
+        }
+      });
+
+      // 启用城市复选框
+      城市值.forEach(本地值 => 本地值.disabled = false);
+    }
+  }
+  async function 测试延迟(主机, 端口, 信号) {
+    const 超时 = 8000;
+    let 机房 = '';
+    let 测试网址 = '';
+    try {
+      const 控制器 = new AbortController();
+      const 超时标识 = setTimeout(() => 控制器.abort(), 超时);
+      if (信号) {
+        信号.addEventListener('abort', () => 控制器.abort());
+      }
+      const 清理主机 = 主机.replace(/^\\[|\\]$/g, '');
+      const 十六进制地址 = 地址转十六进制(清理主机);
+      const 测试域名 = 十六进制地址 ? 十六进制地址 + '.nip.lfree.org' : 清理主机 + '.nip.lfree.org';
+      测试网址 = 'https://' + 测试域名 + ':' + 端口 + '/';
+      console.log('[LatencyTest] Testing:', 测试网址, 'Original:', 主机 + ':' + 端口, 'HexIP:', 十六进制地址);
+      const 首次开始 = Date.now();
+      const 响应1 = await fetch(测试网址, {
+        signal: 控制器.signal
+      });
+      const 首次值 = Date.now() - 首次开始;
+      if (!响应1.ok) {
+        clearTimeout(超时标识);
+        return {
+          success: false,
+          latency: 首次值,
+          error: 'HTTP ' + 响应1.status + ' ' + 响应1.statusText,
+          colo: '',
+          testUrl: 测试网址
+        };
+      }
+      try {
+        const 文本 = await 响应1.text();
+        console.log('[LatencyTest] Response body:', 文本.substring(0, 200));
+        const 数据 = JSON.parse(文本);
+        if (数据.colo) {
+          机房 = 数据.colo;
+        }
+      } catch (事件值) {
+        console.log('[LatencyTest] Parse error:', 事件值.message);
+      }
+      const 值开始 = Date.now();
+      const 响应2 = await fetch(测试网址, {
+        signal: 控制器.signal
+      });
+      await 响应2.text();
+      const 延迟 = Date.now() - 值开始;
+      clearTimeout(超时标识);
+      console.log('[LatencyTest] First:', 首次值 + 'ms (DNS+TLS+RTT)', 'Second:', 延迟 + 'ms (RTT only)');
+      return {
+        success: true,
+        latency: 延迟,
+        colo: 机房,
+        testUrl: 测试网址
+      };
+    } catch (错误) {
+      const 错误消息 = 错误.name === 'AbortError' ? '${是否值236 ? 'زمان تمام شد' : '超时'}' : 错误.message;
+      console.log('[LatencyTest] Error:', 错误消息, 'URL:', 测试网址);
+      return {
+        success: false,
+        latency: -1,
+        error: 错误消息,
+        colo: '',
+        testUrl: 测试网址
+      };
+    }
+  }
+});
+</script>
+    </body>
+    </html>`;
+  return new Response(值页面, {
+    status: 200,
+    headers: {
+      'Content-Type': 'text/html; charset=utf-8'
+    }
+  });
+}
+async function 解析木马头部(缓冲234, 本地值233) {
+  const 字节 = 处理值值8数组(缓冲234);
+  const 密码值井号 = 传输路径 || 本地值233;
+  const 值224密码 = await 处理值224井号(密码值井号);
+  if (字节.byteLength < 56) {
+    return {
+      hasError: true,
+      message: "invalid " + atob('dHJvamFu') + " data - too short"
+    };
+  }
+  let 值值索引 = 56;
+  if (字节[56] !== 0x0d || 字节[57] !== 0x0a) {
+    return {
+      hasError: true,
+      message: "invalid " + atob('dHJvamFu') + " header format (missing CR LF)"
+    };
+  }
+  const 密码232 = 共享解码器.decode(字节.subarray(0, 值值索引));
+  if (密码232 !== 值224密码) {
+    return {
+      hasError: true,
+      message: "invalid " + atob('dHJvamFu') + " password"
+    };
+  }
+  const 代理5数据缓冲 = 字节.subarray(值值索引 + 2);
+  if (代理5数据缓冲.byteLength < 6) {
+    return {
+      hasError: true,
+      message: atob('aW52YWxpZCBTT0NLUzUgcmVxdWVzdCBkYXRh')
+    };
+  }
+  const 视图231 = new DataView(代理5数据缓冲.buffer, 代理5数据缓冲.byteOffset, 代理5数据缓冲.byteLength);
+  const 命令230 = 视图231.getUint8(0);
+  if (命令230 !== 1) {
+    return {
+      hasError: true,
+      message: "unsupported command, only TCP (CONNECT) is allowed"
+    };
+  }
+  const 本地值229 = 视图231.getUint8(1);
+  let 地址长度 = 0;
+  let 地址索引228 = 2;
+  let 地址227 = "";
+  switch (本地值229) {
+    case 1:
+      地址长度 = 4;
+      地址227 = 代理5数据缓冲.subarray(地址索引228, 地址索引228 + 地址长度).join(".");
+      break;
+    case 3:
+      地址长度 = 代理5数据缓冲[地址索引228];
+      地址索引228 += 1;
+      地址227 = 共享解码器.decode(代理5数据缓冲.subarray(地址索引228, 地址索引228 + 地址长度));
+      break;
+    case 4:
+      地址长度 = 16;
+      const 数据视图 = new DataView(代理5数据缓冲.buffer, 代理5数据缓冲.byteOffset + 地址索引228, 地址长度);
+      const 值6 = [];
+      for (let 索引值226 = 0; 索引值226 < 8; 索引值226++) {
+        值6.push(数据视图.getUint16(索引值226 * 2).toString(16));
+      }
+      地址227 = 值6.join(":");
+      break;
+    default:
+      return {
+        hasError: true,
+        message: `invalid addressType is ${本地值229}`
+      };
+  }
+  if (!地址227) {
+    return {
+      hasError: true,
+      message: `address is empty, addressType is ${本地值229}`
+    };
+  }
+  const 端口索引225 = 地址索引228 + 地址长度;
+  const 端口远程 = new DataView(代理5数据缓冲.buffer, 代理5数据缓冲.byteOffset + 端口索引225, 2).getUint16(0);
+  return {
+    hasError: false,
+    addressRemote: 地址227,
+    addressType: 本地值229,
+    port: 端口远程,
+    hostname: 地址227,
+    rawClientData: 代理5数据缓冲.subarray(端口索引225 + 4)
+  };
+}
+async function 处理值224井号(文本224) {
+  const 编码器 = new TextEncoder();
+  const 数据223 = 编码器.encode(文本224);
+  const 本地值222 = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+  let 头部游标 = [0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4];
+  const 消息长度 = 数据223.length;
+  const 值长度221 = 消息长度 * 8;
+  const 值长度220 = Math.ceil((消息长度 + 9) / 64) * 64;
+  const 本地值219 = new Uint8Array(值长度220);
+  本地值219.set(数据223);
+  本地值219[消息长度] = 0x80;
+  const 视图 = new DataView(本地值219.buffer);
+  视图.setUint32(值长度220 - 4, 值长度221, false);
+  for (let 块218 = 0; 块218 < 值长度220; 块218 += 64) {
+    const 写入器包装 = new Uint32Array(64);
+    for (let 索引值217 = 0; 索引值217 < 16; 索引值217++) {
+      写入器包装[索引值217] = 视图.getUint32(块218 + 索引值217 * 4, false);
+    }
+    for (let 索引值216 = 16; 索引值216 < 64; 索引值216++) {
+      const 值0215 = 处理值值200(写入器包装[索引值216 - 15], 7) ^ 处理值值200(写入器包装[索引值216 - 15], 18) ^ 写入器包装[索引值216 - 15] >>> 3;
+      const 值1214 = 处理值值200(写入器包装[索引值216 - 2], 17) ^ 处理值值200(写入器包装[索引值216 - 2], 19) ^ 写入器包装[索引值216 - 2] >>> 10;
+      写入器包装[索引值216] = 写入器包装[索引值216 - 16] + 值0215 + 写入器包装[索引值216 - 7] + 值1214 >>> 0;
+    }
+    let [甲值213, 乙值, 丙值212, 丁值211, 事件值210, 表单值, 本地值209, 头值208] = 头部游标;
+    for (let 索引值207 = 0; 索引值207 < 64; 索引值207++) {
+      const 值1206 = 处理值值200(事件值210, 6) ^ 处理值值200(事件值210, 11) ^ 处理值值200(事件值210, 25);
+      const 本地值205 = 事件值210 & 表单值 ^ ~事件值210 & 本地值209;
+      const 值1 = 头值208 + 值1206 + 本地值205 + 本地值222[索引值207] + 写入器包装[索引值207] >>> 0;
+      const 值0 = 处理值值200(甲值213, 2) ^ 处理值值200(甲值213, 13) ^ 处理值值200(甲值213, 22);
+      const 本地值204 = 甲值213 & 乙值 ^ 甲值213 & 丙值212 ^ 乙值 & 丙值212;
+      const 值2203 = 值0 + 本地值204 >>> 0;
+      头值208 = 本地值209;
+      本地值209 = 表单值;
+      表单值 = 事件值210;
+      事件值210 = 丁值211 + 值1 >>> 0;
+      丁值211 = 丙值212;
+      丙值212 = 乙值;
+      乙值 = 甲值213;
+      甲值213 = 值1 + 值2203 >>> 0;
+    }
+    头部游标[0] = 头部游标[0] + 甲值213 >>> 0;
+    头部游标[1] = 头部游标[1] + 乙值 >>> 0;
+    头部游标[2] = 头部游标[2] + 丙值212 >>> 0;
+    头部游标[3] = 头部游标[3] + 丁值211 >>> 0;
+    头部游标[4] = 头部游标[4] + 事件值210 >>> 0;
+    头部游标[5] = 头部游标[5] + 表单值 >>> 0;
+    头部游标[6] = 头部游标[6] + 本地值209 >>> 0;
+    头部游标[7] = 头部游标[7] + 头值208 >>> 0;
+  }
+  const 结果202 = [];
+  for (let 索引值201 = 0; 索引值201 < 7; 索引值201++) {
+    结果202.push((头部游标[索引值201] >>> 24 & 0xff).toString(16).padStart(2, '0'), (头部游标[索引值201] >>> 16 & 0xff).toString(16).padStart(2, '0'), (头部游标[索引值201] >>> 8 & 0xff).toString(16).padStart(2, '0'), (头部游标[索引值201] & 0xff).toString(16).padStart(2, '0'));
+  }
+  return 结果202.join('');
+}
+function 处理值值200(值199, 本地值198) {
+  return 值199 >>> 本地值198 | 值199 << 32 - 本地值198;
+}
+let 值值197 = 0;
+const 值超文本缓冲大小 = 128 * 1024;
+const 连接超时值 = 5000;
+const 值超时值 = 45000;
+const 上限值196 = 2;
+const 上限值 = 32;
+function 处理扩展超文本值195(本地值194) {
+  return new Promise(结果值193 => setTimeout(结果值193, 本地值194));
+}
+function 验证唯一标识扩展超文本(标识192, 唯一标识191) {
+  for (let 索引190 = 0; 索引190 < 16; 索引190++) {
+    if (标识192[索引190] !== 唯一标识191[索引190]) {
+      return false;
+    }
+  }
+  return true;
+}
+class 扩展超文本计数器 {
+  #total;
+  constructor() {
+    this.#total = 0;
+  }
+  get() {
+    return this.#total;
+  }
+  add(大小189) {
+    this.#total += 大小189;
+  }
+}
+function 处理值值值(首次, ...本地值188) {
+  let 长度 = 首次.length;
+  for (let 甲值187 of 本地值188) {
+    长度 += 甲值187.length;
+  }
+  const 结果值186 = new 首次.constructor(长度);
+  结果值186.set(首次, 0);
+  长度 = 首次.length;
+  for (let 甲值185 of 本地值188) {
+    结果值186.set(甲值185, 长度);
+    长度 += 甲值185.length;
+  }
+  return 结果值186;
+}
+function 解析唯一标识扩展超文本(唯一标识184) {
+  唯一标识184 = 唯一标识184.replaceAll('-', '');
+  const 结果值183 = [];
+  for (let 索引182 = 0; 索引182 < 16; 索引182++) {
+    const 取值181 = parseInt(唯一标识184.substr(索引182 * 2, 2), 16);
+    结果值183.push(取值181);
+  }
+  return 结果值183;
+}
+function 获取扩展超文本缓冲(大小) {
+  return new Uint8Array(new ArrayBuffer(大小 || 值超文本缓冲大小));
+}
+async function 读取扩展超文本头部(本地值180, 唯一标识字符串) {
+  const 读取器179 = 本地值180.getReader({
+    mode: 'byob'
+  });
+  try {
+    let 结果值178 = await 读取器179.readAtLeast(1 + 16 + 1, 获取扩展超文本缓冲());
+    let 本地值177 = 0;
+    let 索引 = 0;
+    let 缓存 = 结果值178.value;
+    本地值177 += 结果值178.value.length;
+    const 本地值176 = 缓存[0];
+    const 标识175 = 缓存.slice(1, 1 + 16);
+    const 唯一标识174 = 解析唯一标识扩展超文本(唯一标识字符串);
+    if (!验证唯一标识扩展超文本(标识175, 唯一标识174)) {
+      return `invalid UUID`;
+    }
+    const 值长度173 = 缓存[1 + 16];
+    const 地址值1 = 1 + 16 + 1 + 值长度173 + 1 + 2 + 1;
+    if (地址值1 + 1 > 本地值177) {
+      if (结果值178.done) {
+        return `header too short`;
+      }
+      索引 = 地址值1 + 1 - 本地值177;
+      结果值178 = await 读取器179.readAtLeast(索引, 获取扩展超文本缓冲());
+      本地值177 += 结果值178.value.length;
+      缓存 = 处理值值值(缓存, 结果值178.value);
+    }
+    const 命令 = 缓存[1 + 16 + 1 + 值长度173];
+    if (命令 !== 1) {
+      return `unsupported command: ${命令}`;
+    }
+    const 端口172 = (缓存[地址值1 - 1 - 2] << 8) + 缓存[地址值1 - 1 - 1];
+    const 本地值171 = 缓存[地址值1 - 1];
+    let 头部长度 = -1;
+    if (本地值171 === 地址类型_四版) {
+      头部长度 = 地址值1 + 4;
+    } else if (本地值171 === 地址类型_六版) {
+      头部长度 = 地址值1 + 16;
+    } else if (本地值171 === 地址类型_网址) {
+      头部长度 = 地址值1 + 1 + 缓存[地址值1];
+    }
+    if (头部长度 < 0) {
+      return 'read address type failed';
+    }
+    索引 = 头部长度 - 本地值177;
+    if (索引 > 0) {
+      if (结果值178.done) {
+        return `read address failed`;
+      }
+      结果值178 = await 读取器179.readAtLeast(索引, 获取扩展超文本缓冲());
+      本地值177 += 结果值178.value.length;
+      缓存 = 处理值值值(缓存, 结果值178.value);
+    }
+    let 主机名170 = '';
+    索引 = 地址值1;
+    switch (本地值171) {
+      case 地址类型_四版:
+        主机名170 = 缓存.slice(索引, 索引 + 4).join('.');
+        break;
+      case 地址类型_网址:
+        主机名170 = new TextDecoder().decode(缓存.slice(索引 + 1, 索引 + 1 + 缓存[索引]));
+        break;
+      case 地址类型_六版:
+        主机名170 = 缓存.slice(索引, 索引 + 16).reduce((字符串值, 值2169, 值2, 甲值) => 值2 % 2 ? 字符串值.concat(((甲值[值2 - 1] << 8) + 值2169).toString(16)) : 字符串值, []).join(':');
+        break;
+    }
+    if (主机名170.length < 1) {
+      return 'failed to parse hostname';
+    }
+    const 数据 = 缓存.slice(头部长度);
+    return {
+      hostname: 主机名170,
+      port: 端口172,
+      data: 数据,
+      resp: new Uint8Array([本地值176, 0]),
+      reader: 读取器179,
+      done: 结果值178.done
+    };
+  } catch (错误168) {
+    try {
+      读取器179.releaseLock();
+    } catch (忽略值167) {}
+    throw 错误168;
+  }
+}
+async function 处理值值远程扩展超文本(计数器166, 写入器165, 本地值164) {
+  async function 处理值值(丁值) {
+    if (!丁值 || 丁值.length === 0) {
+      return;
+    }
+    计数器166.add(丁值.length);
+    try {
+      await 写入器165.write(丁值);
+    } catch (错误163) {
+      throw 错误163;
+    }
+  }
+  try {
+    await 处理值值(本地值164.data);
+    let 块数量162 = 0;
+    while (!本地值164.done) {
+      const 结果值161 = await 本地值164.reader.read(获取扩展超文本缓冲());
+      if (结果值161.done) break;
+      await 处理值值(结果值161.value);
+      本地值164.done = 结果值161.done;
+      块数量162++;
+      if (块数量162 % 10 === 0) {
+        await 处理扩展超文本值195(0);
+      }
+      if (!结果值161.value || 结果值161.value.length === 0) {
+        await 处理扩展超文本值195(2);
+      }
+    }
+  } catch (错误160) {
+    throw 错误160;
+  }
+}
+function 创建扩展超文本值159(本地值158, 本地值157) {
+  const 计数器156 = new 扩展超文本计数器();
+  const 写入器155 = 本地值157.getWriter();
+  const 本地值154 = (async () => {
+    try {
+      await 处理值值远程扩展超文本(计数器156, 写入器155, 本地值158);
+    } catch (错误153) {
+      throw 错误153;
+    } finally {
+      try {
+        await 写入器155.close();
+      } catch (错误152) {}
+    }
+  })();
+  return {
+    counter: 计数器156,
+    done: 本地值154,
+    abort: () => {
+      try {
+        写入器155.abort();
+      } catch (忽略值151) {}
+    }
+  };
+}
+function 创建扩展超文本值(本地值150, 远程值) {
+  const 计数器 = new 扩展超文本计数器();
+  let 流;
+  const 本地值149 = new Promise((本地值148, 本地值147) => {
+    流 = new TransformStream({
+      start(控制器146) {
+        计数器.add(本地值150.length);
+        控制器146.enqueue(本地值150);
+      },
+      transform(块, 控制器145) {
+        计数器.add(块.length);
+        控制器145.enqueue(块);
+      },
+      cancel(本地值144) {
+        本地值147(`download cancelled: ${本地值144}`);
+      }
+    }, null, new ByteLengthQueuingStrategy({
+      highWaterMark: 值超文本缓冲大小
+    }));
+    let 值值143 = Date.now();
+    const 值计时器 = setInterval(() => {
+      if (Date.now() - 值值143 > 值超时值) {
+        try {
+          流.writable.abort?.('idle timeout');
+        } catch (忽略值142) {}
+        clearInterval(值计时器);
+        本地值147('idle timeout');
+      }
+    }, 5000);
+    const 读取器 = 远程值.getReader();
+    const 写入器 = 流.writable.getWriter();
+    ;
+    (async () => {
+      try {
+        let 块数量 = 0;
+        while (true) {
+          const 结果值141 = await 读取器.read();
+          if (结果值141.done) {
+            break;
+          }
+          值值143 = Date.now();
+          await 写入器.write(结果值141.value);
+          块数量++;
+          if (块数量 % 5 === 0) {
+            await 处理扩展超文本值195(0);
+          }
+        }
+        await 写入器.close();
+        本地值148();
+      } catch (错误140) {
+        本地值147(错误140);
+      } finally {
+        try {
+          读取器.releaseLock();
+        } catch (忽略值139) {}
+        try {
+          写入器.releaseLock();
+        } catch (忽略值138) {}
+        clearInterval(值计时器);
+      }
+    })();
+  });
+  return {
+    readable: 流.readable,
+    counter: 计数器,
+    done: 本地值149,
+    abort: () => {
+      try {
+        流.readable.cancel();
+      } catch (忽略值137) {}
+      try {
+        流.writable.abort();
+      } catch (忽略值136) {}
+    }
+  };
+}
+async function 连接值远程扩展超文本(本地值135, ...本地值134) {
+  let 本地值133 = 0;
+  let 值错误;
+  const 连接列表 = [本地值135.hostname, ...本地值134.filter(结果值 => 结果值 && 结果值 !== 本地值135.hostname)];
+  for (const 主机名 of 连接列表) {
+    if (!主机名) continue;
+    本地值133 = 0;
+    while (本地值133 < 上限值196) {
+      本地值133++;
+      try {
+        const 远程 = 连接({
+          hostname: 主机名,
+          port: 本地值135.port
+        });
+        const 超时承诺 = 处理扩展超文本值195(连接超时值).then(() => {
+          throw new Error(atob('Y29ubmVjdCB0aW1lb3V0'));
+        });
+        await Promise.race([远程.opened, 超时承诺]);
+        const 本地值132 = 创建扩展超文本值159(本地值135, 远程.writable);
+        const 本地值131 = 创建扩展超文本值(本地值135.resp, 远程.readable);
+        return {
+          downloader: 本地值131,
+          uploader: 本地值132,
+          close: () => {
+            try {
+              远程.close();
+            } catch (忽略值130) {}
+          }
+        };
+      } catch (错误129) {
+        值错误 = 错误129;
+        if (本地值133 < 上限值196) {
+          await 处理扩展超文本值195(500 * 本地值133);
+        }
+      }
+    }
+  }
+  return null;
+}
+async function 处理扩展超文本客户端(主体128, 唯一标识) {
+  if (值值197 >= 上限值) {
+    return new Response('Too many connections', {
+      status: 429
+    });
+  }
+  值值197++;
+  let 本地值127 = false;
+  const 本地值126 = () => {
+    if (!本地值127) {
+      值值197 = Math.max(0, 值值197 - 1);
+      本地值127 = true;
+    }
+  };
+  try {
+    const 本地值125 = await 读取扩展超文本头部(主体128, 唯一标识);
+    if (typeof 本地值125 !== 'object' || !本地值125) {
+      return null;
+    }
+    const 远程连接 = await 连接值远程扩展超文本(本地值125, 回退地址, '13.230.34.30');
+    if (远程连接 === null) {
+      return null;
+    }
+    const 连接值 = Promise.race([(async () => {
+      try {
+        await 远程连接.downloader.done;
+      } catch (错误124) {}
+    })(), (async () => {
+      try {
+        await 远程连接.uploader.done;
+      } catch (错误123) {}
+    })(), 处理扩展超文本值195(值超时值).then(() => {})]).finally(() => {
+      try {
+        远程连接.close();
+      } catch (忽略值122) {}
+      try {
+        远程连接.downloader.abort();
+      } catch (忽略值121) {}
+      try {
+        远程连接.uploader.abort();
+      } catch (忽略值) {}
+      本地值126();
+    });
+    return {
+      readable: 远程连接.downloader.readable,
+      closed: 连接值
+    };
+  } catch (错误120) {
+    本地值126();
+    return null;
+  }
+}
+async function 处理扩展超文本值(请求119) {
+  try {
+    return await 处理扩展超文本客户端(请求119.body, 认证令牌);
+  } catch (错误118) {
+    return null;
+  }
+}
+function 处理基础64值数组(值64字符串) {
+  if (!值64字符串) return {
+    error: null
+  };
+  try {
+    值64字符串 = 值64字符串.replace(/-/g, '+').replace(/_/g, '/');
+    return {
+      earlyData: Uint8Array.from(atob(值64字符串), 丙值117 => 丙值117.charCodeAt(0)).buffer,
+      error: null
+    };
+  } catch (错误116) {
+    return {
+      error: 错误116
+    };
+  }
+}
+function 关闭套接字值(套接字) {
+  try {
+    if (套接字.readyState === 1 || 套接字.readyState === 2) 套接字.close();
+  } catch (错误115) {}
+}
+const 十六进制值 = Array.from({
+  length: 256
+}, (取值, 索引值) => (索引值 + 256).toString(16).slice(1));
+function 处理格式值(本地值114, 偏移 = 0) {
+  const 标识 = (十六进制值[本地值114[偏移]] + 十六进制值[本地值114[偏移 + 1]] + 十六进制值[本地值114[偏移 + 2]] + 十六进制值[本地值114[偏移 + 3]] + "-" + 十六进制值[本地值114[偏移 + 4]] + 十六进制值[本地值114[偏移 + 5]] + "-" + 十六进制值[本地值114[偏移 + 6]] + 十六进制值[本地值114[偏移 + 7]] + "-" + 十六进制值[本地值114[偏移 + 8]] + 十六进制值[本地值114[偏移 + 9]] + "-" + 十六进制值[本地值114[偏移 + 10]] + 十六进制值[本地值114[偏移 + 11]] + 十六进制值[本地值114[偏移 + 12]] + 十六进制值[本地值114[偏移 + 13]] + 十六进制值[本地值114[偏移 + 14]] + 十六进制值[本地值114[偏移 + 15]]).toLowerCase();
+  if (!是否有效格式(标识)) throw new TypeError(错误_无效标识字符串);
+  return 标识;
+}
+async function 获取值解析新地址列表() {
+  const 网址113 = 优选地址源;
+  try {
+    const 网址列表112 = 网址113.includes(',') ? 网址113.split(',').map(网址值111 => 网址值111.trim()).filter(网址值 => 网址值) : [网址113];
+    const 接口结果列表 = await 获取优选接口(网址列表112, '443', 5000);
+    if (接口结果列表.length > 0) {
+      const 结果列表110 = [];
+      const 正则 = /^(\[[\da-fA-F:]+\]|[\d.]+|[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?)*)(?::(\d+))?(?:#(.+))?$/;
+      for (const 项目109 of 接口结果列表) {
+        const 本地值108 = 项目109.match(正则);
+        if (本地值108) {
+          结果列表110.push({
+            ip: 本地值108[1],
+            port: parseInt(本地值108[2] || '443', 10),
+            name: 本地值108[3]?.trim() || 本地值108[1]
+          });
+        }
+      }
+      return 结果列表110;
+    }
+    const 响应107 = await fetch(网址113);
+    if (!响应107.ok) return [];
+    const 文本106 = await 响应107.text();
+    const 结果列表105 = [];
+    const 行列表104 = 文本106.trim().replace(/\r/g, "").split('\n');
+    const 值正则 = /^([^:]+):(\d+)#(.*)$/;
+    for (const 行103 of 行列表104) {
+      const 值行 = 行103.trim();
+      if (!值行) continue;
+      const 本地值102 = 值行.match(值正则);
+      if (本地值102) {
+        结果列表105.push({
+          ip: 本地值102[1],
+          port: parseInt(本地值102[2], 10),
+          name: 本地值102[3].trim() || 本地值102[1]
+        });
+      }
+    }
+    return 结果列表105;
+  } catch (错误101) {
+    return [];
+  }
+}
+function 生成链接列表来源新地址列表(列表100, 用户99, 工作器域名98, 加密客户端问候配置97 = null, 跳过编号96 = false, 别名命名器95 = null) {
+  const 云墙超文本端口94 = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  const 云墙安全超文本端口93 = [443, 2053, 2083, 2087, 2096, 8443];
+  const 链接列表92 = [];
+  const 网页套接字路径91 = '/?ed=2048';
+  const 协议 = atob('dmxlc3M=');
+  const 制作节点名称90 = 别名命名器95 || 创建值节点命名器(跳过编号96);
+  for (const 项目89 of 列表100) {
+    const 端口88 = 项目89.port;
+    const 安全地址87 = 项目89.ip.includes(':') ? `[${项目89.ip}]` : 项目89.ip;
+    if (云墙安全超文本端口93.includes(端口88)) {
+      const 网页套接字节点名称86 = 制作节点名称90(项目89);
+      let 链接85 = `${协议}://${用户99}@${安全地址87}:${端口88}?encryption=none&security=tls&sni=${工作器域名98}&fp=${启用加密客户端问候 ? 'chrome' : 'randomized'}&type=ws&host=${工作器域名98}&path=${网页套接字路径91}`;
+      if (自定义应用层协议协商) 链接85 += `&alpn=${encodeURIComponent(自定义应用层协议协商)}`;
+
+      // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+      if (启用加密客户端问候) {
+        const 域名系统值84 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+        const 加密客户端问候域名83 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        链接85 += `&ech=${encodeURIComponent(`${加密客户端问候域名83}+${域名系统值84}`)}`;
+      }
+      链接85 += `#${encodeURIComponent(网页套接字节点名称86)}`;
+      链接列表92.push(链接85);
+    } else if (云墙超文本端口94.includes(端口88)) {
+      if (!禁用非传输层安全) {
+        const 网页套接字节点名称82 = 制作节点名称90(项目89);
+        const 链接81 = `${协议}://${用户99}@${安全地址87}:${端口88}?encryption=none&security=none&type=ws&host=${工作器域名98}&path=${网页套接字路径91}#${encodeURIComponent(网页套接字节点名称82)}`;
+        链接列表92.push(链接81);
+      }
+    } else {
+      const 网页套接字节点名称80 = 制作节点名称90(项目89);
+      let 链接79 = `${协议}://${用户99}@${安全地址87}:${端口88}?encryption=none&security=tls&sni=${工作器域名98}&fp=${启用加密客户端问候 ? 'chrome' : 'randomized'}&type=ws&host=${工作器域名98}&path=${网页套接字路径91}`;
+      if (自定义应用层协议协商) 链接79 += `&alpn=${encodeURIComponent(自定义应用层协议协商)}`;
+
+      // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+      if (启用加密客户端问候) {
+        const 域名系统值78 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+        const 加密客户端问候域名77 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        链接79 += `&ech=${encodeURIComponent(`${加密客户端问候域名77}+${域名系统值78}`)}`;
+      }
+      链接79 += `#${encodeURIComponent(网页套接字节点名称80)}`;
+      链接列表92.push(链接79);
+    }
+  }
+  return 链接列表92;
+}
+function 生成扩展超文本链接列表来源源(列表76, 用户75, 工作器域名74, 加密客户端问候配置73 = null, 跳过编号72 = false, 别名命名器71 = null) {
+  const 链接列表70 = [];
+  const 节点路径 = 用户75.substring(0, 8);
+  const 制作节点名称69 = 别名命名器71 || 创建值节点命名器(跳过编号72);
+  for (const 项目68 of 列表76) {
+    const 安全地址67 = 项目68.ip.includes(':') ? `[${项目68.ip}]` : 项目68.ip;
+    const 端口66 = 项目68.port || 443;
+    const 网页套接字节点名称65 = 制作节点名称69(项目68);
+    const 参数 = new URLSearchParams({
+      encryption: 'none',
+      security: 'tls',
+      sni: 工作器域名74,
+      fp: 'chrome',
+      type: 'xhttp',
+      host: 工作器域名74,
+      path: `/${节点路径}`,
+      mode: 'stream-one'
+    });
+    处理值应用层协议协商值(参数);
+    if (启用加密客户端问候) {
+      const 域名系统值64 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+      const 加密客户端问候域名63 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+      参数.set('ech', `${加密客户端问候域名63}+${域名系统值64}`);
+    }
+    链接列表70.push(`${解码64('dmxlc3M6Ly8=')}${用户75}@${安全地址67}:${端口66}?${参数.toString()}#${encodeURIComponent(网页套接字节点名称65)}`);
+  }
+  return 链接列表70;
+}
+async function 生成木马链接列表来源新地址列表(列表, 用户, 工作器域名, 加密客户端问候配置 = null, 跳过编号 = false, 别名命名器 = null) {
+  const 云墙超文本端口 = [80, 8080, 8880, 2052, 2082, 2086, 2095];
+  const 云墙安全超文本端口 = [443, 2053, 2083, 2087, 2096, 8443];
+  const 链接列表 = [];
+  const 网页套接字路径 = '/?ed=2048';
+  const 密码 = 传输路径 || 用户;
+  const 制作节点名称 = 别名命名器 || 创建值节点命名器(跳过编号);
+  for (const 项目62 of 列表) {
+    const 端口61 = 项目62.port;
+    const 安全地址 = 项目62.ip.includes(':') ? `[${项目62.ip}]` : 项目62.ip;
+    if (云墙安全超文本端口.includes(端口61)) {
+      const 网页套接字节点名称60 = 制作节点名称(项目62);
+      let 链接59 = `${atob('dHJvamFuOi8v')}${密码}@${安全地址}:${端口61}?security=tls&sni=${工作器域名}&fp=chrome&type=ws&host=${工作器域名}&path=${网页套接字路径}`;
+      if (自定义应用层协议协商) 链接59 += `&alpn=${encodeURIComponent(自定义应用层协议协商)}`;
+
+      // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+      if (启用加密客户端问候) {
+        const 域名系统值58 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+        const 加密客户端问候域名57 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        链接59 += `&ech=${encodeURIComponent(`${加密客户端问候域名57}+${域名系统值58}`)}`;
+      }
+      链接59 += `#${encodeURIComponent(网页套接字节点名称60)}`;
+      链接列表.push(链接59);
+    } else if (云墙超文本端口.includes(端口61)) {
+      if (!禁用非传输层安全) {
+        const 网页套接字节点名称56 = 制作节点名称(项目62);
+        const 链接55 = `${atob('dHJvamFuOi8v')}${密码}@${安全地址}:${端口61}?security=none&type=ws&host=${工作器域名}&path=${网页套接字路径}#${encodeURIComponent(网页套接字节点名称56)}`;
+        链接列表.push(链接55);
+      }
+    } else {
+      const 网页套接字节点名称 = 制作节点名称(项目62);
+      let 链接 = `${atob('dHJvamFuOi8v')}${密码}@${安全地址}:${端口61}?security=tls&sni=${工作器域名}&fp=chrome&type=ws&host=${工作器域名}&path=${网页套接字路径}`;
+      if (自定义应用层协议协商) 链接 += `&alpn=${encodeURIComponent(自定义应用层协议协商)}`;
+
+      // 如果启用了ECH，添加ech参数（ECH需要伪装成Chrome浏览器）
+      if (启用加密客户端问候) {
+        const 域名系统值 = 自定义域名系统 || 'https://223.5.5.5/dns-query';
+        const 加密客户端问候域名 = 自定义加密客户端问候域名 || 'cloudflare-ech.com';
+        链接 += `&ech=${encodeURIComponent(`${加密客户端问候域名}+${域名系统值}`)}`;
+      }
+      链接 += `#${encodeURIComponent(网页套接字节点名称)}`;
+      链接列表.push(链接);
+    }
+  }
+  return 链接列表;
+}
+async function 处理配置接口(请求54, 环境值 = {}) {
+  if (请求54.method === 'GET') {
+    if (!键值存储) {
+      return new Response(JSON.stringify({
+        error: 'KV存储未配置',
+        kvEnabled: false
+      }), {
+        status: 503,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+    return new Response(JSON.stringify({
+      ...获取有效配置快照(环境值),
+      kvEnabled: true
+    }), {
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  } else if (请求54.method === 'POST') {
+    if (!键值存储) {
+      return new Response(JSON.stringify({
+        success: false,
+        message: 'KV存储未配置，无法保存配置'
+      }), {
+        status: 503,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+    try {
+      const 新配置 = await 请求54.json();
+      for (const [键, 值] of Object.entries(新配置)) {
+        if (值 === '' || 值 === null || 值 === undefined) {
+          delete 键值配置[键];
+        } else {
+          键值配置[键] = 值;
+        }
+      }
+      await 保存键值配置();
+      更新配置值();
+      if (新配置.yx !== undefined) {
+        更新自定义优选来源值();
+      }
+      return new Response(JSON.stringify({
+        success: true,
+        message: '配置已保存',
+        config: 获取有效配置快照(环境值)
+      }), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    } catch (错误53) {
+      return new Response(JSON.stringify({
+        success: false,
+        message: '保存配置失败: ' + 错误53.message
+      }), {
+        status: 500,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+  }
+  return new Response(JSON.stringify({
+    error: 'Method not allowed'
+  }), {
+    status: 405,
+    headers: {
+      'Content-Type': 'application/json'
+    }
+  });
+}
+/* ------------------------------------------------------------------
+   خودکارسازی به‌روزرسانی پنل (self-update)
+   - GET  /api/update  → مقایسه نسخه فعلی با نسخه‌ی موجود در آدرس VERSION
+   - POST /api/update  → دریافت worker-source.js جدید و آپلود آن روی همین Worker
+     از طریق Cloudflare API با توکنی که ادمین در تنظیمات ذخیره کرده.
+   هیچ آدرس یا توکنی هاردکد نشده؛ همه از KV (键值配置) خوانده می‌شود تا هر کاربر
+   بتواند منبع/توکن خودش را تنظیم کند و کاملاً اختیاری بماند.
+------------------------------------------------------------------- */
+async function 处理更新检查接口(请求, 环境值 = {}) {
+  if (请求.method !== 'GET') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
+  }
+  const 版本地址 = 获取配置文本值('updVerUrl', 配置默认值.updVerUrl, 环境值.updVerUrl);
+  if (!版本地址) {
+    return new Response(JSON.stringify({ current: 面板版本, latest: null, hasUpdate: false, message: 'آدرس بررسی نسخه تنظیم نشده' }), { headers: { 'Content-Type': 'application/json' } });
+  }
+  try {
+    const 响应 = await fetch(版本地址, { cf: { cacheTtl: 0 } });
+    if (!响应.ok) throw new Error('HTTP ' + 响应.status);
+    const 最新版本 = (await 响应.text()).trim();
+    return new Response(JSON.stringify({
+      current: 面板版本,
+      latest: 最新版本,
+      hasUpdate: !!最新版本 && 最新版本 !== 面板版本
+    }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (错误) {
+    return new Response(JSON.stringify({ current: 面板版本, latest: null, hasUpdate: false, error: 'بررسی نسخه ناموفق: ' + 错误.message }), { status: 502, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+async function 处理更新应用接口(请求, 环境值 = {}) {
+  if (请求.method !== 'POST') {
+    return new Response(JSON.stringify({ error: 'Method not allowed' }), { status: 405, headers: { 'Content-Type': 'application/json' } });
+  }
+  const 源码地址 = 获取配置文本值('updSrcUrl', 配置默认值.updSrcUrl, 环境值.updSrcUrl);
+  const 令牌 = 获取配置文本值('cfToken', 配置默认值.cfToken, 环境值.cfToken);
+  const 账户ID = 获取配置文本值('cfAccountId', 配置默认值.cfAccountId, 环境值.cfAccountId);
+  const 脚本名 = 获取配置文本值('cfScriptName', 配置默认值.cfScriptName, 环境值.cfScriptName);
+  if (!源码地址 || !令牌 || !账户ID || !脚本名) {
+    return new Response(JSON.stringify({
+      success: false,
+      message: 'برای به‌روزرسانی خودکار باید در تنظیمات مقادیر updSrcUrl، cfToken، cfAccountId و cfScriptName را وارد کنی'
+    }), { status: 400, headers: { 'Content-Type': 'application/json' } });
+  }
+  try {
+    const 源码响应 = await fetch(源码地址, { cf: { cacheTtl: 0 } });
+    if (!源码响应.ok) throw new Error('دریافت کد جدید ناموفق: HTTP ' + 源码响应.status);
+    const 新源码 = await 源码响应.text();
+    if (!新源码 || 新源码.length < 1000) throw new Error('محتوای دریافت‌شده معتبر به نظر نمی‌رسد');
+
+    const 元数据 = { main_module: 'worker.js', compatibility_date: '2024-09-23', compatibility_flags: ['nodejs_compat'] };
+    const 表单 = new FormData();
+    表单.append('metadata', JSON.stringify(元数据));
+    表单.append('worker.js', new Blob([新源码], { type: 'application/javascript+module' }), 'worker.js');
+
+    const 上传地址 = `https://api.cloudflare.com/client/v4/accounts/${账户ID}/workers/scripts/${脚本名}`;
+    const 上传响应 = await fetch(上传地址, {
+      method: 'PUT',
+      headers: { 'Authorization': `Bearer ${令牌}` },
+      body: 表单
+    });
+    const 上传结果 = await 上传响应.json().catch(() => ({}));
+    if (!上传响应.ok || 上传结果.success === false) {
+      const 错误信息 = (上传结果.errors && 上传结果.errors[0] && 上传结果.errors[0].message) || ('HTTP ' + 上传响应.status);
+      throw new Error(错误信息);
+    }
+    return new Response(JSON.stringify({ success: true, message: 'ورکر با موفقیت به‌روزرسانی شد. صفحه را رفرش کن.' }), { headers: { 'Content-Type': 'application/json' } });
+  } catch (错误) {
+    return new Response(JSON.stringify({ success: false, message: 'به‌روزرسانی ناموفق: ' + 错误.message }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+  }
+}
+
+async function 处理优选地址列表接口(请求) {
+  if (!键值存储) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'KV存储未配置',
+      message: '需要配置KV存储才能使用此功能'
+    }), {
+      status: 503,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+  const 本地值52 = 获取配置值('ae', '') === 'yes';
+  if (!本地值52) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: 'API功能未启用',
+      message: '出于安全考虑，优选IP API功能默认关闭。请在配置管理页面开启"允许API管理"选项后使用。'
+    }), {
+      status: 403,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+  try {
+    if (请求.method === 'GET') {
+      const 值值51 = 获取配置值('yx', '');
+      const 本地值50 = 解析值值数组(值值51);
+      return new Response(JSON.stringify({
+        success: true,
+        count: 本地值50.length,
+        data: 本地值50
+      }), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    } else if (请求.method === 'POST') {
+      const 主体49 = await 请求.json();
+      const 地址列表值添加 = Array.isArray(主体49) ? 主体49 : [主体49];
+      if (地址列表值添加.length === 0) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: '请求数据为空',
+          message: '请提供IP数据'
+        }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      const 值值48 = 获取配置值('yx', '');
+      let 本地值47 = 解析值值数组(值值48);
+      const 值地址列表46 = [];
+      const 值地址列表45 = [];
+      const 错误列表 = [];
+      for (const 项目44 of 地址列表值添加) {
+        if (!项目44.ip) {
+          错误列表.push({
+            ip: '未知',
+            reason: 'IP地址是必需的'
+          });
+          continue;
+        }
+        const 端口43 = 项目44.port || 443;
+        const 名称 = 项目44.name || `API优选-${项目44.ip}:${端口43}`;
+        if (!是否有效地址(项目44.ip) && !是否有效域名(项目44.ip)) {
+          错误列表.push({
+            ip: 项目44.ip,
+            reason: '无效的IP或域名格式'
+          });
+          continue;
+        }
+        const 本地值42 = 本地值47.some(值项目 => 值项目.ip === 项目44.ip && 值项目.port === 端口43);
+        if (本地值42) {
+          值地址列表45.push({
+            ip: 项目44.ip,
+            port: 端口43,
+            reason: '已存在'
+          });
+          continue;
+        }
+        const 新地址 = {
+          ip: 项目44.ip,
+          port: 端口43,
+          name: 名称,
+          addedAt: new Date().toISOString()
+        };
+        本地值47.push(新地址);
+        值地址列表46.push(新地址);
+      }
+      if (值地址列表46.length > 0) {
+        const 新值值41 = 处理数组值值(本地值47);
+        await 设置配置值('yx', 新值值41);
+        更新自定义优选来源值();
+      }
+      return new Response(JSON.stringify({
+        success: 值地址列表46.length > 0,
+        message: `成功添加 ${值地址列表46.length} 个IP`,
+        added: 值地址列表46.length,
+        skipped: 值地址列表45.length,
+        errors: 错误列表.length,
+        data: {
+          addedIPs: 值地址列表46,
+          skippedIPs: 值地址列表45.length > 0 ? 值地址列表45 : undefined,
+          errors: 错误列表.length > 0 ? 错误列表 : undefined
+        }
+      }), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    } else if (请求.method === 'DELETE') {
+      const 主体 = await 请求.json();
+      if (主体.all === true) {
+        const 值值40 = 获取配置值('yx', '');
+        const 本地值39 = 解析值值数组(值值40);
+        const 值数量 = 本地值39.length;
+        await 设置配置值('yx', '');
+        更新自定义优选来源值();
+        return new Response(JSON.stringify({
+          success: true,
+          message: `已清空所有优选IP，共删除 ${值数量} 个`,
+          deletedCount: 值数量
+        }), {
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      if (!主体.ip) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: 'IP地址是必需的',
+          message: '请提供要删除的ip字段，或使用 {"all": true} 清空所有'
+        }), {
+          status: 400,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      const 端口38 = 主体.port || 443;
+      const 值值37 = 获取配置值('yx', '');
+      let 本地值36 = 解析值值数组(值值37);
+      const 值长度 = 本地值36.length;
+      const 值地址列表 = 本地值36.filter(项目35 => !(项目35.ip === 主体.ip && 项目35.port === 端口38));
+      if (值地址列表.length === 值长度) {
+        return new Response(JSON.stringify({
+          success: false,
+          error: '优选IP不存在',
+          message: `${主体.ip}:${端口38} 未找到`
+        }), {
+          status: 404,
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        });
+      }
+      const 新值值 = 处理数组值值(值地址列表);
+      await 设置配置值('yx', 新值值);
+      更新自定义优选来源值();
+      return new Response(JSON.stringify({
+        success: true,
+        message: '优选IP已删除',
+        deleted: {
+          ip: 主体.ip,
+          port: 端口38
+        }
+      }), {
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    } else {
+      return new Response(JSON.stringify({
+        success: false,
+        error: '不支持的请求方法',
+        message: '支持的方法: GET, POST, DELETE'
+      }), {
+        status: 405,
+        headers: {
+          'Content-Type': 'application/json'
+        }
+      });
+    }
+  } catch (错误34) {
+    return new Response(JSON.stringify({
+      success: false,
+      error: '处理请求失败',
+      message: 错误34.message
+    }), {
+      status: 500,
+      headers: {
+        'Content-Type': 'application/json'
+      }
+    });
+  }
+}
+function 更新配置值() {
+  const 有效配置 = 获取有效配置快照();
+  const 手动地区 = 有效配置.wk;
+  if (手动地区 && 手动地区.trim()) {
+    手动工作器地区 = 手动地区.trim().toUpperCase();
+    当前工作器地区 = 手动工作器地区;
+  } else {
+    const 本地值 = 有效配置.p;
+    if (本地值 && 本地值.trim()) {
+      当前工作器地区 = 'CUSTOM';
+    } else {
+      手动工作器地区 = '';
+      当前工作器地区 = '';
+    }
+  }
+  启用地区匹配 = !(有效配置.rm && 有效配置.rm.toLowerCase() === 'no');
+  启用明文 = 有效配置.ev === 'yes';
+  启用木马 = 有效配置.et === 'yes';
+  启用扩展传输 = 有效配置.ex === 'yes';
+  传输路径 = 有效配置.tp || '';
+  订阅转换接口 = 有效配置.scu || 配置默认值.scu;
+  启用优选域名 = 有效配置.epd === 'yes';
+  启用优选地址 = 有效配置.epi === 'yes';
+  启用仓库优选 = 有效配置.egi === 'yes';
+  启用原生地址 = 有效配置.ena === 'yes';
+  启用加密客户端问候 = 有效配置.ech === 'yes';
+  自定义域名系统 = 有效配置.customDNS || 配置默认值.customDNS;
+  自定义加密客户端问候域名 = 有效配置.customECHDomain || 配置默认值.customECHDomain;
+  自定义应用层协议协商 = 规范化应用层协议协商(有效配置.alpn || '');
+  禁用非传输层安全 = 有效配置.dkby === 'yes' || 启用加密客户端问候;
+  启用代理降级 = !!(有效配置.qj && 有效配置.qj.toLowerCase() === 'no');
+  自定义路径 = 有效配置.d || '';
+  优选地址源 = 有效配置.yxURL || '';
+  回退地址 = 有效配置.p ? 有效配置.p.trim() : '';
+  代理5配置 = 有效配置.s || '';
+  if (代理5配置) {
+    try {
+      已解析代理5配置 = 解析代理配置(代理5配置);
+      是否代理已启用 = true;
+    } catch (错误31) {
+      是否代理已启用 = false;
+    }
+  } else {
+    已解析代理5配置 = {};
+    是否代理已启用 = false;
+  }
+  禁用优选 = !!(有效配置.yxby && 有效配置.yxby.toLowerCase() === 'yes');
+}
+function 更新自定义优选来源值() {
+  const 值值30 = 获取配置值('yx', '');
+  if (值值30) {
+    try {
+      const 优选列表 = 值值30.split(',').map(项目29 => 项目29.trim()).filter(项目28 => 项目28);
+      自定义优选地址列表 = [];
+      自定义优选域名列表 = [];
+      优选列表.forEach(项目27 => {
+        let 节点名称26 = '';
+        let 地址部分25 = 项目27;
+        if (项目27.includes('#')) {
+          const 部分列表24 = 项目27.split('#');
+          地址部分25 = 部分列表24[0].trim();
+          节点名称26 = 部分列表24[1].trim();
+        }
+        const {
+          address: 地址23,
+          port: 端口22
+        } = 解析地址值端口(地址部分25);
+        if (!节点名称26) {
+          节点名称26 = '自定义优选-' + 地址23 + (端口22 ? ':' + 端口22 : '');
+        }
+        if (是否有效地址(地址23)) {
+          自定义优选地址列表.push({
+            ip: 地址23,
+            port: 端口22,
+            isp: 节点名称26
+          });
+        } else {
+          自定义优选域名列表.push({
+            domain: 地址23,
+            port: 端口22,
+            name: 节点名称26
+          });
+        }
+      });
+    } catch (错误) {
+      自定义优选地址列表 = [];
+      自定义优选域名列表 = [];
+    }
+  } else {
+    自定义优选地址列表 = [];
+    自定义优选域名列表 = [];
+  }
+}
+function 解析值值数组(值值) {
+  if (!值值 || !值值.trim()) return [];
+  const 项目列表 = 值值.split(',').map(项目21 => 项目21.trim()).filter(项目20 => 项目20);
+  const 结果 = [];
+  for (const 项目19 of 项目列表) {
+    let 节点名称 = '';
+    let 地址部分 = 项目19;
+    if (项目19.includes('#')) {
+      const 部分列表 = 项目19.split('#');
+      地址部分 = 部分列表[0].trim();
+      节点名称 = 部分列表[1].trim();
+    }
+    const {
+      address: 地址,
+      port: 端口18
+    } = 解析地址值端口(地址部分);
+    if (!节点名称) {
+      节点名称 = 地址 + (端口18 ? ':' + 端口18 : '');
+    }
+    结果.push({
+      ip: 地址,
+      port: 端口18 || 443,
+      name: 节点名称,
+      addedAt: new Date().toISOString()
+    });
+  }
+  return 结果;
+}
+function 处理数组值值(数组) {
+  if (!数组 || 数组.length === 0) return '';
+  return 数组.map(项目 => {
+    const 端口17 = 项目.port || 443;
+    return `${项目.ip}:${端口17}#${项目.name}`;
+  }).join(',');
+}
+function 是否有效域名(域名) {
+  const 域名正则 = /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+  return 域名正则.test(域名);
+}
+async function 解析文本值数组(内容) {
+  var 已处理 = 内容.replace(/[	"'\r\n]+/g, ',').replace(/,+/g, ',');
+  if (已处理.charAt(0) == ',') 已处理 = 已处理.slice(1);
+  if (已处理.charAt(已处理.length - 1) == ',') 已处理 = 已处理.slice(0, 已处理.length - 1);
+  return 已处理.split(',');
+}
+async function 获取优选接口(网址列表, 默认端口 = '443', 超时 = 3000) {
+  if (!网址列表?.length) return [];
+  const 结果列表 = new Set();
+  await Promise.allSettled(网址列表.map(async 网址 => {
+    try {
+      const 控制器 = new AbortController();
+      const 超时标识 = setTimeout(() => 控制器.abort(), 超时);
+      const 响应 = await fetch(网址, {
+        signal: 控制器.signal
+      });
+      clearTimeout(超时标识);
+      let 文本 = '';
+      try {
+        const 缓冲 = await 响应.arrayBuffer();
+        const 内容类型 = (响应.headers.get('content-type') || '').toLowerCase();
+        const 字符集 = 内容类型.match(/charset=([^\s;]+)/i)?.[1]?.toLowerCase() || '';
+        let 解码器列表 = ['utf-8', 'gb2312'];
+        if (字符集.includes('gb') || 字符集.includes('gbk') || 字符集.includes('gb2312')) {
+          解码器列表 = ['gb2312', 'utf-8'];
+        }
+        let 解码成功 = false;
+        for (const 解码器 of 解码器列表) {
+          try {
+            const 已解码 = new TextDecoder(解码器).decode(缓冲);
+            if (已解码 && 已解码.length > 0 && !已解码.includes('\ufffd')) {
+              文本 = 已解码;
+              解码成功 = true;
+              break;
+            } else if (已解码 && 已解码.length > 0) {
+              continue;
+            }
+          } catch (事件值16) {
+            continue;
+          }
+        }
+        if (!解码成功) {
+          文本 = await 响应.text();
+        }
+        if (!文本 || 文本.trim().length === 0) {
+          return;
+        }
+      } catch (事件值15) {
+        return;
+      }
+      const 行列表 = 文本.trim().split('\n').map(行值14 => 行值14.trim()).filter(行值 => 行值);
+      const 是否值 = 行列表.length > 1 && 行列表[0].includes(',');
+      const 六版地址模式 = /^[^\[\]]*:[^\[\]]*:[^\[\]]/;
+      if (!是否值) {
+        行列表.forEach(行13 => {
+          const 井号索引 = 行13.indexOf('#');
+          const [主机部分, 备注] = 井号索引 > -1 ? [行13.substring(0, 井号索引), 行13.substring(井号索引)] : [行13, ''];
+          let 是否有端口 = false;
+          if (主机部分.startsWith('[')) {
+            是否有端口 = /\]:(\d+)$/.test(主机部分);
+          } else {
+            const 值索引 = 主机部分.lastIndexOf(':');
+            是否有端口 = 值索引 > -1 && /^\d+$/.test(主机部分.substring(值索引 + 1));
+          }
+          const 端口12 = new URL(网址).searchParams.get('port') || 默认端口;
+          结果列表.add(是否有端口 ? 行13 : `${主机部分}:${端口12}${备注}`);
+        });
+      } else {
+        const 头部列表 = 行列表[0].split(',').map(头值11 => 头值11.trim());
+        const 数据行列表 = 行列表.slice(1);
+        if (头部列表.includes('IP地址') && 头部列表.includes('端口') && 头部列表.includes('数据中心')) {
+          const 地址索引10 = 头部列表.indexOf('IP地址'),
+            端口索引 = 头部列表.indexOf('端口');
+          const 备注索引 = 头部列表.indexOf('国家') > -1 ? 头部列表.indexOf('国家') : 头部列表.indexOf('城市') > -1 ? 头部列表.indexOf('城市') : 头部列表.indexOf('数据中心');
+          const 传输层安全索引 = 头部列表.indexOf('TLS');
+          数据行列表.forEach(行9 => {
+            const 列列表8 = 行9.split(',').map(丙值7 => 丙值7.trim());
+            if (传输层安全索引 !== -1 && 列列表8[传输层安全索引]?.toLowerCase() !== 'true') return;
+            const 包裹地址6 = 六版地址模式.test(列列表8[地址索引10]) ? `[${列列表8[地址索引10]}]` : 列列表8[地址索引10];
+            结果列表.add(`${包裹地址6}:${列列表8[端口索引]}#${列列表8[备注索引]}`);
+          });
+        } else if (头部列表.some(头值5 => 头值5.includes('IP')) && 头部列表.some(头值4 => 头值4.includes('延迟')) && 头部列表.some(头值3 => 头值3.includes('下载速度'))) {
+          const 地址索引 = 头部列表.findIndex(头值2 => 头值2.includes('IP'));
+          const 延迟索引 = 头部列表.findIndex(头值1 => 头值1.includes('延迟'));
+          const 速度索引 = 头部列表.findIndex(头值 => 头值.includes('下载速度'));
+          const 端口 = new URL(网址).searchParams.get('port') || 默认端口;
+          数据行列表.forEach(行 => {
+            const 列列表 = 行.split(',').map(丙值 => 丙值.trim());
+            const 包裹地址 = 六版地址模式.test(列列表[地址索引]) ? `[${列列表[地址索引]}]` : 列列表[地址索引];
+            结果列表.add(`${包裹地址}:${端口}#CF优选 ${列列表[延迟索引]}ms ${列列表[速度索引]}MB/s`);
+          });
+        }
+      }
+    } catch (事件值) {}
+  }));
+  return Array.from(结果列表);
+}
